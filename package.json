@@ -1,0 +1,23 @@
+{
+  "name": "rentars",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": ["apps/*"],
+  "scripts": {
+    "dev": "bun run dev",
+    "build": "bun run build",
+    "lint": "bun run lint",
+    "format": "biome format --write .",
+    "format-and-lint": "biome check .",
+    "format-and-lint:fix": "biome check . --write"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@types/bun": "latest",
+    "@types/express": "^4.17.23"
+  },
+  "dependencies": {
+    "@stellar/stellar-sdk": "^13.3.0"
+  },
+  "packageManager": "yarn@1.22.22"
+}
