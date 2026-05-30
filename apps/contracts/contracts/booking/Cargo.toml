@@ -1,25 +1,21 @@
-[workspace]
-members = [
-    ".",
-    "contracts/property-listing",
-    "contracts/booking",
-    "contracts/review-contract",
-]
-resolver = "2"
-
 [package]
-name = "rentars-contracts"
+name = "booking"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 soroban-sdk = { version = "21.0.0", features = ["alloc"] }
+property-listing = { path = "../property-listing" }
 
 [dev-dependencies]
 soroban-sdk = { version = "21.0.0", features = ["testutils"] }
+property-listing = { path = "../property-listing", features = ["testutils"] }
+
+[features]
+testutils = ["soroban-sdk/testutils", "property-listing/testutils"]
 
 [profile.release]
 opt-level = "z"
