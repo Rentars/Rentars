@@ -8,7 +8,7 @@
 
 #[cfg(test)]
 mod tests {
-    use soroban_sdk::{testutils::Address as _, Address, Env, String};
+    use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, String};
 
     use crate::{ListingStatus, PropertyListingContract, PropertyListingContractClient};
 

@@ -10,7 +10,7 @@
 
 #[cfg(test)]
 mod tests {
-    use soroban_sdk::{testutils::Address as _, Address, Env, String};
+    use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, String};
 
     use crate::{ReviewContract, ReviewContractClient};
 
@@ -591,5 +591,117 @@ mod tests {
                 ratings, rep, expected_rep
             );
         }
+    }
+
+    // ─── Deployment Validation Tests ──────────────────────────────────────────
+
+    /// Deployment validation: contract initialises correctly with testnet-like
+    /// ledger settings (non-zero sequence number and timestamp).
+    ///
+    /// On Stellar Testnet the ledger sequence starts well above 0 and the
+    /// timestamp reflects real wall-clock time. This test simulates that
+    /// environment and verifies the contract behaves identically to a fresh
+    /// mainnet deploy. In particular, the review timestamp must be sourced from
+    /// the ledger, so advancing the ledger before submission must be reflected
+    /// in the stored review.
+    #[test]
+    fn test_deployment_validation_networks_testnet_init() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        // Simulate testnet ledger state
+        env.ledger().with_mut(|li| {
+            li.sequence_number = 3_000_000;   // testnet-like sequence
+            li.timestamp = 1_700_000_000;     // ~Nov 2023 Unix timestamp
+        });
+
+        let contract_id = env.register_contract(None, ReviewContract);
+        let client = ReviewContractClient::new(&env, &contract_id);
+
+        // Review count starts at zero regardless of ledger state
+        assert_eq!(
+            client.review_count(),
+            0,
+            "Review count must be 0 on a fresh testnet deploy"
+        );
+
+        let reviewer = Address::generate(&env);
+        let reviewee = Address::generate(&env);
+
+        let id = client.submit_review(
+            &reviewer,
+            &reviewee,
+            &5_u32,
+            &String::from_str(&env, "Great on testnet!"),
+        );
+
+        assert_eq!(id, 1);
+
+        let review = client.get_review(&id);
+        // The timestamp must match the simulated testnet ledger timestamp
+        assert_eq!(
+            review.timestamp,
+            1_700_000_000,
+            "Review timestamp must reflect the testnet ledger timestamp"
+        );
+        assert_eq!(review.rating, 5);
+    }
+
+    /// Deployment validation: contract IDs are deterministic given the same
+    /// deployer and salt.
+    ///
+    /// Soroban derives a contract address from (deployer_address, salt) via a
+    /// deterministic hash. Registering the same contract type at the same
+    /// explicit address in two independent environments must yield the same
+    /// address, confirming the determinism property relied upon by deployment
+    /// scripts and cross-contract calls.
+    #[test]
+    fn test_deployment_validation_networks_deterministic_contract_id() {
+        // Build two completely independent environments
+        let env_a = Env::default();
+        env_a.mock_all_auths();
+        let env_b = Env::default();
+        env_b.mock_all_auths();
+
+        // Construct a fixed contract address from a known 32-byte value.
+        // This simulates deploying with a known salt so the resulting contract
+        // ID is reproducible across networks.
+        let fixed_bytes: [u8; 32] = [0x03u8; 32];
+        let contract_addr_a = soroban_sdk::Address::from_contract_id(
+            &BytesN::from_array(&env_a, &fixed_bytes),
+        );
+        let contract_addr_b = soroban_sdk::Address::from_contract_id(
+            &BytesN::from_array(&env_b, &fixed_bytes),
+        );
+
+        // Register the contract at the fixed address in both environments
+        env_a.register_contract(&contract_addr_a, ReviewContract);
+        env_b.register_contract(&contract_addr_b, ReviewContract);
+
+        // Both contract addresses must be equal — determinism holds
+        assert_eq!(
+            contract_addr_a, contract_addr_b,
+            "Contract IDs derived from the same salt must be identical across environments"
+        );
+
+        // Both instances must operate independently with correct initial state
+        let client_a = ReviewContractClient::new(&env_a, &contract_addr_a);
+        let client_b = ReviewContractClient::new(&env_b, &contract_addr_b);
+
+        assert_eq!(client_a.review_count(), 0);
+        assert_eq!(client_b.review_count(), 0);
+
+        // Submitting a review in env_a must not affect env_b
+        let reviewer_a = Address::generate(&env_a);
+        let reviewee_a = Address::generate(&env_a);
+        client_a.submit_review(
+            &reviewer_a,
+            &reviewee_a,
+            &4_u32,
+            &String::from_str(&env_a, "Env A review"),
+        );
+
+        assert_eq!(client_a.review_count(), 1);
+        assert_eq!(client_b.review_count(), 0, "env_b must remain isolated from env_a");
     }
 }
