@@ -1,9 +1,10 @@
 //! Unit tests for the PropertyListing contract.
 //!
 //! Coverage:
-//!   Happy paths  — create, get, update, update_status
+//!   Happy paths  — create, get, update, update_status, set_rented
 //!   Error cases  — unauthorized, not-found, duplicate-id logic, invalid inputs
 //!   Edge cases   — empty strings, boundary values, max price, single-char title
+//!   Gas / TTL    — test_gas_optimization_validation
 
 #[cfg(test)]
 mod tests {
@@ -173,6 +174,55 @@ mod tests {
 
         client.update_status(&owner, &id, &ListingStatus::Inactive);
         assert_eq!(client.get_listing(&id).status, ListingStatus::Inactive);
+    }
+
+    /// set_rented transitions an Active listing to Rented without owner auth.
+    #[test]
+    fn test_set_rented_success() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        let id = client.create_listing(
+            &owner,
+            &String::from_str(&env, "Beach House"),
+            &String::from_str(&env, "desc"),
+            &100_0000000_i128,
+        );
+
+        client.set_rented(&id);
+
+        assert_eq!(client.get_listing(&id).status, ListingStatus::Rented);
+    }
+
+    /// set_rented panics when the listing is not Active.
+    #[test]
+    #[should_panic(expected = "Property is not available for booking")]
+    fn test_set_rented_not_active() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        let id = client.create_listing(
+            &owner,
+            &String::from_str(&env, "Beach House"),
+            &String::from_str(&env, "desc"),
+            &100_0000000_i128,
+        );
+
+        // Mark inactive first
+        client.update_status(&owner, &id, &ListingStatus::Inactive);
+        // Now set_rented must fail
+        client.set_rented(&id);
+    }
+
+    /// set_rented panics when the listing does not exist.
+    #[test]
+    #[should_panic(expected = "Listing not found")]
+    fn test_set_rented_not_found() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+        client.set_rented(&9999);
     }
 
     /// Multiple owners can each have their own listings independently.
