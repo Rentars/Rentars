@@ -1,0 +1,216 @@
+/**
+ * Higher-level service that stores a canonical data-hash for each property
+ * on-chain. The Supabase DB holds the authoritative property data; the hash
+ * on-chain allows tamper-evidence verification via verifyPropertyIntegrity().
+ *
+ * Assumed contract interface (Soroban):
+ *   create_property_listing(id: String, data_hash: String, owner: Address)
+ *   update_property_listing(id: String, data_hash: String, owner: Address)
+ *   get_property_listing(id: String) -> { owner: Address, data_hash: String, status: Symbol }
+ *   update_property_status(id: String, owner: Address, status: Symbol)
+ */
+
+import { createHash } from 'crypto';
+import {
+  Contract,
+  TransactionBuilder,
+  nativeToScVal,
+  scValToNative,
+  xdr,
+} from '@stellar/stellar-sdk';
+import {
+  NETWORK_PASSPHRASE,
+  PROPERTY_LISTING_CONTRACT_ID,
+  STELLAR_SOURCE_ACCOUNT,
+} from './config.js';
+import { getSorobanServer, simulateReadOnly, submitAndWait } from './soroban.js';
+import { buildPrepareAndSign } from './transactionUtils.js';
+import { ContractError } from './errors.js';
+import type { ListingStatus } from './types.js';
+
+export interface OnChainPropertyData {
+  owner: string;
+  data_hash: string;
+  status: ListingStatus;
+}
+
+// ─── Serialisation ────────────────────────────────────────────────────────────
+
+/**
+ * Serialise the canonical subset of property fields to a deterministic JSON
+ * string for hashing. Keys are always sorted alphabetically.
+ */
+export function propertyToHashData(property: Record<string, unknown>): string {
+  const CANONICAL_FIELDS = [
+    'address',
+    'bathrooms',
+    'bedrooms',
+    'city',
+    'country',
+    'description',
+    'id',
+    'max_guests',
+    'price_per_night',
+    'title',
+  ] as const;
+
+  const canonical: Record<string, unknown> = {};
+  for (const field of CANONICAL_FIELDS) {
+    if (field in property) {
+      canonical[field] = property[field];
+    }
+  }
+
+  return JSON.stringify(canonical);
+}
+
+function computeSha256(data: string): string {
+  return createHash('sha256').update(data, 'utf8').digest('hex');
+}
+
+// ─── Read ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Fetch the on-chain hash record for a property.
+ */
+export async function getPropertyListing(id: string): Promise<OnChainPropertyData> {
+  if (!PROPERTY_LISTING_CONTRACT_ID) {
+    throw new ContractError(
+      'PROPERTY_LISTING_CONTRACT_ID is not configured',
+      'get_property_listing',
+    );
+  }
+
+  const server = getSorobanServer();
+  const contract = new Contract(PROPERTY_LISTING_CONTRACT_ID);
+
+  const sourceAccount = await server.getAccount(STELLAR_SOURCE_ACCOUNT);
+  const tx = new TransactionBuilder(sourceAccount, {
+    fee: '100',
+    networkPassphrase: NETWORK_PASSPHRASE,
+  })
+    .addOperation(
+      contract.call('get_property_listing', nativeToScVal(id, { type: 'string' })),
+    )
+    .setTimeout(30)
+    .build();
+
+  const retval = await simulateReadOnly(server, tx, 'get_property_listing');
+  const native = scValToNative(retval) as {
+    owner: string;
+    data_hash: string;
+    status: string;
+  };
+
+  return {
+    owner: native.owner,
+    data_hash: native.data_hash,
+    status: native.status as ListingStatus,
+  };
+}
+
+// ─── Write ────────────────────────────────────────────────────────────────────
+
+/**
+ * Register a property's data-hash on-chain.
+ */
+export async function createPropertyListing(
+  id: string,
+  dataHash: string,
+  ownerAddress: string,
+): Promise<void> {
+  if (!PROPERTY_LISTING_CONTRACT_ID) {
+    throw new ContractError(
+      'PROPERTY_LISTING_CONTRACT_ID is not configured',
+      'create_property_listing',
+    );
+  }
+
+  const server = getSorobanServer();
+  const contract = new Contract(PROPERTY_LISTING_CONTRACT_ID);
+
+  const op = contract.call(
+    'create_property_listing',
+    nativeToScVal(id, { type: 'string' }),
+    nativeToScVal(dataHash, { type: 'string' }),
+    nativeToScVal(ownerAddress, { type: 'address' }),
+  );
+
+  const tx = await buildPrepareAndSign(server, [op]);
+  await submitAndWait(server, tx);
+}
+
+/**
+ * Update the stored data-hash for a property.
+ */
+export async function updatePropertyListing(
+  id: string,
+  dataHash: string,
+  ownerAddress: string,
+): Promise<void> {
+  if (!PROPERTY_LISTING_CONTRACT_ID) {
+    throw new ContractError(
+      'PROPERTY_LISTING_CONTRACT_ID is not configured',
+      'update_property_listing',
+    );
+  }
+
+  const server = getSorobanServer();
+  const contract = new Contract(PROPERTY_LISTING_CONTRACT_ID);
+
+  const op = contract.call(
+    'update_property_listing',
+    nativeToScVal(id, { type: 'string' }),
+    nativeToScVal(dataHash, { type: 'string' }),
+    nativeToScVal(ownerAddress, { type: 'address' }),
+  );
+
+  const tx = await buildPrepareAndSign(server, [op]);
+  await submitAndWait(server, tx);
+}
+
+/**
+ * Update the status of a property listing on-chain.
+ */
+export async function updatePropertyStatus(
+  id: string,
+  ownerAddress: string,
+  status: ListingStatus,
+): Promise<void> {
+  if (!PROPERTY_LISTING_CONTRACT_ID) {
+    throw new ContractError(
+      'PROPERTY_LISTING_CONTRACT_ID is not configured',
+      'update_property_status',
+    );
+  }
+
+  const server = getSorobanServer();
+  const contract = new Contract(PROPERTY_LISTING_CONTRACT_ID);
+
+  const op = contract.call(
+    'update_property_status',
+    nativeToScVal(id, { type: 'string' }),
+    nativeToScVal(ownerAddress, { type: 'address' }),
+    xdr.ScVal.scvVec([xdr.ScVal.scvSymbol(status)]),
+  );
+
+  const tx = await buildPrepareAndSign(server, [op]);
+  await submitAndWait(server, tx);
+}
+
+// ─── Integrity ────────────────────────────────────────────────────────────────
+
+/**
+ * Verify that local property data matches the hash stored on-chain.
+ *
+ * Returns true when the hashes match, false when they diverge (indicating
+ * the off-chain record may have been mutated outside the normal update flow).
+ */
+export async function verifyPropertyIntegrity(
+  id: string,
+  localData: Record<string, unknown>,
+): Promise<boolean> {
+  const onChain = await getPropertyListing(id);
+  const localHash = computeSha256(propertyToHashData(localData));
+  return localHash === onChain.data_hash;
+}

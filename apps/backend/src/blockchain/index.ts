@@ -1,25 +1,52 @@
 /**
  * Blockchain client module for Rentars.
  *
- * Exports typed clients for each Soroban contract, backed by their ABI files:
- *   - PropertyListingClient  ← apps/contracts/property_listing_abi.json
- *   - BookingClient          ← apps/contracts/booking_abi.json
- *   - ReviewClient           ← apps/contracts/review_abi.json
- *
- * Usage:
- *   import { BookingClient, PropertyListingClient, ReviewClient } from './blockchain/index.js';
- *
- *   const bookingClient = new BookingClient(
- *     process.env.BOOKING_CONTRACT_ID!,
- *     process.env.STELLAR_RPC_URL!,
- *   );
- *
- *   const booking = await bookingClient.getBooking(1n);
+ * Exports typed clients for each Soroban contract, shared utilities,
+ * and the TrustlessWork escrow client.
  */
 
 export { BookingClient } from './bookingClient.js';
 export { PropertyListingClient } from './propertyListingClient.js';
 export { ReviewClient } from './reviewClient.js';
+
+export {
+  createBookingOnChain,
+  cancelBookingOnChain,
+  updateBookingStatusOnChain,
+  checkAvailability,
+} from './bookingContract.js';
+
+export {
+  createPropertyListing,
+  updatePropertyListing,
+  getPropertyListing,
+  updatePropertyStatus,
+  verifyPropertyIntegrity,
+  propertyToHashData,
+} from './propertyListingContract.js';
+
+export { getSorobanServer, submitAndWait, buildFeeBump } from './soroban.js';
+
+export {
+  buildTransaction,
+  signTransaction,
+  buildPrepareAndSign,
+  extractReturnValue,
+} from './transactionUtils.js';
+
+export {
+  TrustlessWorkClient,
+  trustlessWorkClient,
+} from './trustlessWork.js';
+
+export {
+  BlockchainError,
+  ContractError,
+  TransactionError,
+  AvailabilityError,
+  EscrowError,
+} from './errors.js';
+
 export type {
   Booking,
   BookingStatus,
@@ -31,3 +58,14 @@ export type {
   SubmitReviewParams,
   UpdateListingParams,
 } from './types.js';
+
+export type {
+  CreateEscrowRequest,
+  CreateEscrowResponse,
+  EscrowStatus,
+  FundEscrowRequest,
+  ReleaseEscrowRequest,
+  BookingEscrowParams,
+} from './trustlessWork.js';
+
+export type { OnChainPropertyData } from './propertyListingContract.js';

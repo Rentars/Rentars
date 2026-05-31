@@ -11,7 +11,7 @@
 import {
   Contract,
   Networks,
-  SorobanRpc,
+  rpc,
   TransactionBuilder,
   nativeToScVal,
   scValToNative,
@@ -32,7 +32,7 @@ const CONTRACT_NAME = 'property-listing';
 
 export class PropertyListingClient {
   private readonly contract: Contract;
-  private readonly server: SorobanRpc.Server;
+  private readonly server: rpc.Server;
   private readonly networkPassphrase: string;
 
   constructor(
@@ -41,7 +41,7 @@ export class PropertyListingClient {
     networkPassphrase: string = Networks.TESTNET,
   ) {
     this.contract = new Contract(contractId);
-    this.server = new SorobanRpc.Server(rpcUrl, { allowHttp: rpcUrl.startsWith('http://') });
+    this.server = new rpc.Server(rpcUrl, { allowHttp: rpcUrl.startsWith('http://') });
     this.networkPassphrase = networkPassphrase;
   }
 
@@ -151,13 +151,13 @@ export class PropertyListingClient {
 
     const simResult = await this.server.simulateTransaction(tx);
 
-    if (SorobanRpc.Api.isSimulationError(simResult)) {
+    if (rpc.Api.isSimulationError(simResult)) {
       throw new Error(
         `Contract simulation failed [${CONTRACT_NAME}@${ABI_VERSION}::${method}]: ${simResult.error}`,
       );
     }
 
-    const successResult = simResult as SorobanRpc.Api.SimulateTransactionSuccessResponse;
+    const successResult = simResult as rpc.Api.SimulateTransactionSuccessResponse;
     if (!successResult.result?.retval) {
       throw new Error(`No return value from ${method}`);
     }
