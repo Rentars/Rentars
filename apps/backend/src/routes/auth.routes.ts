@@ -1,11 +1,14 @@
 import { Router } from 'express';
-import { login, register, walletChallenge, walletVerify } from '../controllers/auth.controller.js';
+import { login, register } from '../controllers/auth.controller.js';
+import { walletChallenge, walletVerify } from '../controllers/wallet.controller.js';
 import {
   loginSchema,
   registerSchema,
   walletChallengeSchema,
   walletVerifySchema,
   validateBody,
+  walletChallengeSchema,
+  walletVerifySchema,
 } from '../validators/auth.validator.js';
 
 const router = Router();

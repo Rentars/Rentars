@@ -4,6 +4,7 @@
 
 import { z } from 'zod';
 import type { NextFunction, Request, Response } from 'express';
+import { StrKey } from '@stellar/stellar-sdk';
 
 // ─── Register schema ──────────────────────────────────────────────────────────
 
@@ -43,25 +44,25 @@ export const loginSchema = z.object({
 // ─── Wallet Challenge schema ──────────────────────────────────────────────────
 
 export const walletChallengeSchema = z.object({
-  stellar_address: z
-    .string({ required_error: 'stellar_address is required' })
-    .regex(/^G[A-Z2-7]{55}$/, 'stellar_address must be a valid Stellar public key'),
+  address: z
+    .string({ required_error: 'address is required' })
+    .refine(
+      (addr) => StrKey.isValidEd25519PublicKey(addr),
+      'address must be a valid Stellar public key',
+    ),
 });
 
 // ─── Wallet Verify schema ─────────────────────────────────────────────────────
 
 export const walletVerifySchema = z.object({
-  stellar_address: z
-    .string({ required_error: 'stellar_address is required' })
-    .regex(/^G[A-Z2-7]{55}$/, 'stellar_address must be a valid Stellar public key'),
-
-  challenge: z
-    .string({ required_error: 'challenge is required' })
-    .min(1, 'challenge is required'),
-
-  signature: z
-    .string({ required_error: 'signature is required' })
-    .min(1, 'signature is required'),
+  address: z
+    .string({ required_error: 'address is required' })
+    .refine(
+      (addr) => StrKey.isValidEd25519PublicKey(addr),
+      'address must be a valid Stellar public key',
+    ),
+  challenge: z.string({ required_error: 'challenge is required' }),
+  signature: z.string({ required_error: 'signature is required' }),
 });
 
 // ─── Middleware factory ───────────────────────────────────────────────────────
