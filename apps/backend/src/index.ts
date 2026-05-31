@@ -6,6 +6,7 @@ import { rateLimiter } from './middleware/rateLimiter';
 import authRoutes from './routes/auth.routes';
 import bookingRoutes from './routes/booking.routes';
 import propertyRoutes from './routes/property.routes';
+import locationRoutes from './routes/location.routes';
 
 dotenv.config();
 
@@ -26,6 +27,7 @@ app.use(rateLimiter);
 app.use('/auth', authRoutes);
 app.use('/api/bookings', bookingRoutes);
 app.use('/api/properties', propertyRoutes);
+app.use('/api/locations', locationRoutes);
 
 // Health check
 app.get('/health', (_req, res) => {
