@@ -4,9 +4,10 @@
   "private": true,
   "workspaces": ["apps/*"],
   "scripts": {
-    "dev": "bun run dev",
-    "build": "bun run build",
-    "lint": "bun run lint",
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "test": "turbo run test",
+    "lint": "turbo run lint",
     "format": "biome format --write .",
     "format-and-lint": "biome check .",
     "format-and-lint:fix": "biome check . --write"
@@ -14,7 +15,8 @@
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
     "@types/bun": "latest",
-    "@types/express": "^4.17.23"
+    "@types/express": "^4.17.23",
+    "turbo": "^2.3.3"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^13.3.0"
