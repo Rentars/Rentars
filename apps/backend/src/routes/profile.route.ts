@@ -6,6 +6,7 @@ import {
   updateStellarAddressHandler,
 } from '@/controllers/profile.controller.js';
 import { authenticate } from '@/middleware/auth.middleware.js';
+import { updateProfileSchema, validateBody } from '@/validators/profile.validator.js';
 
 const router = Router();
 
@@ -16,7 +17,7 @@ router.get('/', authenticate, getOwnProfileHandler);
 router.get('/:id', getPublicProfileHandler);
 
 // PATCH /api/profile — update own profile (auth required)
-router.patch('/', authenticate, updateProfileHandler);
+router.patch('/', authenticate, validateBody(updateProfileSchema), updateProfileHandler);
 
 // PATCH /api/profile/stellar — update Stellar wallet address (auth required)
 router.patch('/stellar', authenticate, updateStellarAddressHandler);

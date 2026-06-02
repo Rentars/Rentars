@@ -18,7 +18,9 @@ import {
   removeAvailabilityBlock,
 } from '@/controllers/availability.controller.js';
 import { authenticate } from '@/middleware/auth.middleware.js';
+import { requirePropertyOwner } from '@/middleware/rbac.middleware.js';
 import { upload } from '@/middleware/multer.js';
+import { propertySchema, updatePropertySchema, validateBody } from '@/validators/property.validator.js';
 
 const router = Router();
 
@@ -32,38 +34,26 @@ router.get('/search', searchPropertiesEndpoint);
 router.get('/:id', getProperty);
 
 // POST /api/v1/properties
-router.post('/', authenticate, createPropertyHandler);
+router.post('/', authenticate, validateBody(propertySchema), createPropertyHandler);
 
-// PUT /api/v1/properties/:id
-router.put('/:id', authenticate, updatePropertyHandler);
+// PUT /api/v1/properties/:id  — owner only
+router.put('/:id', authenticate, requirePropertyOwner, validateBody(updatePropertySchema), updatePropertyHandler);
 
-// DELETE /api/v1/properties/:id
-router.delete('/:id', authenticate, deletePropertyHandler);
+// DELETE /api/v1/properties/:id  — owner only
+router.delete('/:id', authenticate, requirePropertyOwner, deletePropertyHandler);
 
 // ── Image management ───────────────────────────────────────────────────────────
 
-// GET /api/v1/properties/:id/images
 router.get('/:id/images', listImages);
-
-// POST /api/v1/properties/:id/images
-router.post('/:id/images', authenticate, upload.single('image'), uploadImage);
-
-// DELETE /api/v1/properties/:id/images/:imageId
-router.delete('/:id/images/:imageId', authenticate, deleteImage);
-
-// PATCH /api/v1/properties/:id/images/:imageId/primary
-router.patch('/:id/images/:imageId/primary', authenticate, setAsPrimary);
+router.post('/:id/images', authenticate, requirePropertyOwner, upload.single('image'), uploadImage);
+router.delete('/:id/images/:imageId', authenticate, requirePropertyOwner, deleteImage);
+router.patch('/:id/images/:imageId/primary', authenticate, requirePropertyOwner, setAsPrimary);
 
 // ── Availability management ────────────────────────────────────────────────────
 
-// GET /api/v1/properties/:id/availability
 router.get('/:id/availability', getAvailability);
-
-// POST /api/v1/properties/:id/availability
-router.post('/:id/availability', authenticate, addAvailabilityBlock);
-
-// DELETE /api/v1/properties/:id/availability/:rangeId
-router.delete('/:id/availability/:rangeId', authenticate, removeAvailabilityBlock);
+router.post('/:id/availability', authenticate, requirePropertyOwner, addAvailabilityBlock);
+router.delete('/:id/availability/:rangeId', authenticate, requirePropertyOwner, removeAvailabilityBlock);
 
 export default router;
 

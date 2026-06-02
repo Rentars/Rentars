@@ -4,6 +4,8 @@ import {
   registerUser,
   generateWalletChallenge,
   verifyWalletChallenge,
+  refreshTokens,
+  logoutUser,
 } from '@/services/auth.service.js';
 import { AuthError } from '@/types/errors.js';
 
@@ -57,4 +59,25 @@ export async function walletVerify(req: Request, res: Response): Promise<void> {
     }
     throw err;
   }
+}
+
+export async function refresh(req: Request, res: Response): Promise<void> {
+  const { refreshToken } = req.body;
+  if (!refreshToken) {
+    res.status(400).json({ error: 'refreshToken is required' });
+    return;
+  }
+  const result = await refreshTokens(refreshToken);
+  res.json(result.data);
+}
+
+export async function logout(req: Request, res: Response): Promise<void> {
+  const accessToken = req.headers.authorization?.split(' ')[1] ?? '';
+  const { refreshToken } = req.body;
+  if (!refreshToken) {
+    res.status(400).json({ error: 'refreshToken is required' });
+    return;
+  }
+  await logoutUser(accessToken, refreshToken);
+  res.status(204).send();
 }

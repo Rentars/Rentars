@@ -1,4 +1,5 @@
-import type { Request, Response } from 'express';
+import type { Response } from 'express';
+import type { AuthRequest } from '@/middleware/auth.middleware.js';
 import {
   createProperty,
   deleteProperty,
@@ -8,7 +9,7 @@ import {
   updateProperty,
 } from '@/services/property.service.js';
 
-export async function getProperties(req: Request, res: Response): Promise<void> {
+export async function getProperties(req: AuthRequest, res: Response): Promise<void> {
   // If any search filter query params are present, delegate to searchProperties
   const { city, country, min_price, max_price, bedrooms, status } = req.query;
 
@@ -45,7 +46,7 @@ export async function getProperties(req: Request, res: Response): Promise<void> 
 
 // ─── Featured ─────────────────────────────────────────────────────────────────
 
-export async function getFeatured(_req: Request, res: Response): Promise<void> {
+export async function getFeatured(_req: AuthRequest, res: Response): Promise<void> {
   try {
     const data = await getFeaturedProperties();
     res.json(data);
@@ -56,7 +57,7 @@ export async function getFeatured(_req: Request, res: Response): Promise<void> {
 
 // ─── Single property ──────────────────────────────────────────────────────────
 
-export async function getProperty(req: Request, res: Response): Promise<void> {
+export async function getProperty(req: AuthRequest, res: Response): Promise<void> {
   const result = await getPropertyById(req.params.id);
 
   if (!result.success) {
@@ -67,8 +68,8 @@ export async function getProperty(req: Request, res: Response): Promise<void> {
   res.json(result.data);
 }
 
-export async function createPropertyHandler(req: Request, res: Response): Promise<void> {
-  const result = await createProperty(req.body);
+export async function createPropertyHandler(req: AuthRequest, res: Response): Promise<void> {
+  const result = await createProperty({ ...req.body, owner_id: req.userId });
 
   if (!result.success) {
     res.status(400).json({ error: result.error });
@@ -78,7 +79,7 @@ export async function createPropertyHandler(req: Request, res: Response): Promis
   res.status(201).json(result.data);
 }
 
-export async function updatePropertyHandler(req: Request, res: Response): Promise<void> {
+export async function updatePropertyHandler(req: AuthRequest, res: Response): Promise<void> {
   const result = await updateProperty(req.params.id, req.body);
 
   if (!result.success) {
@@ -89,7 +90,7 @@ export async function updatePropertyHandler(req: Request, res: Response): Promis
   res.json(result.data);
 }
 
-export async function deletePropertyHandler(req: Request, res: Response): Promise<void> {
+export async function deletePropertyHandler(req: AuthRequest, res: Response): Promise<void> {
   const result = await deleteProperty(req.params.id);
 
   if (!result.success) {

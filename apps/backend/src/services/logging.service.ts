@@ -12,20 +12,6 @@ export interface BlockchainOperationLog {
 }
 
 class LoggingService {
-  /**
-   * Persist a blockchain operation log to Supabase and emit a console message.
-   *
-   * Both successful operations and errors are recorded. On a DB failure the log
-   * is still printed to the console so no diagnostic information is silently lost.
-   *
-   * @param operation - Name of the operation (e.g. 'createEscrow', 'cancelBookingOnChain')
-   * @param input - Arbitrary key/value context associated with the operation
-   * @param result - Optional result payload returned by the operation
-   * @param error - Optional error message when the operation failed
-   * @example
-   * loggingService.logBlockchainOperation('createEscrow', { propertyId, userId }, { escrowId });
-   * loggingService.logBlockchainOperation('cancelEscrow', { bookingId }, undefined, err.message);
-   */
   async logBlockchainOperation(
     operation: string,
     input: Record<string, unknown>,
@@ -49,7 +35,6 @@ class LoggingService {
       console.error(`Error logging blockchain operation ${operation}:`, err);
     }
 
-    // Also log to console for immediate visibility
     const { error: errorMsg, ...rest } = { error, ...input };
     if (error) {
       console.error(`[Blockchain:${operation}] ERROR:`, errorMsg, rest);
@@ -60,3 +45,49 @@ class LoggingService {
 }
 
 export const loggingService = new LoggingService();
+
+// ─── Security event logger ────────────────────────────────────────────────────
+
+type SecurityEvent =
+  | 'login_success'
+  | 'login_failure'
+  | 'logout'
+  | 'register_success'
+  | 'token_revoked'
+  | 'unauthorized_access'
+  | 'rate_limit_exceeded';
+
+class SecurityLogger {
+  async logAuthEvent(
+    event: SecurityEvent,
+    userId?: string,
+    meta?: Record<string, unknown>,
+  ): Promise<void> {
+    const entry = {
+      event,
+      userId,
+      timestamp: new Date().toISOString(),
+      ...meta,
+    };
+
+    // Console output always
+    if (event === 'login_failure' || event === 'unauthorized_access') {
+      console.warn(`[Security:${event}]`, JSON.stringify(entry));
+    } else {
+      console.log(`[Security:${event}]`, JSON.stringify(entry));
+    }
+
+    // Persist to Supabase (best-effort)
+    try {
+      await supabase.from('security_logs').insert({
+        event,
+        user_id: userId || null,
+        meta_json: meta || null,
+      });
+    } catch {
+      // non-fatal — DB table may not exist yet
+    }
+  }
+}
+
+export const securityLogger = new SecurityLogger();

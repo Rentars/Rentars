@@ -1,9 +1,10 @@
-import type { Request, Response } from 'express';
+import type { Response } from 'express';
+import type { AuthRequest } from '@/middleware/auth.middleware.js';
 import { BookingService } from '@/services/booking.service.js';
 
 const bookingService = new BookingService();
 
-export async function getBooking(req: Request, res: Response): Promise<void> {
+export async function getBooking(req: AuthRequest, res: Response): Promise<void> {
   const result = await bookingService.getBookingById(req.params.id);
 
   if (!result.success) {
@@ -14,8 +15,8 @@ export async function getBooking(req: Request, res: Response): Promise<void> {
   res.json(result.data);
 }
 
-export async function createBooking(req: Request, res: Response): Promise<void> {
-  const result = await bookingService.createBooking(req.body);
+export async function createBooking(req: AuthRequest, res: Response): Promise<void> {
+  const result = await bookingService.createBooking({ ...req.body, user_id: req.userId });
 
   if (!result.success) {
     res.status(400).json({ error: result.error });
@@ -25,9 +26,8 @@ export async function createBooking(req: Request, res: Response): Promise<void> 
   res.status(201).json(result.data);
 }
 
-export async function cancelBooking(req: Request, res: Response): Promise<void> {
-  const userId = (req as Request & { user?: { id: string } }).user?.id ?? '';
-  const result = await bookingService.cancelBooking(req.params.id, userId);
+export async function cancelBooking(req: AuthRequest, res: Response): Promise<void> {
+  const result = await bookingService.cancelBooking(req.params.id, req.userId ?? '');
 
   if (!result.success) {
     res.status(400).json({ error: result.error });
@@ -37,9 +37,8 @@ export async function cancelBooking(req: Request, res: Response): Promise<void> 
   res.json(result.data);
 }
 
-export async function confirmBooking(req: Request, res: Response): Promise<void> {
-  const userId = (req as Request & { user?: { id: string } }).user?.id ?? '';
-  const result = await bookingService.confirmBooking(req.params.id, userId);
+export async function confirmBooking(req: AuthRequest, res: Response): Promise<void> {
+  const result = await bookingService.confirmBooking(req.params.id, req.userId ?? '');
 
   if (!result.success) {
     res.status(400).json({ error: result.error });
@@ -49,7 +48,7 @@ export async function confirmBooking(req: Request, res: Response): Promise<void>
   res.json(result.data);
 }
 
-export async function updateBooking(req: Request, res: Response): Promise<void> {
+export async function updateBooking(req: AuthRequest, res: Response): Promise<void> {
   const result = await bookingService.updateBooking(req.params.id, req.body);
 
   if (!result.success) {
@@ -60,7 +59,7 @@ export async function updateBooking(req: Request, res: Response): Promise<void> 
   res.json(result.data);
 }
 
-export async function deleteBooking(req: Request, res: Response): Promise<void> {
+export async function deleteBooking(req: AuthRequest, res: Response): Promise<void> {
   const result = await bookingService.deleteBooking(req.params.id);
 
   if (!result.success) {
