@@ -8,7 +8,7 @@
     "dev": "bun run --watch src/index.ts",
     "build": "bun build ./src/index.ts --outdir ./dist",
     "start": "bun run dist/index.js",
-    "test": "bun test",
+    "test": "jest --no-coverage",
     "test:api": "bash tests/api/simple.test.sh && bash tests/api/endpoints.test.sh && bash tests/api/profile.test.sh",
     "test:docker": "bash tests/docker/integration.test.sh"
   },
@@ -33,16 +33,18 @@
     "@types/bcrypt": "^6.0.0",
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.6",
-    "@types/jest": "^30.0.0",
+    "@types/jest": "^29.5.12",
     "@types/jsonwebtoken": "^9.0.5",
     "@types/multer": "^2.1.0",
     "@types/node": "^25.9.1",
     "@types/nodemailer": "^8.0.0",
     "@types/supertest": "^7.2.0",
     "bun-types": "latest",
+    "jest": "^29.7.0",
     "supertest": "^7.2.2",
     "swagger-jsdoc": "^6.2.8",
     "swagger-ui-express": "^5.0.0",
+    "ts-jest": "^29.2.5",
     "typescript": "^6.0.3",
     "vitest": "^4.1.8"
   }

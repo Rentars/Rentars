@@ -15,6 +15,7 @@ import {
 import { trustlessWorkClient } from '@/blockchain/trustlessWork.js';
 import { loggingService } from './logging.service.js';
 import { createNotification } from './notification.service.js';
+import { checkDateRangeAvailability } from './availability.service.js';
 import type { ServiceResponse } from './index.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -165,6 +166,18 @@ export class BookingService {
 
     if (checkInDate >= checkOutDate) {
       return { success: false, error: 'check_in must be before check_out' };
+    }
+
+    // 1a. DB-level availability check (conflict detection + min/max stay + manual blocks)
+    const availabilityCheck = await checkDateRangeAvailability(property_id, check_in, check_out);
+    if (!availabilityCheck.success) {
+      return { success: false, error: availabilityCheck.error };
+    }
+    if (!availabilityCheck.data?.is_available) {
+      return {
+        success: false,
+        error: availabilityCheck.data?.unavailable_reason ?? 'Property is not available for the requested dates',
+      };
     }
 
     // 1. Fetch property + owner

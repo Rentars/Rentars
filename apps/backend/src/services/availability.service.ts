@@ -17,11 +17,32 @@ export interface BlockRangeInput {
   reason?: string;
 }
 
-/**
- * Get all availability (blocked) ranges for a property.
- *
- * @param propertyId - UUID of the property
- */
+export interface PropertySettings {
+  min_stay_nights: number;
+  max_stay_nights?: number | null;
+}
+
+export interface AvailabilityWindow {
+  property_id: string;
+  check_in: string;
+  check_out: string;
+  nights: number;
+  is_available: boolean;
+  unavailable_reason?: string;
+  settings: PropertySettings;
+}
+
+/** Validate ISO date string */
+function parseDate(value: string): Date | null {
+  const d = new Date(value);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+/** Returns number of nights between two dates */
+function nightsBetween(checkIn: Date, checkOut: Date): number {
+  return Math.round((checkOut.getTime() - checkIn.getTime()) / 86400000);
+}
+
 export async function getAvailabilityRanges(
   propertyId: string,
 ): Promise<ServiceResponse<AvailabilityRange[]>> {
@@ -35,19 +56,11 @@ export async function getAvailabilityRanges(
   return { success: true, data: data as AvailabilityRange[] };
 }
 
-/**
- * Block a date range for a property (prevents bookings during this period).
- *
- * @param propertyId - UUID of the property
- * @param ownerId - UUID of the requesting user (must be owner)
- * @param input - Date range and optional reason
- */
 export async function blockAvailabilityRange(
   propertyId: string,
   ownerId: string,
   input: BlockRangeInput,
 ): Promise<ServiceResponse<AvailabilityRange>> {
-  // Verify ownership
   const { data: property } = await supabase
     .from('properties')
     .select('owner_id')
@@ -59,16 +72,11 @@ export async function blockAvailabilityRange(
     return { success: false, error: 'Forbidden: you do not own this property' };
   }
 
-  const startDate = new Date(input.start_date);
-  const endDate = new Date(input.end_date);
+  const startDate = parseDate(input.start_date);
+  const endDate = parseDate(input.end_date);
 
-  if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
-    return { success: false, error: 'Invalid date format' };
-  }
-
-  if (startDate >= endDate) {
-    return { success: false, error: 'start_date must be before end_date' };
-  }
+  if (!startDate || !endDate) return { success: false, error: 'Invalid date format' };
+  if (startDate >= endDate) return { success: false, error: 'start_date must be before end_date' };
 
   const { data, error } = await supabase
     .from('availability_ranges')
@@ -87,13 +95,6 @@ export async function blockAvailabilityRange(
   return { success: true, data: data as AvailabilityRange };
 }
 
-/**
- * Remove a blocked date range.
- *
- * @param propertyId - UUID of the property
- * @param rangeId - UUID of the range to delete
- * @param ownerId - UUID of the requesting user
- */
 export async function deleteAvailabilityRange(
   propertyId: string,
   rangeId: string,
@@ -120,12 +121,8 @@ export async function deleteAvailabilityRange(
 }
 
 /**
- * Check whether a date range is blocked for a property.
- *
- * @param propertyId - UUID of the property
- * @param checkIn - ISO date string
- * @param checkOut - ISO date string
- * @returns true if available, false if any blocked range overlaps
+ * Check whether a date range is free of manual blocks for a property.
+ * Does NOT check booking conflicts — use checkDateRangeAvailability for full check.
  */
 export async function isDateRangeAvailable(
   propertyId: string,
@@ -142,4 +139,130 @@ export async function isDateRangeAvailable(
     .limit(1);
 
   return !data || data.length === 0;
+}
+
+/**
+ * Full availability check: validates dates, min/max stay, blocked ranges, and booking conflicts.
+ * Returns an AvailabilityWindow with full details.
+ */
+export async function checkDateRangeAvailability(
+  propertyId: string,
+  checkIn: string,
+  checkOut: string,
+): Promise<ServiceResponse<AvailabilityWindow>> {
+  const checkInDate = parseDate(checkIn);
+  const checkOutDate = parseDate(checkOut);
+
+  if (!checkInDate || !checkOutDate) {
+    return { success: false, error: 'Invalid date format' };
+  }
+  if (checkInDate >= checkOutDate) {
+    return { success: false, error: 'check_in must be before check_out' };
+  }
+
+  const nights = nightsBetween(checkInDate, checkOutDate);
+
+  // Load settings (min/max stay)
+  const { data: settingsRow } = await supabase
+    .from('property_settings')
+    .select('min_stay_nights, max_stay_nights')
+    .eq('property_id', propertyId)
+    .single();
+
+  const settings: PropertySettings = {
+    min_stay_nights: (settingsRow as PropertySettings | null)?.min_stay_nights ?? 1,
+    max_stay_nights: (settingsRow as PropertySettings | null)?.max_stay_nights ?? null,
+  };
+
+  if (nights < settings.min_stay_nights) {
+    return {
+      success: true,
+      data: {
+        property_id: propertyId,
+        check_in: checkIn,
+        check_out: checkOut,
+        nights,
+        is_available: false,
+        unavailable_reason: `Minimum stay is ${settings.min_stay_nights} night(s)`,
+        settings,
+      },
+    };
+  }
+
+  if (settings.max_stay_nights && nights > settings.max_stay_nights) {
+    return {
+      success: true,
+      data: {
+        property_id: propertyId,
+        check_in: checkIn,
+        check_out: checkOut,
+        nights,
+        is_available: false,
+        unavailable_reason: `Maximum stay is ${settings.max_stay_nights} night(s)`,
+        settings,
+      },
+    };
+  }
+
+  // Check manual blocked ranges
+  const { data: blockedRanges } = await supabase
+    .from('availability_ranges')
+    .select('id')
+    .eq('property_id', propertyId)
+    .eq('is_available', false)
+    .lt('start_date', checkOut)
+    .gt('end_date', checkIn)
+    .limit(1);
+
+  if (blockedRanges && blockedRanges.length > 0) {
+    return {
+      success: true,
+      data: {
+        property_id: propertyId,
+        check_in: checkIn,
+        check_out: checkOut,
+        nights,
+        is_available: false,
+        unavailable_reason: 'Dates are blocked by the owner',
+        settings,
+      },
+    };
+  }
+
+  // Check booking conflicts (active bookings, not cancelled)
+  const { data: conflictingBookings } = await supabase
+    .from('bookings')
+    .select('id')
+    .eq('property_id', propertyId)
+    .not('status', 'eq', 'Cancelled')
+    .lt('check_in', checkOut)
+    .gt('check_out', checkIn)
+    .limit(1);
+
+  if (conflictingBookings && conflictingBookings.length > 0) {
+    return {
+      success: true,
+      data: {
+        property_id: propertyId,
+        check_in: checkIn,
+        check_out: checkOut,
+        nights,
+        is_available: false,
+        unavailable_reason: 'Property already booked for these dates',
+        settings,
+      },
+    };
+  }
+
+  return {
+    success: true,
+    data: {
+      property_id: propertyId,
+      check_in: checkIn,
+      check_out: checkOut,
+      nights,
+      is_available: true,
+      settings,
+    },
+  };
 }
