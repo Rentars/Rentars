@@ -25,6 +25,9 @@ const router = Router();
 // GET /api/v1/properties
 router.get('/', getProperties);
 
+// GET /api/v1/properties/search?q=...
+router.get('/search', searchPropertiesEndpoint);
+
 // GET /api/v1/properties/:id
 router.get('/:id', getProperty);
 
@@ -63,3 +66,4 @@ router.post('/:id/availability', authenticate, addAvailabilityBlock);
 router.delete('/:id/availability/:rangeId', authenticate, removeAvailabilityBlock);
 
 export default router;
+
