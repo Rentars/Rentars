@@ -10,8 +10,8 @@
     "test": "vitest",
     "test:watch": "vitest --watch",
     "test:coverage": "vitest --coverage",
-    "storybook": "storybook dev -p 6006",
-    "build-storybook": "storybook build"
+    "docker:build": "docker build -t rentars-web .",
+    "docker:run": "docker run --rm -p 3000:3000 --env-file .env.local rentars-web"
   },
   "dependencies": {
     "@radix-ui/react-slot": "^1.2.4",
