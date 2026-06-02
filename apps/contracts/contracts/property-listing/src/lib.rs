@@ -83,10 +83,34 @@ pub struct PropertyListingContract;
 
 #[contractimpl]
 impl PropertyListingContract {
-    /// Create a new property listing.
+    /// Create a new property listing and persist it to on-chain storage.
     ///
-    /// Returns the new listing's ID.
-    /// Panics if `price_per_night` is zero or negative, or if `title` is empty.
+    /// Assigns a monotonically increasing ID, sets status to `Active`, and
+    /// writes the listing and the updated counter to persistent storage.
+    ///
+    /// # Parameters
+    ///
+    /// - `env` (`Env`) — Soroban host environment (provides storage, auth, etc.).
+    /// - `owner` (`Address`) — Stellar address of the property owner; must authorise this call.
+    /// - `title` (`String`) — Human-readable title for the listing (must not be empty).
+    /// - `description` (`String`) — Free-text property description.
+    /// - `price_per_night` (`i128`) — Nightly rate in USDC stroops (must be > 0).
+    ///
+    /// # Returns
+    ///
+    /// `u64` — The newly assigned listing ID (starts at 1, increments globally).
+    ///
+    /// # Panics
+    ///
+    /// - If `owner` has not authorised the transaction.
+    /// - If `price_per_night <= 0`.
+    /// - If `title` is empty (zero length).
+    ///
+    /// # Side Effects
+    ///
+    /// - Writes `Listing(id)` to persistent storage.
+    /// - Writes updated `ListingCount` to persistent storage.
+    /// - Extends TTL on both entries to prevent ledger expiry.
     pub fn create_listing(
         env: Env,
         owner: Address,
@@ -96,10 +120,11 @@ impl PropertyListingContract {
     ) -> u64 {
         owner.require_auth();
 
-        // Validate inputs
+        // Validate inputs — fail fast before any storage reads/writes.
         assert!(price_per_night > 0, "price_per_night must be positive");
         assert!(title.len() > 0, "title must not be empty");
 
+        // Read the current global counter; defaults to 0 for a freshly deployed contract.
         let count: u64 = env
             .storage()
             .persistent()
@@ -119,6 +144,8 @@ impl PropertyListingContract {
         env.storage()
             .persistent()
             .set(&DataKey::Listing(id), &listing);
+        // Immediately extend TTL after writing so the new entry doesn't start
+        // with a short remaining lifetime inherited from the ledger default.
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::Listing(id), TTL_MIN, TTL_EXTEND_TO);
@@ -126,6 +153,7 @@ impl PropertyListingContract {
         env.storage()
             .persistent()
             .set(&DataKey::ListingCount, &id);
+        // Keep the counter alive — losing it would freeze ID generation.
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::ListingCount, TTL_MIN, TTL_EXTEND_TO);
@@ -133,9 +161,20 @@ impl PropertyListingContract {
         id
     }
 
-    /// Retrieve a listing by ID.
+    /// Retrieve a listing by its on-chain ID.
     ///
-    /// Panics with "Listing not found" if the ID does not exist.
+    /// # Parameters
+    ///
+    /// - `env` (`Env`) — Soroban host environment.
+    /// - `id` (`u64`) — Listing ID returned by [`create_listing`].
+    ///
+    /// # Returns
+    ///
+    /// [`PropertyListing`] — The full listing struct.
+    ///
+    /// # Panics
+    ///
+    /// - If no listing with the given `id` exists (`"Listing not found"`).
     pub fn get_listing(env: Env, id: u64) -> PropertyListing {
         env.storage()
             .persistent()
@@ -143,10 +182,30 @@ impl PropertyListingContract {
             .expect("Listing not found")
     }
 
-    /// Update a listing's mutable fields.
+    /// Update a listing's mutable fields (title, description, price).
     ///
-    /// Only the original owner may call this.
-    /// Panics if caller is not the owner, listing not found, or inputs are invalid.
+    /// The listing's `id`, `owner`, and `status` remain unchanged.
+    ///
+    /// # Parameters
+    ///
+    /// - `env` (`Env`) — Soroban host environment.
+    /// - `caller` (`Address`) — Must equal the listing's `owner` and must authorise the tx.
+    /// - `id` (`u64`) — ID of the listing to update.
+    /// - `title` (`String`) — New title (must not be empty).
+    /// - `description` (`String`) — New description.
+    /// - `price_per_night` (`i128`) — New nightly rate in USDC stroops (must be > 0).
+    ///
+    /// # Panics
+    ///
+    /// - If `caller` has not authorised the transaction.
+    /// - If `caller` is not the listing owner (`"Unauthorized"`).
+    /// - If the listing does not exist (`"Listing not found"`).
+    /// - If `price_per_night <= 0` or `title` is empty.
+    ///
+    /// # Side Effects
+    ///
+    /// - Overwrites `Listing(id)` in persistent storage with updated fields.
+    /// - Extends TTL on the updated entry.
     pub fn update_listing(
         env: Env,
         caller: Address,
@@ -174,14 +233,31 @@ impl PropertyListingContract {
         env.storage()
             .persistent()
             .set(&DataKey::Listing(id), &listing);
+        // Refresh TTL after update so the entry survives until the next interaction.
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::Listing(id), TTL_MIN, TTL_EXTEND_TO);
     }
 
-    /// Update the status of a listing.
+    /// Update the status of a listing (e.g., Active → Inactive).
     ///
-    /// Only the original owner may call this.
+    /// # Parameters
+    ///
+    /// - `env` (`Env`) — Soroban host environment.
+    /// - `caller` (`Address`) — Must equal the listing's `owner` and must authorise the tx.
+    /// - `id` (`u64`) — ID of the listing whose status is being changed.
+    /// - `status` ([`ListingStatus`]) — The new status value.
+    ///
+    /// # Panics
+    ///
+    /// - If `caller` has not authorised the transaction.
+    /// - If `caller` is not the listing owner (`"Unauthorized"`).
+    /// - If the listing does not exist (`"Listing not found"`).
+    ///
+    /// # Side Effects
+    ///
+    /// - Overwrites the `status` field on `Listing(id)` in persistent storage.
+    /// - Extends TTL on the updated entry.
     pub fn update_status(env: Env, caller: Address, id: u64, status: ListingStatus) {
         caller.require_auth();
 
@@ -198,6 +274,7 @@ impl PropertyListingContract {
         env.storage()
             .persistent()
             .set(&DataKey::Listing(id), &listing);
+        // Refresh TTL after status change.
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::Listing(id), TTL_MIN, TTL_EXTEND_TO);
@@ -205,12 +282,26 @@ impl PropertyListingContract {
 
     /// Set a listing's status to `Rented` on behalf of the booking contract.
     ///
-    /// This entry point is intended for cross-contract calls from the booking
-    /// contract. It does NOT require the property owner's auth — instead it
-    /// requires the caller (the booking contract) to authorise itself, which
-    /// Soroban satisfies automatically when one contract invokes another.
+    /// This entry point is intended for **cross-contract calls** from the
+    /// booking contract. It does NOT require the property owner's auth —
+    /// instead, Soroban's automatic contract-to-contract authorisation
+    /// applies when the booking contract invokes this function.
     ///
-    /// Panics if the listing does not exist or is not currently `Active`.
+    /// # Parameters
+    ///
+    /// - `env` (`Env`) — Soroban host environment.
+    /// - `id` (`u64`) — Listing ID to mark as rented.
+    ///
+    /// # Panics
+    ///
+    /// - If the listing does not exist (`"Listing not found"`).
+    /// - If the listing's current status is not `Active`
+    ///   (`"Property is not available for booking"`).
+    ///
+    /// # Side Effects
+    ///
+    /// - Changes `Listing(id).status` to `Rented` in persistent storage.
+    /// - Extends TTL on the updated entry.
     pub fn set_rented(env: Env, id: u64) {
         let mut listing: PropertyListing = env
             .storage()
@@ -228,12 +319,22 @@ impl PropertyListingContract {
         env.storage()
             .persistent()
             .set(&DataKey::Listing(id), &listing);
+        // Refresh TTL — the booking contract relies on this entry surviving.
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::Listing(id), TTL_MIN, TTL_EXTEND_TO);
     }
 
     /// Return the total number of listings ever created.
+    ///
+    /// # Parameters
+    ///
+    /// - `env` (`Env`) — Soroban host environment.
+    ///
+    /// # Returns
+    ///
+    /// `u64` — Monotonic counter of all listings created (never decremented).
+    ///         Returns `0` if no listings have been created yet.
     pub fn listing_count(env: Env) -> u64 {
         env.storage()
             .persistent()

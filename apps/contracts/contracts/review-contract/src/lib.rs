@@ -72,13 +72,40 @@ pub struct ReviewContract;
 
 #[contractimpl]
 impl ReviewContract {
-    /// Submit a review for `reviewee`.
+    /// Submit a review for a given `reviewee`.
     ///
-    /// Validates:
-    /// - rating is 1–5 (inclusive)
-    /// - reviewer has not already reviewed this reviewee
+    /// Enforces a **one-review-per-pair** invariant: a given `reviewer` may
+    /// only review a given `reviewee` once. The review is timestamped with
+    /// the current ledger timestamp.
     ///
-    /// Returns the new review ID.
+    /// # Parameters
+    ///
+    /// - `env` (`Env`) — Soroban host environment.
+    /// - `reviewer` (`Address`) — Stellar address submitting the review;
+    ///   must authorise this call.
+    /// - `reviewee` (`Address`) — Stellar address being reviewed (e.g., a
+    ///   property owner).
+    /// - `rating` (`u32`) — Rating from 1 to 5 inclusive.
+    /// - `comment` (`String`) — Free-text review comment.
+    ///
+    /// # Returns
+    ///
+    /// `u64` — The newly assigned global review ID.
+    ///
+    /// # Panics
+    ///
+    /// - If `reviewer` has not authorised the transaction.
+    /// - If `rating < 1` or `rating > 5`.
+    /// - If the `reviewer` has already reviewed this `reviewee`
+    ///   (`"Reviewer has already reviewed this user"`).
+    ///
+    /// # Side Effects
+    ///
+    /// - Writes `Review(id)` to persistent storage.
+    /// - Increments and writes `ReviewCount` to persistent storage.
+    /// - Sets the `HasReviewed(reviewer, reviewee)` flag to `true`.
+    /// - Appends the review ID to `UserReviews(reviewee)`.
+    /// - Extends TTL on all four entries.
     pub fn submit_review(
         env: Env,
         reviewer: Address,
@@ -93,6 +120,9 @@ impl ReviewContract {
         assert!(rating <= 5, "Rating must be at most 5");
 
         // ── Duplicate prevention ──────────────────────────────────────────
+        // Use a (reviewer, reviewee) composite key to ensure that each
+        // reviewer can submit at most one review per reviewee. This is a
+        // boolean flag stored in persistent storage.
         let already_reviewed: bool = env
             .storage()
             .persistent()
@@ -120,6 +150,7 @@ impl ReviewContract {
         env.storage()
             .persistent()
             .set(&DataKey::Review(id), &review);
+        // Extend TTL so the review persists for reputation queries.
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::Review(id), TTL_MIN, TTL_EXTEND_TO);
@@ -127,14 +158,18 @@ impl ReviewContract {
         env.storage()
             .persistent()
             .set(&DataKey::ReviewCount, &id);
+        // Keep the counter alive — losing it would corrupt ID generation.
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::ReviewCount, TTL_MIN, TTL_EXTEND_TO);
 
-        // Mark duplicate-prevention flag
+        // Set the duplicate-prevention flag so a second review from the
+        // same reviewer for this reviewee will be rejected.
         env.storage()
             .persistent()
             .set(&DataKey::HasReviewed(reviewer.clone(), reviewee.clone()), &true);
+        // Extend TTL on the flag — if it expires, the reviewer could
+        // accidentally submit a duplicate.
         env.storage()
             .persistent()
             .extend_ttl(
@@ -143,7 +178,8 @@ impl ReviewContract {
                 TTL_EXTEND_TO,
             );
 
-        // Append to per-reviewee index
+        // Append to per-reviewee index so queries and reputation calculations
+        // can enumerate all reviews for a given user.
         let mut user_reviews: Vec<u64> = env
             .storage()
             .persistent()
@@ -153,6 +189,7 @@ impl ReviewContract {
         env.storage()
             .persistent()
             .set(&DataKey::UserReviews(reviewee.clone()), &user_reviews);
+        // The per-reviewee index must survive as long as the reviews do.
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::UserReviews(reviewee), TTL_MIN, TTL_EXTEND_TO);
@@ -161,6 +198,19 @@ impl ReviewContract {
     }
 
     /// Retrieve a review by its global ID.
+    ///
+    /// # Parameters
+    ///
+    /// - `env` (`Env`) — Soroban host environment.
+    /// - `id` (`u64`) — Review ID returned by [`submit_review`].
+    ///
+    /// # Returns
+    ///
+    /// [`Review`] — The full review struct.
+    ///
+    /// # Panics
+    ///
+    /// - If no review with the given `id` exists (`"Review not found"`).
     pub fn get_review(env: Env, id: u64) -> Review {
         env.storage()
             .persistent()
@@ -169,6 +219,15 @@ impl ReviewContract {
     }
 
     /// Return all review IDs submitted for a given reviewee.
+    ///
+    /// # Parameters
+    ///
+    /// - `env` (`Env`) — Soroban host environment.
+    /// - `reviewee` (`Address`) — The address whose reviews are requested.
+    ///
+    /// # Returns
+    ///
+    /// `Vec<u64>` — Review IDs. Returns an empty vector if no reviews exist.
     pub fn get_reviews_for_user(env: Env, reviewee: Address) -> Vec<u64> {
         env.storage()
             .persistent()
@@ -176,8 +235,17 @@ impl ReviewContract {
             .unwrap_or(vec![&env])
     }
 
-    /// Return the average rating for a reviewee (scaled ×100 to avoid floats).
-    /// Returns 0 if no reviews exist.
+    /// Return the average rating for a reviewee, scaled ×100 to avoid
+    /// floating-point arithmetic (e.g., an average of 4.5 is returned as 450).
+    ///
+    /// # Parameters
+    ///
+    /// - `env` (`Env`) — Soroban host environment.
+    /// - `reviewee` (`Address`) — The address whose reputation score is requested.
+    ///
+    /// # Returns
+    ///
+    /// `u32` — `(sum_of_ratings * 100) / count`. Returns `0` if no reviews exist.
     pub fn get_reputation(env: Env, reviewee: Address) -> u32 {
         let ids: Vec<u64> = env
             .storage()
@@ -200,11 +268,21 @@ impl ReviewContract {
             total += review.rating;
         }
 
-        // Average × 100 (e.g. 4.5 → 450)
+        // Multiply by 100 before dividing to preserve one decimal place of
+        // precision without using floats. E.g., 4.5 → 450.
         (total * 100) / ids.len()
     }
 
     /// Return the total number of reviews ever submitted.
+    ///
+    /// # Parameters
+    ///
+    /// - `env` (`Env`) — Soroban host environment.
+    ///
+    /// # Returns
+    ///
+    /// `u64` — Monotonic counter of all reviews submitted (never decremented).
+    ///         Returns `0` if no reviews have been submitted yet.
     pub fn review_count(env: Env) -> u64 {
         env.storage()
             .persistent()
