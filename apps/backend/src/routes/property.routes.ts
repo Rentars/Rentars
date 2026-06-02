@@ -6,9 +6,19 @@ import {
   getProperty,
   updatePropertyHandler,
 } from '@/controllers/property.controller.js';
+import {
+  uploadImage,
+  listImages,
+  deleteImage,
+  setAsPrimary,
+} from '@/controllers/propertyImage.controller.js';
+import {
+  getAvailability,
+  addAvailabilityBlock,
+  removeAvailabilityBlock,
+} from '@/controllers/availability.controller.js';
 import { authenticate } from '@/middleware/auth.middleware.js';
 import { upload } from '@/middleware/multer.js';
-import { uploadPropertyImage } from '@/middleware/upload.middleware.js';
 
 const router = Router();
 
@@ -26,5 +36,30 @@ router.put('/:id', authenticate, updatePropertyHandler);
 
 // DELETE /api/v1/properties/:id
 router.delete('/:id', authenticate, deletePropertyHandler);
+
+// ── Image management ───────────────────────────────────────────────────────────
+
+// GET /api/v1/properties/:id/images
+router.get('/:id/images', listImages);
+
+// POST /api/v1/properties/:id/images
+router.post('/:id/images', authenticate, upload.single('image'), uploadImage);
+
+// DELETE /api/v1/properties/:id/images/:imageId
+router.delete('/:id/images/:imageId', authenticate, deleteImage);
+
+// PATCH /api/v1/properties/:id/images/:imageId/primary
+router.patch('/:id/images/:imageId/primary', authenticate, setAsPrimary);
+
+// ── Availability management ────────────────────────────────────────────────────
+
+// GET /api/v1/properties/:id/availability
+router.get('/:id/availability', getAvailability);
+
+// POST /api/v1/properties/:id/availability
+router.post('/:id/availability', authenticate, addAvailabilityBlock);
+
+// DELETE /api/v1/properties/:id/availability/:rangeId
+router.delete('/:id/availability/:rangeId', authenticate, removeAvailabilityBlock);
 
 export default router;
