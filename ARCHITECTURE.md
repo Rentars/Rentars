@@ -4,6 +4,7 @@ This document provides a comprehensive overview of the Rentars system design, da
 
 ---
 
+
 ## System Overview
 
 Rentars is a decentralized peer-to-peer rental platform built on the Stellar blockchain. The system connects property owners and tenants through a modern web interface, REST API, and Soroban smart contracts.
