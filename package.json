@@ -9,7 +9,8 @@
     "lint": "bun run lint",
     "format": "biome format --write .",
     "format-and-lint": "biome check .",
-    "format-and-lint:fix": "biome check . --write"
+    "format-and-lint:fix": "biome check . --write",
+    "dev:docker": "docker compose up --build"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",

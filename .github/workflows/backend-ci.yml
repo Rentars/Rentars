@@ -1,0 +1,65 @@
+name: Backend CI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'apps/backend/**'
+      - 'biome.json'
+      - '.github/workflows/backend-ci.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'apps/backend/**'
+      - 'biome.json'
+      - '.github/workflows/backend-ci.yml'
+
+jobs:
+  backend-ci:
+    name: Lint, Type-check & Test
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: apps/backend
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: apps/backend/node_modules
+          key: ${{ runner.os }}-bun-${{ hashFiles('apps/backend/bun.lockb', 'apps/backend/package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Run Biome check
+        working-directory: .
+        run: bunx biome check apps/backend
+
+      - name: Type-check
+        run: bunx tsc --noEmit
+
+      - name: Run tests with coverage
+        run: bun test --coverage --coverage-reporter=lcov --coverage-dir=./coverage
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-coverage-${{ github.sha }}
+          path: apps/backend/coverage/
+          retention-days: 14
+          if-no-files-found: warn
