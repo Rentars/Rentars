@@ -18,7 +18,11 @@ export const registerSchema = z.object({
   password: z
     .string({ required_error: 'password is required' })
     .min(8, 'password must be at least 8 characters')
-    .max(128, 'password must be at most 128 characters'),
+    .max(128, 'password must be at most 128 characters')
+    .regex(/[A-Z]/, 'password must contain at least one uppercase letter')
+    .regex(/[a-z]/, 'password must contain at least one lowercase letter')
+    .regex(/[0-9]/, 'password must contain at least one number')
+    .regex(/[^A-Za-z0-9]/, 'password must contain at least one special character'),
 
   name: z
     .string({ required_error: 'name is required' })

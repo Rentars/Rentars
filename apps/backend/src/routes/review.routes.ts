@@ -6,11 +6,12 @@ import {
   getUserReviews,
   getUserAverageRating,
 } from '../controllers/review.controller.js';
+import { createReviewSchema, validateBody } from '../validators/review.validator.js';
 
 const router = Router();
 
 // POST /api/reviews
-router.post('/', authenticate, createReview);
+router.post('/', authenticate, validateBody(createReviewSchema), createReview);
 
 // GET /api/reviews/property/:id
 router.get('/property/:id', getPropertyReviews);

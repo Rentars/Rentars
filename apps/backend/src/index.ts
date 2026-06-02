@@ -1,6 +1,7 @@
 import cors from 'cors';
 import dotenv from 'dotenv';
 import express from 'express';
+import helmet from 'helmet';
 import { errorMiddleware } from './middleware/error.middleware';
 import { rateLimiter } from './middleware/rateLimiter';
 import authRoutes from './routes/auth.routes';
@@ -13,12 +14,26 @@ dotenv.config();
 
 export const app = express();
 
-app.use(express.json());
+// Security headers
+app.use(helmet());
+
+app.use(express.json({ limit: '10kb' }));
+
+// CORS — support comma-separated list of allowed origins
+const allowedOrigins = (process.env.CORS_ORIGIN || 'http://localhost:3001')
+  .split(',')
+  .map((o) => o.trim());
+
 app.use(
   cors({
-    origin: [env.CORS_ORIGIN],
+    origin: (origin, callback) => {
+      // Allow non-browser requests (e.g. mobile, curl) only in dev
+      if (!origin && process.env.NODE_ENV !== 'production') return callback(null, true);
+      if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+      callback(new Error(`CORS: origin ${origin} not allowed`));
+    },
     credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
   })
 );
