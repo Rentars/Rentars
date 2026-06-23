@@ -1,6 +1,6 @@
 'use client';
 
-import BookingCard from './components/BookingCard';
+import BookingCard from '@/app/dashboard/tenant-dashboard/components/BookingCard';
 
 interface BookingHistoryProps {
   bookings: Array<{
