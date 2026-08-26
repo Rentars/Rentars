@@ -23,6 +23,7 @@ export default function BlockchainVerification({
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [pollCount, setPollCount] = useState(0);
+  const [pollingTimedOut, setPollingTimedOut] = useState(false);
 
   const loadStatus = useCallback(async () => {
     try {
@@ -45,28 +46,34 @@ export default function BlockchainVerification({
 
   // Poll for status updates when pending
   useEffect(() => {
-    if (!status || !status.pending || pollCount >= MAX_POLL_ATTEMPTS) {
+    if (!status?.pending || pollingTimedOut) {
+      return;
+    }
+
+    // Cap reached — mark as timed out instead of looping forever
+    if (pollCount >= MAX_POLL_ATTEMPTS) {
+      setPollingTimedOut(true);
       return;
     }
 
     const timer = setTimeout(async () => {
       const updatedStatus = await loadStatus();
-      setPollCount(prev => prev + 1);
-      
-      // Stop polling if terminal state reached
+      // Terminal states stop the poll counter from advancing further
       if (updatedStatus && (updatedStatus.verified || updatedStatus.failed)) {
-        setPollCount(0);
+        return;
       }
+      setPollCount(prev => prev + 1);
     }, POLL_INTERVAL);
 
     return () => clearTimeout(timer);
-  }, [status, pollCount, loadStatus]);
+  }, [status, pollCount, pollingTimedOut, loadStatus]);
 
   const handleVerify = async () => {
     try {
       setVerifying(true);
       setError(null);
       setPollCount(0);
+      setPollingTimedOut(false);
       const data = await verifyProperty(propertyId);
       setStatus(data);
     } catch (err) {
@@ -88,7 +95,7 @@ export default function BlockchainVerification({
     if (status?.verified) {
       return <CheckCircle size={20} className="text-green-600" />;
     }
-    if (status?.failed) {
+    if (status?.failed || pollingTimedOut) {
       return <XCircle size={20} className="text-red-600" />;
     }
     if (status?.pending) {
@@ -100,6 +107,7 @@ export default function BlockchainVerification({
   const getStatusText = () => {
     if (status?.verified) return 'Blockchain Verified';
     if (status?.failed) return 'Verification Failed';
+    if (pollingTimedOut) return 'Verification Timed Out';
     if (status?.pending) return 'Verification Pending';
     return 'Not Verified';
   };
@@ -131,6 +139,31 @@ export default function BlockchainVerification({
     );
   }
 
+  if (pollingTimedOut) {
+    return (
+      <div className="p-4 bg-yellow-50 rounded-lg border border-yellow-200">
+        <div className="flex items-center gap-2 text-yellow-800 mb-2">
+          <XCircle size={16} />
+          <span className="text-sm font-medium">Verification Timed Out</span>
+        </div>
+        <p className="text-sm text-yellow-700">
+          Blockchain confirmation did not arrive after {MAX_POLL_ATTEMPTS} attempts. The
+          transaction may still be processing.
+        </p>
+        <button
+          onClick={() => {
+            setPollCount(0);
+            setPollingTimedOut(false);
+            loadStatus();
+          }}
+          className="mt-2 text-xs text-yellow-800 underline hover:no-underline"
+        >
+          Check again
+        </button>
+      </div>
+    );
+  }
+
   if (!status) {
     return null;
   }
@@ -144,7 +177,7 @@ export default function BlockchainVerification({
           {getStatusIcon()}
           <span className="font-semibold text-gray-900">{getStatusText()}</span>
         </div>
-        {status.pending && (
+        {status.pending && !pollingTimedOut && (
           <span className="text-xs text-yellow-600 font-medium">
             Confirming... ({pollCount}/{MAX_POLL_ATTEMPTS})
           </span>
@@ -214,7 +247,7 @@ export default function BlockchainVerification({
         </button>
       )}
 
-      {status.pending && (
+      {status.pending && !pollingTimedOut && (
         <div className="text-xs text-gray-500 text-center">
           Waiting for blockchain confirmation...
         </div>
