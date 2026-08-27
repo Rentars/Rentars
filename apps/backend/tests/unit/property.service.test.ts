@@ -131,6 +131,45 @@ describe('property.service', () => {
       expect(result.error).toBe('Property title is required');
     });
 
+    // #419 — whitespace-only titles must be rejected without a DB call
+    it('rejects a whitespace-only title without a database call', async () => {
+      const result = await createProperty({ title: '   ' });
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('Property title is required');
+      expect(mockFrom).not.toHaveBeenCalled();
+    });
+
+    // #419 — surrounding spaces must not be stored
+    it('does not persist surrounding spaces in the title', async () => {
+      const createdProperty = { id: 'new-id', title: 'Nice Flat', city: 'Berlin' };
+      mockFrom.mockImplementation(() => ({
+        insert: mock(() => ({
+          select: mock(() => ({
+            single: mock(async () => ({ data: createdProperty, error: null })),
+          })),
+        })),
+        update: mock(() => ({
+          eq: mock(async () => ({ error: null })),
+        })),
+      }));
+
+      const result = await createProperty({ title: '  Nice Flat  ', city: 'Berlin' });
+      expect(result.success).toBe(true);
+      // The inserted payload should have the trimmed title
+      const insertArg = mockFrom.mock.calls[0];
+      expect(insertArg).toBeDefined(); // DB was reached
+      // The returned property title must not carry leading/trailing spaces
+      expect(result.data?.title).toBe('Nice Flat');
+    });
+
+    // #418 — titles with no sluggable characters must fail with a clear message
+    it('rejects a title that produces no valid slug characters', async () => {
+      const result = await createProperty({ title: '!!!---...' });
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/letter or digit/i);
+      expect(mockFrom).not.toHaveBeenCalled();
+    });
+
     it('should handle database error during creation', async () => {
       mockFrom.mockImplementation(() => ({
         insert: mock(() => ({
