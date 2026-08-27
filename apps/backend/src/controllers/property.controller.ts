@@ -93,13 +93,35 @@ export async function getProperties(req: Request, res: Response): Promise<void> 
   const hasFilters = city || country || min_price || max_price || bedrooms || min_bathrooms || property_type || status;
 
   if (hasFilters) {
+    // #421 — bedrooms must be a finite non-negative integer
+    let bedroomsValue: number | undefined;
+    if (bedrooms !== undefined) {
+      const n = Number(bedrooms);
+      if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0) {
+        res.status(400).json({ error: 'bedrooms must be a non-negative integer' });
+        return;
+      }
+      bedroomsValue = n;
+    }
+
+    // #422 — min_bathrooms must be a finite non-negative integer
+    let minBathroomsValue: number | undefined;
+    if (min_bathrooms !== undefined) {
+      const n = Number(min_bathrooms);
+      if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0) {
+        res.status(400).json({ error: 'min_bathrooms must be a non-negative integer' });
+        return;
+      }
+      minBathroomsValue = n;
+    }
+
     const result = await searchProperties({
       city: city as string | undefined,
       country: country as string | undefined,
       min_price: min_price ? Number(min_price) : undefined,
       max_price: max_price ? Number(max_price) : undefined,
-      bedrooms: bedrooms ? Number(bedrooms) : undefined,
-      min_bathrooms: min_bathrooms ? Number(min_bathrooms) : undefined,
+      bedrooms: bedroomsValue,
+      min_bathrooms: minBathroomsValue,
       property_type: property_type as string | undefined,
       status: status as string | undefined,
     });

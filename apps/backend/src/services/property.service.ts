@@ -1005,11 +1005,24 @@ export async function advancedSearch(
   return { success: true, data: pageResult };
 }
 
-function toTsQuery(input: string): string {
+/**
+ * Convert a free-text search string into a safe PostgreSQL tsquery expression.
+ *
+ * All characters that have special meaning in tsquery syntax (`&`, `|`, `!`,
+ * `(`, `)`, `:`, `*`, `'`, `\`) as well as every non-alphanumeric character
+ * are stripped from each token before it is appended with the prefix-match
+ * operator (`:*`).  This guarantees that user input can never alter the query
+ * structure or produce a database syntax error.
+ *
+ * Exported so it can be unit-tested in isolation.
+ */
+export function toTsQuery(input: string): string {
   const tokens = input
     .toLowerCase()
     .split(/\s+/)
-    .map((t) => t.replace(/[^a-z0-9_-]/g, ''))
+    // Keep only plain alphanumeric characters — strip everything else,
+    // including all PostgreSQL tsquery operators (&, |, !, (, ), :, *, ', \).
+    .map((t) => t.replace(/[^a-z0-9]/g, ''))
     .filter(Boolean);
 
   if (tokens.length === 0) return '';
