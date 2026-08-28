@@ -257,7 +257,9 @@ export async function getPropertyById(
 export async function createProperty(
   payload: Partial<Property>,
 ): Promise<ServiceResponse<Property>> {
-  if (!payload.title) {
+  // Trim first so whitespace-only titles are caught by the truthiness guard (#419)
+  const trimmedTitle = payload.title?.trim();
+  if (!trimmedTitle) {
     return { success: false, error: 'Property title is required' };
   }
 
@@ -269,12 +271,20 @@ export async function createProperty(
   // Sanitize user-generated text fields before storing
   const sanitized: Partial<Property> = {
     ...payload,
-    title: sanitizeShortText(payload.title, 255),
+    title: sanitizeShortText(trimmedTitle, 255),
     description: payload.description ? sanitizeLongText(payload.description, 10_000) : undefined,
     additional_rules: payload.additional_rules
       ? sanitizeLongText(payload.additional_rules, 2_000)
       : undefined,
   };
+
+  // Guard against titles that produce no valid slug (#418).
+  // generateSlug falls back to "property-<suffix>" for empty bases, but a title
+  // with no sluggable characters is itself invalid — reject it early.
+  const prospectiveSlug = generateSlug(trimmedTitle, payload.city, 'probe');
+  if (prospectiveSlug.startsWith('property-')) {
+    return { success: false, error: 'Property title must contain at least one letter or digit' };
+  }
 
   const { data, error } = await supabase
     .from('properties')

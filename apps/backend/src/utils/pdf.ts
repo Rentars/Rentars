@@ -28,9 +28,24 @@ interface RectOptions {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/** Convert a 6-digit hex colour to PDF r g b values (0–1 range). */
-function hexToRgb(hex: string): [number, number, number] {
+/** Convert a 6-digit hex colour to PDF r g b values (0–1 range).
+ *
+ * Only accepts complete six-digit hex strings (with or without a leading '#').
+ * Partial, empty, or non-hex values silently fall back to black (0 0 0) so
+ * that callers which pass a malformed colour never produce invalid PDF output
+ * with incorrect or NaN RGB channel values (issue #485).
+ */
+export function hexToRgb(hex: string): [number, number, number] {
+  const FALLBACK: [number, number, number] = [0, 0, 0];
+
+  if (typeof hex !== 'string') return FALLBACK;
+
   const h = hex.replace('#', '');
+
+  // Require exactly 6 hex digits — reject 3-digit shorthand, empty, or
+  // strings with non-hex characters.
+  if (!/^[0-9a-fA-F]{6}$/.test(h)) return FALLBACK;
+
   const r = parseInt(h.slice(0, 2), 16) / 255;
   const g = parseInt(h.slice(2, 4), 16) / 255;
   const b = parseInt(h.slice(4, 6), 16) / 255;
