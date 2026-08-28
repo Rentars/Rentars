@@ -15,6 +15,7 @@ import {
 } from '../controllers/review.controller.js';
 import { validateBody } from '../validators/booking.validator.js';
 import { createReviewSchema, flagReviewSchema } from '../validators/review.validator.js';
+import { validatePagination } from '../validators/pagination.validator.js';
 
 const router = Router();
 
@@ -22,10 +23,10 @@ const router = Router();
 router.post('/', authenticate, validateBody(createReviewSchema), createReview);
 
 // GET /api/reviews/property/:id
-router.get('/property/:id', getPropertyReviews);
+router.get('/property/:id', validatePagination, getPropertyReviews);
 
 // GET /api/reviews/user/:id
-router.get('/user/:id', getUserReviews);
+router.get('/user/:id', validatePagination, getUserReviews);
 
 // GET /api/reviews/user/:id/average
 router.get('/user/:id/average', getUserAverageRating);

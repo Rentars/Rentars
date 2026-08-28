@@ -16,3 +16,5 @@ export interface ServiceResponse<T = unknown> {
   /** True when failure is due to a booking date conflict (maps to HTTP 409). */
   conflict?: boolean;
 }
+
+export type { PaginatedResult } from '../types/pagination.js';

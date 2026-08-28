@@ -222,40 +222,30 @@ export class BookingService {
    */
   async getUserBookings(
     userId: string,
-    cursor?: string | null,
-    limit = 20,
+    page = 1,
+    pageSize = 20,
     status?: string | null,
     sort: 'date' | 'price' | 'created' = 'created',
     order: 'asc' | 'desc' = 'desc',
-  ): Promise<ServiceResponse<CursorPaginatedResult<Booking>>> {
+  ): Promise<ServiceResponse<PaginatedResult<Booking>>> {
     const trimmedUserId = (userId ?? '').trim();
     if (!trimmedUserId) {
       return { success: false, error: 'User ID is required' };
     }
 
-    // Cursor keyset is only defined for the created_at sort field. Reject
-    // cursors for date/price sorts instead of silently ignoring them and
-    // serving duplicate or restarted pages.
-    if (cursor && sort !== 'created') {
-      return {
-        success: false,
-        error: 'Cursor pagination is only supported for sort=created',
-      };
-    }
-
-    const pageSize = Math.min(Math.max(1, limit), 100);
-    const decoded = decodeCursor(cursor);
+    if (!Number.isInteger(page) || page < 1) return { success: false, error: 'page must be a positive integer' };
+    if (!Number.isInteger(pageSize) || pageSize < 1) return { success: false, error: 'pageSize must be a positive integer' };
+    pageSize = Math.min(pageSize, 100);
 
     const sortColumn = sort === 'date' ? 'check_in' : sort === 'price' ? 'total_price' : 'created_at';
     const ascending = order === 'asc';
 
     let query = supabase
       .from('bookings')
-      .select('*')
+      .select('*', { count: 'exact' })
       .eq('tenant_id', trimmedUserId)
       .order(sortColumn, { ascending })
-      .order('id', { ascending: false })
-      .limit(pageSize + 1);
+      .order('id', { ascending: false });
 
     if (status) {
       const KNOWN_STATUSES = ['Pending', 'Confirmed', 'Cancelled', 'Completed', 'Disputed'] as const;
@@ -274,22 +264,9 @@ export class BookingService {
       }
     }
 
-    if (decoded && sort === 'created') {
-      query = query.or(
-        `created_at.lt.${decoded.created_at},and(created_at.eq.${decoded.created_at},id.lt.${decoded.id})`,
-      );
-    }
-
-    const { data, error } = await query;
-
-    if (error) {
-      return { success: false, error: error.message };
-    }
-
-    const rows = (data ?? []) as Booking[];
-    const page = buildCursorPage(rows, pageSize);
-
-    return { success: true, data: page };
+    const response = await executePaginatedQuery(query, page, pageSize);
+    if (response.error) return { success: false, error: response.error };
+    return { success: true, data: response.result };
   }
 
   // ── Create ─────────────────────────────────────────────────────────────────
