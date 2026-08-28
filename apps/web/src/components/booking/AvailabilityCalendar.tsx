@@ -103,8 +103,8 @@ export default function AvailabilityCalendar({
       if (prev) {
         const prevDay = parseInt(prev.split('-')[2], 10);
         const daysInMonth = new Date(year, month, 0).getDate();
-        const clamped = Math.min(prevDay, daysInMonth);
-        return toISO(year, month, clamped);
+        const day = Number.isFinite(prevDay) ? Math.min(prevDay, daysInMonth) : 1;
+        return toISO(year, month, day);
       }
       return days.length > 0 ? days[0].date : toISO(year, month, 1);
     });
