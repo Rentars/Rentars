@@ -93,11 +93,32 @@ export async function getProperties(req: Request, res: Response): Promise<void> 
   const hasFilters = city || country || min_price || max_price || bedrooms || min_bathrooms || property_type || status;
 
   if (hasFilters) {
+    // Parse and validate price bounds (#420)
+    const parsedMinPrice = min_price !== undefined ? Number(min_price) : undefined;
+    const parsedMaxPrice = max_price !== undefined ? Number(max_price) : undefined;
+
+    if (parsedMinPrice !== undefined && (!Number.isFinite(parsedMinPrice) || parsedMinPrice < 0)) {
+      res.status(400).json({ error: 'min_price must be a non-negative number' });
+      return;
+    }
+    if (parsedMaxPrice !== undefined && (!Number.isFinite(parsedMaxPrice) || parsedMaxPrice < 0)) {
+      res.status(400).json({ error: 'max_price must be a non-negative number' });
+      return;
+    }
+    if (
+      parsedMinPrice !== undefined &&
+      parsedMaxPrice !== undefined &&
+      parsedMinPrice > parsedMaxPrice
+    ) {
+      res.status(400).json({ error: 'min_price must be less than or equal to max_price' });
+      return;
+    }
+
     const result = await searchProperties({
       city: city as string | undefined,
       country: country as string | undefined,
-      min_price: min_price ? Number(min_price) : undefined,
-      max_price: max_price ? Number(max_price) : undefined,
+      min_price: parsedMinPrice,
+      max_price: parsedMaxPrice,
       bedrooms: bedrooms ? Number(bedrooms) : undefined,
       min_bathrooms: min_bathrooms ? Number(min_bathrooms) : undefined,
       property_type: property_type as string | undefined,

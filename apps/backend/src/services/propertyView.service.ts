@@ -54,11 +54,10 @@ export interface ViewCountResult {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/** Truncate a Date to the start of its UTC hour (the dedup window boundary). */
+/** Truncate a Date to the start of its dedup window boundary. */
 function windowStart(now: Date): string {
-  const d = new Date(now);
-  d.setUTCMinutes(0, 0, 0);
-  return d.toISOString();
+  const ms = now.getTime();
+  return new Date(ms - (ms % WINDOW_MS)).toISOString();
 }
 
 /** Return true if the User-Agent string looks like a known bot. */
