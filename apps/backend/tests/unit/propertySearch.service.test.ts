@@ -1,15 +1,21 @@
 import { describe, it, expect, beforeEach, mock } from 'bun:test';
 
 // ── Supabase mock ─────────────────────────────────────────────────────────────
+// bun:test requires mock.module() to intercept ES module exports.
+// The mock must be set up before the tested module is imported.
 
 const mockRpc = mock(async () => ({ data: null, error: null }));
 const mockFrom = mock((_: string) => ({}));
 
-const mockSupabase = { rpc: mockRpc, from: mockFrom };
-const supabaseMod = await import('../../src/config/supabase.js');
-(supabaseMod as any).supabase = mockSupabase;
+mock.module('../../src/config/supabase.js', () => ({
+  supabase: {
+    get rpc() { return mockRpc; },
+    get from() { return mockFrom; },
+  },
+}));
 
-import { searchPropertiesNearby, searchPropertiesByQuery } from '../../src/services/propertySearch.service.js';
+const { searchPropertiesNearby, searchPropertiesByQuery } =
+  await import('../../src/services/propertySearch.service.js');
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -94,6 +100,61 @@ describe('searchPropertiesNearby', () => {
       lng: 2.35,
       radius_km: 25,
     });
+  });
+
+  // ── #426: null data normalisation ──────────────────────────────────────────
+
+  it('returns empty array when rpc resolves { data: null, error: null }', async () => {
+    mockRpc.mockImplementation(async () => ({ data: null, error: null }));
+
+    const result = await searchPropertiesNearby({ lat: 25.77, lng: -80.19, radiusKm: 10 });
+
+    expect(result.success).toBe(true);
+    expect(result.data).toEqual([]);
+    expect(mockRpc).toHaveBeenCalledTimes(1);
+  });
+
+  // ── #427: radius validation ─────────────────────────────────────────────────
+
+  it('rejects a zero radius before calling the database', async () => {
+    const result = await searchPropertiesNearby({ lat: 25.77, lng: -80.19, radiusKm: 0 });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/finite positive/i);
+    expect(mockRpc).not.toHaveBeenCalled();
+  });
+
+  it('rejects a negative radius before calling the database', async () => {
+    const result = await searchPropertiesNearby({ lat: 25.77, lng: -80.19, radiusKm: -5 });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/finite positive/i);
+    expect(mockRpc).not.toHaveBeenCalled();
+  });
+
+  it('rejects NaN radius before calling the database', async () => {
+    const result = await searchPropertiesNearby({ lat: 25.77, lng: -80.19, radiusKm: NaN });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/finite positive/i);
+    expect(mockRpc).not.toHaveBeenCalled();
+  });
+
+  it('rejects Infinity radius before calling the database', async () => {
+    const result = await searchPropertiesNearby({ lat: 25.77, lng: -80.19, radiusKm: Infinity });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/finite positive/i);
+    expect(mockRpc).not.toHaveBeenCalled();
+  });
+
+  it('accepts a positive finite radius and calls the database', async () => {
+    mockRpc.mockImplementation(async () => ({ data: [], error: null }));
+
+    const result = await searchPropertiesNearby({ lat: 25.77, lng: -80.19, radiusKm: 15 });
+
+    expect(result.success).toBe(true);
+    expect(mockRpc).toHaveBeenCalledTimes(1);
   });
 });
 

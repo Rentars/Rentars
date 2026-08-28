@@ -29,7 +29,7 @@ export default function OccupancyInsights({ occupancy }: OccupancyInsightsProps)
       <div className="w-full bg-gray-200 rounded-full h-2 mb-4">
         <div
           className="bg-blue-600 h-2 rounded-full transition-all"
-          style={{ width: `${Math.min(occupancyRate, 100)}%` }}
+          style={{ width: `${Math.max(0, Math.min(occupancyRate, 100))}%` }}
         />
       </div>
 

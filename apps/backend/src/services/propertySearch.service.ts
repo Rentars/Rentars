@@ -34,6 +34,11 @@ export async function searchPropertiesNearby(
 ): Promise<ServiceResponse<NearbySearchResult[]>> {
   const { lat, lng, radiusKm } = params;
 
+  // Validate radius — must be a finite positive number.
+  if (!Number.isFinite(radiusKm) || radiusKm <= 0) {
+    return { success: false, error: 'radiusKm must be a finite positive number' };
+  }
+
   const { data, error } = await supabase.rpc('search_nearby_properties', {
     lat,
     lng,
@@ -44,6 +49,7 @@ export async function searchPropertiesNearby(
     return { success: false, error: error.message };
   }
 
+  // Normalise a null response (e.g. RPC returns no rows) to an empty array.
   return { success: true, data: (data ?? []) as NearbySearchResult[] };
 }
 
@@ -87,22 +93,33 @@ export function promoteFeatureToTop(
 ): (Property & { is_featured: boolean })[] {
   const effectiveCap = Math.min(Math.max(0, cap), FEATURED_CAP);
 
-  const featured: (Property & { is_featured: boolean })[] = [];
-  const organic:  (Property & { is_featured: boolean })[] = [];
+  // Collect ALL currently-featured candidates first, then sort by weight so
+  // that the highest-weight entries always fill the featured slots — regardless
+  // of their position in the input list.  Applying the cap before sorting
+  // could let a lower-weight early entry displace a higher-weight later entry.
+  const featuredCandidates: Property[] = [];
+  const organic:            Property[] = [];
 
   for (const p of properties) {
-    if (featured.length < effectiveCap && isFeaturedNow(p)) {
-      featured.push({ ...p, is_featured: true });
+    if (isFeaturedNow(p)) {
+      featuredCandidates.push(p);
     } else {
-      organic.push({ ...p, is_featured: false });
+      organic.push(p);
     }
   }
 
-  // Sort the featured slot by weight descending so higher-weight listings
-  // always appear first regardless of the order they came out of the query.
-  featured.sort((a, b) => (b.featured_weight ?? 0) - (a.featured_weight ?? 0));
+  // Sort by weight descending and keep only the top `effectiveCap` entries.
+  featuredCandidates.sort((a, b) => (b.featured_weight ?? 0) - (a.featured_weight ?? 0));
+  const promoted = featuredCandidates.slice(0, effectiveCap);
 
-  return [...featured, ...organic];
+  // Properties that were featured but did not fit the cap are demoted to
+  // organic so they still appear in results (preserving total count).
+  const demoted = featuredCandidates.slice(effectiveCap);
+
+  const featuredOut = promoted.map((p) => ({ ...p, is_featured: true  as const }));
+  const organicOut  = [...demoted, ...organic].map((p) => ({ ...p, is_featured: false as const }));
+
+  return [...featuredOut, ...organicOut];
 }
 
 // ─── Text-based property search ───────────────────────────────────────────────
