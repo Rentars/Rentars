@@ -42,12 +42,14 @@ function toGcalDate(iso: string): string {
  */
 function toGcalEndDate(iso: string): string {
   if (!iso.includes('T')) {
-    const d = new Date(iso + 'T00:00:00Z');
-    d.setUTCDate(d.getUTCDate() + 1);
-    const y = d.getUTCFullYear();
-    const m = (d.getUTCMonth() + 1).toString().padStart(2, '0');
-    const day = d.getUTCDate().toString().padStart(2, '0');
-    return `${y}${m}${day}`;
+    // Parse date-only values as calendar fields so the +1-day adjustment is
+    // independent of the browser's local timezone.
+    const [year, month, day] = iso.split('-').map(Number);
+    const nextDay = new Date(Date.UTC(year, month - 1, day + 1));
+    const nextYear = nextDay.getUTCFullYear();
+    const nextMonth = (nextDay.getUTCMonth() + 1).toString().padStart(2, '0');
+    const nextDate = nextDay.getUTCDate().toString().padStart(2, '0');
+    return `${nextYear}${nextMonth}${nextDate}`;
   }
   return toGcalDate(iso);
 }
