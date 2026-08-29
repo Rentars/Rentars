@@ -71,7 +71,10 @@ export async function del(key: string): Promise<void> {
 export async function invalidatePattern(pattern: string): Promise<void> {
   try {
     await ensureConnected();
-    const keys = await redisClient.keys(pattern);
+    const rawKeys = await redisClient.keys(pattern);
+    // Normalise to an empty array in case the client returns null/undefined
+    // on a temporary response anomaly, preventing a runtime exception.
+    const keys: string[] = Array.isArray(rawKeys) ? rawKeys : [];
     if (keys.length > 0) {
       await redisClient.del(keys);
     }

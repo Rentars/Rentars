@@ -51,12 +51,26 @@ export interface ReceiptData {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-function calcNights(checkIn: string, checkOut: string): number {
+/**
+ * Count the number of nights between two ISO date strings.
+ *
+ * Uses UTC-normalised date-only arithmetic so that DST transitions
+ * (where a wall-clock day can be 23 or 25 hours long) never produce an
+ * off-by-one result. Each "date" is treated as midnight UTC, regardless of
+ * local timezone or DST rules.
+ *
+ * Returns at least 1 to handle same-day edge cases gracefully.
+ */
+export function calcNights(checkIn: string, checkOut: string): number {
+  // Parse only the date portion (YYYY-MM-DD) and interpret it as UTC
+  // midnight so DST offsets cannot inflate or deflate the difference.
+  const parseUTCDate = (iso: string): number => {
+    const [y, m, d] = iso.slice(0, 10).split('-').map(Number);
+    return Date.UTC(y, m - 1, d);
+  };
   const msPerDay = 86_400_000;
-  return Math.max(
-    1,
-    Math.round((new Date(checkOut).getTime() - new Date(checkIn).getTime()) / msPerDay),
-  );
+  const diff = parseUTCDate(checkOut) - parseUTCDate(checkIn);
+  return Math.max(1, Math.round(diff / msPerDay));
 }
 
 function fmtDate(iso: string): string {
