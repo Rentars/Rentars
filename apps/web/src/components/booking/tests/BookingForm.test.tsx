@@ -682,6 +682,41 @@ describe('BookingForm edge cases', () => {
     expect(true).toBe(true);
   });
 
+  it('clears a stale availability error when a retry succeeds', async () => {
+    let availabilityAttempts = 0;
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/quote')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve(makePricingResponse('2027-06-10', '2027-06-13')),
+        } as Response);
+      }
+      if (url.includes('/check')) {
+        availabilityAttempts += 1;
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ available: availabilityAttempts > 1 }),
+        } as Response);
+      }
+      return Promise.resolve({ ok: false, json: () => Promise.resolve({}) } as Response);
+    }));
+
+    const user = userEvent.setup();
+    render(<BookingForm {...defaultProps} />);
+    await user.type(screen.getByLabelText(/check-in/i), '2027-06-10');
+    await user.type(screen.getByLabelText(/check-out/i), '2027-06-13');
+    await waitFor(() => expect(screen.getByText(/300 usdc/i)).toBeInTheDocument());
+
+    const submit = screen.getByRole('button', { name: /book now/i });
+    await user.click(submit);
+    await waitFor(() => expect(screen.getByText(/dates not available/i)).toBeInTheDocument());
+
+    await user.click(submit);
+    await waitFor(() => expect(screen.queryByText(/dates not available/i)).not.toBeInTheDocument());
+    expect(defaultProps.onSubmit).toHaveBeenCalledTimes(1);
+  });
+
   // ── Happy path ───────────────────────────────────────────────────────────
 
   it('calls onSubmit with correct data when form is valid', async () => {
