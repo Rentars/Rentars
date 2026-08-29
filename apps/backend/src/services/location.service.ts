@@ -69,8 +69,12 @@ export class LocationService {
         `https://nominatim.openstreetmap.org/reverse?lat=${roundedLat}&lon=${roundedLng}&format=json`;
       const response = await fetch(url, {
         headers: { 'User-Agent': 'Rentars/1.0 (rentals platform)' },
+        signal: AbortSignal.timeout(10_000),
       });
 
+      if (response.status === 429) {
+        return { success: false, error: 'Reverse geocoding rate limit exceeded', statusCode: 429 };
+      }
       if (!response.ok) {
         return { success: false, error: 'Reverse geocoding service unavailable', statusCode: 502 };
       }
@@ -120,8 +124,12 @@ export class LocationService {
       const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(address)}&format=json&limit=1`;
       const response = await fetch(url, {
         headers: { 'User-Agent': 'Rentars/1.0 (rentals platform)' },
+        signal: AbortSignal.timeout(10_000),
       });
 
+      if (response.status === 429) {
+        return { success: false, error: 'Geocoding rate limit exceeded', statusCode: 429 };
+      }
       if (!response.ok) {
         return { success: false, error: 'Geocoding service unavailable', statusCode: 502 };
       }
