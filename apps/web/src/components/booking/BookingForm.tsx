@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Calendar, Users, AlertCircle } from 'lucide-react';
 import { useTranslations } from '@/lib/i18n/useTranslations';
 import { useLocale } from '@/lib/i18n/useLocale';
@@ -58,10 +58,13 @@ export default function BookingForm({
   useEffect(() => {
     if (!checkIn || !checkOut) return;
 
+    const controller = new AbortController();
+
     const fetchPricing = async () => {
       try {
         const res = await fetch(
           `${API_URL}/api/v1/properties/${propertyId}/quote?start=${checkIn}&end=${checkOut}`,
+          { signal: controller.signal },
         );
 
         if (res.ok) {
@@ -75,22 +78,29 @@ export default function BookingForm({
               : t('cantCalculatePrice'),
           );
         }
-      } catch {
+      } catch (err) {
+        if ((err as Error).name === 'AbortError') return;
         setDateError('Failed to fetch pricing');
       }
     };
 
     fetchPricing();
-  }, [checkIn, checkOut, propertyId, t]);
+
+    return () => {
+      controller.abort();
+    };
+  }, [checkIn, checkOut, propertyId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleGuestChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const val = parseInt(e.target.value, 10);
-    setGuestCount(isNaN(val) ? 1 : val);
+    // Store 0 when the field is empty (NaN) so the user can freely edit the value.
+    // The minimum guest count is enforced by the error message and submit guard.
+    setGuestCount(isNaN(val) ? 0 : val);
 
-    if (maxGuests !== undefined && val > maxGuests) {
-      setGuestError(`Maximum ${maxGuests} guest${maxGuests === 1 ? '' : 's'} allowed`);
-    } else if (val < 1) {
+    if (isNaN(val) || val < 1) {
       setGuestError('At least 1 guest is required');
+    } else if (maxGuests !== undefined && val > maxGuests) {
+      setGuestError(`Maximum ${maxGuests} guest${maxGuests === 1 ? '' : 's'} allowed`);
     } else {
       setGuestError('');
     }
