@@ -32,7 +32,8 @@ export async function createReview(req: AuthRequest, res: Response): Promise<voi
 }
 
 export async function getPropertyReviews(req: Request, res: Response): Promise<void> {
-  const result = await getReviewsForProperty(req.params.id);
+  const pagination = (req as Request & { parsedPagination?: { page: number; pageSize: number } }).parsedPagination;
+  const result = await getReviewsForProperty(req.params.id, pagination?.page ?? 1, pagination?.pageSize ?? 20);
   if (!result.success) {
     res.status(400).json({ error: result.error });
     return;
@@ -41,7 +42,8 @@ export async function getPropertyReviews(req: Request, res: Response): Promise<v
 }
 
 export async function getUserReviews(req: Request, res: Response): Promise<void> {
-  const result = await getReviewsForUser(req.params.id);
+  const pagination = (req as Request & { parsedPagination?: { page: number; pageSize: number } }).parsedPagination;
+  const result = await getReviewsForUser(req.params.id, pagination?.page ?? 1, pagination?.pageSize ?? 20);
   if (!result.success) {
     res.status(400).json({ error: result.error });
     return;

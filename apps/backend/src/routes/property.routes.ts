@@ -37,11 +37,12 @@ import { authenticate } from '@/middleware/auth.middleware.js';
 import { requireEmailVerified } from '@/middleware/emailVerified.middleware.js';
 import { upload } from '@/middleware/multer.js';
 import { geoSearchSchema, validateQuery } from '@/validators/property.validator.js';
+import { validatePagination } from '@/validators/pagination.validator.js';
 
 const router = Router();
 
 // GET /api/v1/properties
-router.get('/', getProperties);
+router.get('/', validatePagination, getProperties);
 
 // GET /api/v1/properties/search/advanced - Advanced search with filters
 router.get('/search/advanced', advancedSearchHandler);

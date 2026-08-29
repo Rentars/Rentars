@@ -2,6 +2,8 @@ import { supabase } from '../config/supabase.js';
 import * as cache from './cache.service.js';
 import type { ServiceResponse } from './index.js';
 import { sanitizeLongText, sanitizeResponse } from '../utils/sanitize.js';
+import type { PaginatedResult } from '../types/pagination.js';
+import { executePaginatedQuery } from '../utils/pagination.js';
 
 export type ModerationStatus = 'pending' | 'approved' | 'rejected';
 
@@ -111,28 +113,30 @@ export async function submitReview(
   return { success: true, data: data as Review };
 }
 
-export async function getReviewsForProperty(propertyId: string): Promise<ServiceResponse<Review[]>> {
-  const { data, error } = await supabase
+export async function getReviewsForProperty(propertyId: string, page = 1, pageSize = 20): Promise<ServiceResponse<PaginatedResult<Review>>> {
+  const query = supabase
     .from('reviews')
-    .select('*')
+    .select('*', { count: 'exact' })
     .eq('property_id', propertyId)
     .eq('moderation_status', 'approved')
     .order('created_at', { ascending: false });
 
-  if (error) return { success: false, error: error.message };
-  return { success: true, data: (data ?? []) as Review[] };
+  const response = await executePaginatedQuery(query, page, pageSize);
+  if (response.error) return { success: false, error: response.error };
+  return { success: true, data: response.result };
 }
 
-export async function getReviewsForUser(userId: string): Promise<ServiceResponse<Review[]>> {
-  const { data, error } = await supabase
+export async function getReviewsForUser(userId: string, page = 1, pageSize = 20): Promise<ServiceResponse<PaginatedResult<Review>>> {
+  const query = supabase
     .from('reviews')
-    .select('*')
+    .select('*', { count: 'exact' })
     .eq('target_id', userId)
     .eq('moderation_status', 'approved')
     .order('created_at', { ascending: false });
 
-  if (error) return { success: false, error: error.message };
-  return { success: true, data: (data ?? []) as Review[] };
+  const response = await executePaginatedQuery(query, page, pageSize);
+  if (response.error) return { success: false, error: response.error };
+  return { success: true, data: response.result };
 }
 
 export async function getAverageRating(userId: string): Promise<ServiceResponse<number>> {

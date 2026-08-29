@@ -31,6 +31,7 @@ import {
   validateBody,
 } from '@/validators/booking.validator.js';
 import { env } from '@/config/env.js';
+import { validatePagination } from '@/validators/pagination.validator.js';
 
 const router = Router();
 
@@ -48,7 +49,7 @@ const bookingCreationLimiter = createUserRateLimiter({
 });
 
 // GET /api/v1/bookings — list current user's bookings (cursor pagination)
-router.get('/', authenticate, listUserBookings);
+router.get('/', authenticate, validatePagination, listUserBookings);
 
 // GET /api/v1/bookings/:id
 router.get('/:id', authenticate, getBooking);

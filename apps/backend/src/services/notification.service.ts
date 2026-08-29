@@ -3,6 +3,8 @@ import { emailService } from './email.service.js';
 import { buildPreferenceUrlForUser } from './preferenceToken.js';
 import type { ServiceResponse } from './index.js';
 import { decodeCursor, buildCursorPage } from '../utils/cursor.js';
+import type { PaginatedResult } from '../types/pagination.js';
+import { executePaginatedQuery } from '../utils/pagination.js';
 
 export interface CursorPaginatedResult<T> {
   data: T[];
@@ -109,16 +111,16 @@ export async function createNotification(
   return { success: true, data: notification as Notification };
 }
 
-export async function getNotifications(userId: string): Promise<ServiceResponse<Notification[]>> {
-  const { data, error } = await supabase
+export async function getNotifications(userId: string, page = 1, pageSize = 20): Promise<ServiceResponse<PaginatedResult<Notification>>> {
+  const query = supabase
     .from('notifications')
-    .select('*')
+    .select('*', { count: 'exact' })
     .eq('user_id', userId)
-    .order('created_at', { ascending: false })
-    .limit(50);
+    .order('created_at', { ascending: false });
 
-  if (error) return { success: false, error: error.message };
-  return { success: true, data: (data ?? []) as Notification[] };
+  const response = await executePaginatedQuery(query, page, Math.min(Math.max(1, pageSize), 100));
+  if (response.error) return { success: false, error: response.error };
+  return { success: true, data: response.result };
 }
 
 /**

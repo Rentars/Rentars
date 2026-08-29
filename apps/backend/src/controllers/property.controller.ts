@@ -90,6 +90,7 @@ function applyLocationPrivacyToList(properties: Property[]): Record<string, unkn
 
 export async function getProperties(req: Request, res: Response): Promise<void> {
   const { city, country, min_price, max_price, bedrooms, min_bathrooms, property_type, status } = req.query;
+  const pagination = (req as Request & { parsedPagination?: { page: number; pageSize: number } }).parsedPagination;
   const hasFilters = city || country || min_price || max_price || bedrooms || min_bathrooms || property_type || status;
 
   if (hasFilters) {
@@ -123,6 +124,8 @@ export async function getProperties(req: Request, res: Response): Promise<void> 
       min_bathrooms: min_bathrooms ? Number(min_bathrooms) : undefined,
       property_type: property_type as string | undefined,
       status: status as string | undefined,
+      page: pagination?.page ?? 1,
+      pageSize: pagination?.pageSize ?? 20,
     });
 
     if (!result.success) {
@@ -130,17 +133,17 @@ export async function getProperties(req: Request, res: Response): Promise<void> 
       return;
     }
 
-    res.json(applyLocationPrivacyToList(result.data));
+    res.json({ ...result.data, data: applyLocationPrivacyToList(result.data.data) });
     return;
   }
 
-  const result = await getAllProperties();
+  const result = await getAllProperties(pagination?.page ?? 1, pagination?.pageSize ?? 20);
   if (!result.success) {
     res.status(500).json({ error: result.error });
     return;
   }
 
-  res.json(applyLocationPrivacyToList(result.data));
+  res.json({ ...result.data, data: applyLocationPrivacyToList(result.data.data) });
 }
 
 // ─── Featured ─────────────────────────────────────────────────────────────────

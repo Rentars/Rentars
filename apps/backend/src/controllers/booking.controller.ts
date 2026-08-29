@@ -14,13 +14,9 @@ export async function listUserBookings(req: AuthRequest, res: Response): Promise
     return;
   }
 
-  const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : null;
-  const limit = req.query.limit ? Number(req.query.limit) : 20;
-
-  if (!Number.isFinite(limit) || !Number.isInteger(limit) || limit < 1) {
-    res.status(422).json({ error: 'limit must be a positive integer' });
-    return;
-  }
+  const pagination = (req as AuthRequest & { parsedPagination?: { page: number; pageSize: number } }).parsedPagination;
+  const page = pagination?.page ?? Number(req.query.page ?? 1);
+  const pageSize = pagination?.pageSize ?? Number(req.query.pageSize ?? req.query.limit ?? 20);
 
   const status = typeof req.query.status === 'string' ? req.query.status : null;
 
@@ -30,7 +26,7 @@ export async function listUserBookings(req: AuthRequest, res: Response): Promise
   const orderRaw = typeof req.query.order === 'string' ? req.query.order : 'desc';
   const order = orderRaw === 'asc' ? 'asc' : 'desc';
 
-  const result = await bookingService.getUserBookings(userId, cursor, limit, status, sort, order);
+  const result = await bookingService.getUserBookings(userId, page, pageSize, status, sort, order);
   if (!result.success) {
     res.status(400).json({ error: result.error });
     return;

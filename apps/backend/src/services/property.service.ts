@@ -9,6 +9,8 @@
 import { supabase } from '@/config/supabase.js';
 import * as cache from './cache.service.js';
 import type { ServiceResponse } from './index.js';
+import type { PaginatedResult } from '../types/pagination.js';
+import { executePaginatedQuery } from '../utils/pagination.js';
 import { CANONICAL_AMENITIES } from '@/types/amenities.js';
 import { sanitizeLongText, sanitizeShortText } from '@/utils/sanitize.js';
 import { generateSlug } from '@/utils/slug.js';
@@ -123,6 +125,9 @@ export interface PropertySearchFilters {
   /** Filter by a single property type (exact match). */
   property_type?: string;
   status?: string;
+  page?: number;
+  pageSize?: number;
+  limit?: number;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -142,22 +147,15 @@ function validateAmenities(amenities: string[]): string | null {
 /**
  * Retrieve all active (non-soft-deleted) properties.
  */
-export async function getAllProperties(): Promise<ServiceResponse<Property[]>> {
-  const cached = await cache.get<Property[]>('properties:all');
-  if (cached) return { success: true, data: cached };
-
-  const { data, error } = await supabase
+export async function getAllProperties(page = 1, pageSize = 20): Promise<ServiceResponse<PaginatedResult<Property>>> {
+  const query = supabase
     .from('properties')
-    .select('*')
+    .select('*', { count: 'exact' })
     .is('deleted_at', null)
     .order('created_at', { ascending: false });
-
-  if (error) {
-    return { success: false, error: error.message };
-  }
-
-  await cache.set('properties:all', data, TTL_ALL);
-  return { success: true, data: data as Property[] };
+  const response = await executePaginatedQuery(query, page, pageSize);
+  if (response.error) return { success: false, error: response.error };
+  return { success: true, data: response.result };
 }
 
 /**
@@ -619,8 +617,10 @@ export async function clearFeatured(
 
 export async function searchProperties(
   filters: PropertySearchFilters,
-): Promise<ServiceResponse<Property[]>> {
-  let query = supabase.from('properties').select('*').is('deleted_at', null);
+): Promise<ServiceResponse<PaginatedResult<Property>>> {
+  const page = Math.max(filters.page ?? 1, 1);
+  const pageSize = Math.min(filters.pageSize ?? filters.limit ?? 20, 100);
+  let query = supabase.from('properties').select('*', { count: 'exact' }).is('deleted_at', null);
 
   if (filters.city) {
     query = query.ilike('city', `%${filters.city}%`);
@@ -656,13 +656,9 @@ export async function searchProperties(
 
   query = query.order('created_at', { ascending: false });
 
-  const { data, error } = await query;
-
-  if (error) {
-    return { success: false, error: error.message };
-  }
-
-  return { success: true, data: data as Property[] };
+  const response = await executePaginatedQuery(query, page, pageSize);
+  if (response.error) return { success: false, error: response.error };
+  return { success: true, data: response.result };
 }
 
 export interface AdvancedSearchFilters extends PropertySearchFilters {

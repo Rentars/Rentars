@@ -1,11 +1,12 @@
 import { Router } from 'express';
 import { authenticate } from '../middleware/auth.middleware.js';
 import { listWishlist, addWishlist, removeWishlist } from '../controllers/wishlist.controller.js';
+import { validatePagination } from '../validators/pagination.validator.js';
 
 const router = Router();
 
 // GET /api/wishlists
-router.get('/', authenticate, listWishlist);
+router.get('/', authenticate, validatePagination, listWishlist);
 
 // POST /api/wishlists/:propertyId
 router.post('/:propertyId', authenticate, addWishlist);
