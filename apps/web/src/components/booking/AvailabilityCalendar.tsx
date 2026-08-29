@@ -44,7 +44,15 @@ export default function AvailabilityCalendar({
   const month = currentDate.getMonth() + 1; // 1-based
 
   // ── Data fetching ────────────────────────────────────────────────────────────
+  // Track the last-requested property/month key so identical consecutive inputs
+  // don't trigger a duplicate network request (#433).
+  const lastFetchKeyRef = useRef<string | null>(null);
+
   useEffect(() => {
+    const fetchKey = `${propertyId}/${year}/${month}`;
+    if (fetchKey === lastFetchKeyRef.current) return;
+    lastFetchKeyRef.current = fetchKey;
+
     const fetchCalendar = async () => {
       setLoading(true);
       try {
@@ -282,7 +290,6 @@ export default function AvailabilityCalendar({
         <h2
           id="cal-heading"
           className="text-xl font-semibold text-gray-900 dark:text-white"
-          aria-live="polite"
         >
           {monthName} {year}
         </h2>
@@ -310,6 +317,7 @@ export default function AvailabilityCalendar({
             role="grid"
             aria-labelledby="cal-heading"
             aria-multiselectable="false"
+            tabIndex={0}
             onKeyDown={handleGridKeyDown}
             className="focus:outline-none"
           >

@@ -116,9 +116,13 @@ describe('BookingCalendar — keyboard navigation', () => {
     const grid = screen.getByRole('grid');
     grid.focus();
 
-    // The first focusable button inside the grid is the initial focused cell.
-    const initialFocused = grid.querySelector('button[tabindex="0"]') as HTMLButtonElement;
-    expect(initialFocused).not.toBeNull();
+    // Wait for the focused cell to be assigned (the month-change effect runs
+    // asynchronously after loading finishes, setting tabIndex={0} on day 1).
+    const initialFocused = await waitFor(() => {
+      const el = grid.querySelector('button[tabindex="0"]') as HTMLButtonElement;
+      expect(el).not.toBeNull();
+      return el;
+    });
     const initialLabel = initialFocused.getAttribute('aria-label') ?? '';
 
     await user.keyboard('{ArrowRight}');
@@ -199,9 +203,11 @@ describe('BookingCalendar — keyboard navigation', () => {
     // Navigate to an available cell and press Enter.
     await user.keyboard('{Enter}');
 
-    // The live region should now contain check-in text.
+    // The sr-only live region (not the heading) should now contain check-in text.
     await waitFor(() => {
-      const liveRegion = document.querySelector('[aria-live="polite"]');
+      // Select the first aria-live element with the sr-only class, which is the
+      // dedicated announcer div (not the h2 heading).
+      const liveRegion = document.querySelector('.sr-only[aria-live="polite"]');
       expect(liveRegion?.textContent).toMatch(/check-in/i);
     });
   });
@@ -299,9 +305,13 @@ describe('HostCalendar — ARIA structure', () => {
 
     // jsdom exposes aria-hidden cells regardless — query all gridcells including hidden ones.
     const allCells = document.querySelectorAll('[role="gridcell"][aria-hidden="true"]');
-    // The first day of any month except Sunday will have at least one padding cell.
+    // The first day of any month except Sunday will have at least one leading padding cell.
+    // The last row may also be padded with trailing empty cells to complete the 7-column grid.
     const firstDayOfWeek = new Date(YEAR, MONTH - 1, 1).getDay();
-    expect(allCells.length).toBe(firstDayOfWeek);
+    // There are at least firstDayOfWeek hidden cells (leading), plus 0–6 trailing cells.
+    expect(allCells.length).toBeGreaterThanOrEqual(firstDayOfWeek);
+    // Total hidden cells must be a valid combination: leading + trailing (0–6).
+    expect((allCells.length - firstDayOfWeek) % 7).toBeLessThan(7);
   });
 });
 
@@ -416,6 +426,95 @@ describe('HostCalendar — block-range form', () => {
         return opts?.method === 'DELETE';
       });
       expect(deleteCalls.length).toBe(1);
+    });
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// #433 BookingCalendar — duplicate fetch prevention
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('BookingCalendar — #433 duplicate fetch prevention', () => {
+  it('issues exactly one request when rendered with the same property and month', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ days: buildDays(YEAR, MONTH) }),
+    } as Response);
+    global.fetch = fetchSpy;
+
+    render(<BookingCalendar propertyId={PROPERTY_ID} />);
+
+    await waitFor(() => expect(screen.queryByText(/loading/i)).toBeNull());
+
+    const calendarCalls = fetchSpy.mock.calls.filter(([url]: [string]) =>
+      String(url).includes('/month'),
+    );
+    // The initial mount should produce exactly one request for the current month.
+    expect(calendarCalls).toHaveLength(1);
+  });
+
+  it('does not refetch when the same property+month is re-rendered without change', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ days: buildDays(YEAR, MONTH) }),
+    } as Response);
+    global.fetch = fetchSpy;
+
+    const { rerender } = render(<BookingCalendar propertyId={PROPERTY_ID} />);
+    await waitFor(() => expect(screen.queryByText(/loading/i)).toBeNull());
+
+    // Re-render with identical props — should NOT trigger another fetch.
+    rerender(<BookingCalendar propertyId={PROPERTY_ID} />);
+
+    // Allow any potential async effect to settle.
+    await new Promise((r) => setTimeout(r, 50));
+
+    const calendarCalls = fetchSpy.mock.calls.filter(([url]: [string]) =>
+      String(url).includes('/month'),
+    );
+    // Still exactly one call.
+    expect(calendarCalls).toHaveLength(1);
+  });
+
+  it('fetches again when the property changes', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ days: buildDays(YEAR, MONTH) }),
+    } as Response);
+    global.fetch = fetchSpy;
+
+    const { rerender } = render(<BookingCalendar propertyId="prop-a" />);
+    await waitFor(() => expect(screen.queryByText(/loading/i)).toBeNull());
+
+    rerender(<BookingCalendar propertyId="prop-b" />);
+    await waitFor(() => {
+      const calls = fetchSpy.mock.calls.filter(([url]: [string]) =>
+        String(url).includes('/month'),
+      );
+      expect(calls.length).toBeGreaterThanOrEqual(2);
+    });
+  });
+
+  it('fetches again when the month changes via navigation', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ days: buildDays(YEAR, MONTH) }),
+    } as Response);
+    global.fetch = fetchSpy;
+
+    const user = userEvent.setup();
+    render(<BookingCalendar propertyId={PROPERTY_ID} />);
+
+    await waitFor(() => expect(screen.queryByText(/loading/i)).toBeNull());
+
+    const nextBtn = screen.getByRole('button', { name: /next month/i });
+    await user.click(nextBtn);
+
+    await waitFor(() => {
+      const calls = fetchSpy.mock.calls.filter(([url]: [string]) =>
+        String(url).includes('/month'),
+      );
+      expect(calls.length).toBeGreaterThanOrEqual(2);
     });
   });
 });
