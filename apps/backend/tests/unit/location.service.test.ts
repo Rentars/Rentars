@@ -113,3 +113,107 @@ describe('LocationService geocode caching', () => {
     expect(mockFetch).not.toHaveBeenCalled();
   });
 });
+
+// ─── LocationService geocode — 429 rate-limit handling ───────────────────────
+
+describe('LocationService geocode — 429 rate-limit', () => {
+  beforeEach(() => {
+    mockCacheGet.mockClear();
+    mockCacheSet.mockClear();
+    mockFetch.mockClear();
+  });
+
+  it('returns statusCode 429 and rate-limit message when provider responds 429', async () => {
+    mockFetch.mockResolvedValueOnce(
+      new Response('', { status: 429 }),
+    );
+    const service = new LocationService();
+    const result = await service.geocode('Berlin');
+    expect(result.success).toBe(false);
+    expect(result.statusCode).toBe(429);
+    expect(result.error).toMatch(/rate limit/i);
+    // Must not expose provider body
+    expect(result.error).not.toContain('Retry-After');
+  });
+
+  it('returns statusCode 502 (not 429) for a generic provider error (500)', async () => {
+    mockFetch.mockResolvedValueOnce(
+      new Response('', { status: 500 }),
+    );
+    const service = new LocationService();
+    const result = await service.geocode('Berlin');
+    expect(result.success).toBe(false);
+    expect(result.statusCode).toBe(502);
+  });
+});
+
+describe('LocationService reverseGeocode — 429 rate-limit', () => {
+  beforeEach(() => {
+    mockCacheGet.mockClear();
+    mockCacheSet.mockClear();
+    mockFetch.mockClear();
+  });
+
+  it('returns statusCode 429 and rate-limit message when provider responds 429', async () => {
+    mockFetch.mockResolvedValueOnce(
+      new Response('', { status: 429 }),
+    );
+    const service = new LocationService();
+    const result = await service.reverseGeocode(52.52, 13.405);
+    expect(result.success).toBe(false);
+    expect(result.statusCode).toBe(429);
+    expect(result.error).toMatch(/rate limit/i);
+  });
+
+  it('returns statusCode 502 (not 429) for a generic provider error (500)', async () => {
+    mockFetch.mockResolvedValueOnce(
+      new Response('', { status: 500 }),
+    );
+    const service = new LocationService();
+    const result = await service.reverseGeocode(52.52, 13.405);
+    expect(result.success).toBe(false);
+    expect(result.statusCode).toBe(502);
+  });
+});
+
+// ─── LocationService — fetch timeout handling ─────────────────────────────────
+
+describe('LocationService geocode — fetch timeout', () => {
+  beforeEach(() => {
+    mockCacheGet.mockClear();
+    mockFetch.mockClear();
+  });
+
+  it('returns 500 and propagates the timeout error message when fetch times out', async () => {
+    // Simulate the DOMException that AbortSignal.timeout produces
+    mockFetch.mockRejectedValueOnce(
+      new DOMException('The operation was aborted due to timeout', 'TimeoutError'),
+    );
+    const service = new LocationService();
+    const result = await service.geocode('Anywhere');
+    expect(result.success).toBe(false);
+    expect(result.statusCode).toBe(500);
+    // The error message must come from the caught Error, not expose internals
+    expect(typeof result.error).toBe('string');
+    expect(result.error!.length).toBeGreaterThan(0);
+  });
+});
+
+describe('LocationService reverseGeocode — fetch timeout', () => {
+  beforeEach(() => {
+    mockCacheGet.mockClear();
+    mockFetch.mockClear();
+  });
+
+  it('returns 500 and propagates the timeout error message when fetch times out', async () => {
+    mockFetch.mockRejectedValueOnce(
+      new DOMException('The operation was aborted due to timeout', 'TimeoutError'),
+    );
+    const service = new LocationService();
+    const result = await service.reverseGeocode(48.8566, 2.3522);
+    expect(result.success).toBe(false);
+    expect(result.statusCode).toBe(500);
+    expect(typeof result.error).toBe('string');
+    expect(result.error!.length).toBeGreaterThan(0);
+  });
+});
