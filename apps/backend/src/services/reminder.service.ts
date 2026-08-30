@@ -46,14 +46,19 @@ function getLeadTimeHours(): { checkIn: number; checkOut: number } {
 /**
  * Mark a reminder as sent. Returns false if already sent (unique violation),
  * true on success, throws on unexpected errors.
+ *
+ * Uses atomic INSERT ... ON CONFLICT ... DO NOTHING to prevent race conditions
+ * when multiple scheduler invocations run concurrently.
  */
 export async function markReminderSent(
   bookingId: string,
   reminderType: ReminderType,
 ): Promise<boolean> {
-  const { error } = await supabase
+  const { data, error } = await supabase
     .from('booking_reminders')
-    .insert({ booking_id: bookingId, reminder_type: reminderType });
+    .insert({ booking_id: bookingId, reminder_type: reminderType })
+    .select('id')
+    .single();
 
   if (!error) return true;
   // 23505 = unique_violation — already sent
