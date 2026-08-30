@@ -91,8 +91,9 @@ export function useDashboard(
           setNextCursor(page.nextCursor);
           setHasMore(page.nextCursor !== null);
         }
-      } catch {
-        setError('Failed to load bookings');
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Failed to load bookings';
+        setError(message);
       } finally {
         if (isFirst) setIsLoading(false);
         else setIsLoadingMore(false);
