@@ -18,14 +18,25 @@ function usePropertyDetails(propertyId: string | undefined) {
   const [property, setProperty] = useState<Property | null>(null);
 
   useEffect(() => {
-    if (!propertyId) return;
+    if (!propertyId) {
+      setProperty(null);
+      return;
+    }
+
+    let active = true;
     const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null;
     fetch(`${API_URL}/api/v1/properties/${propertyId}`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     })
       .then((r) => (r.ok ? r.json() : null))
-      .then((data) => data && setProperty(data))
+      .then((data) => {
+        if (active && data) setProperty(data);
+      })
       .catch(() => {});
+
+    return () => {
+      active = false;
+    };
   }, [propertyId]);
 
   return property;
