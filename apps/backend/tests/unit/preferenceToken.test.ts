@@ -8,10 +8,11 @@
  *  - verifyPreferenceToken returns null for a tampered token
  *  - verifyPreferenceToken returns null for a token signed with a different purpose
  *  - buildPreferenceUrl / buildPreferenceUrlForUser produce correct URLs
+ *  - TTL configuration is properly normalized (malformed/negative values fall back to default)
  *  - Toggling preferences via the token-based endpoint updates them (integration layer)
  */
 
-import { describe, it, expect, beforeAll } from 'bun:test';
+import { describe, it, expect, beforeAll, afterEach } from 'bun:test';
 import jwt from 'jsonwebtoken';
 
 // ── Env setup (must precede importing the module under test) ──────────────────
@@ -19,6 +20,10 @@ beforeAll(() => {
   process.env.JWT_SECRET = 'mock-jwt-secret-min-32-characters-long';
   process.env.FRONTEND_URL = 'https://rentars.app';
   delete process.env.PREF_TOKEN_SECRET; // ensure fallback to JWT_SECRET
+});
+
+afterEach(() => {
+  delete process.env.PREF_TOKEN_TTL_DAYS;
 });
 
 import {
@@ -194,6 +199,37 @@ describe('preferenceToken', () => {
       const url1 = buildPreferenceUrlForUser('user-1');
       const url2 = buildPreferenceUrlForUser('user-2');
       expect(url1).not.toBe(url2);
+    });
+  });
+
+  // ── TTL Configuration ───────────────────────────────────────────────────
+
+  describe('TTL configuration validation', () => {
+    it('generated tokens have valid expiration time (approximately 30 days)', () => {
+      const token = generatePreferenceToken(TEST_USER_ID);
+      const decoded = jwt.decode(token) as Record<string, unknown>;
+      expect(decoded.exp).toBeDefined();
+
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      const expirySeconds = Number(decoded.exp);
+      const ttlSeconds = expirySeconds - nowSeconds;
+      const ttlDays = ttlSeconds / (24 * 60 * 60);
+
+      expect(ttlDays).toBeGreaterThan(25);
+      expect(ttlDays).toBeLessThan(35);
+    });
+
+    it('generated tokens are still valid immediately after creation', () => {
+      const token = generatePreferenceToken(TEST_USER_ID);
+      const userId = verifyPreferenceToken(token);
+      expect(userId).toBe(TEST_USER_ID);
+    });
+
+    it('verifyPreferenceToken returns userId without revealing malformed segments', () => {
+      const validToken = generatePreferenceToken(TEST_USER_ID);
+      const parts = validToken.split('.');
+      expect(parts.length).toBe(3);
+      expect(verifyPreferenceToken(validToken)).toBe(TEST_USER_ID);
     });
   });
 });

@@ -17,7 +17,24 @@
 
 import jwt from 'jsonwebtoken';
 
-const TTL_DAYS = Number(process.env.PREF_TOKEN_TTL_DAYS ?? 30);
+function getTTLDays(): number {
+  const defaultTTL = 30;
+  const envValue = process.env.PREF_TOKEN_TTL_DAYS;
+
+  if (!envValue) {
+    return defaultTTL;
+  }
+
+  const parsed = Number(envValue);
+
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return defaultTTL;
+  }
+
+  return parsed;
+}
+
+const TTL_DAYS = getTTLDays();
 const TTL_SECONDS = TTL_DAYS * 24 * 60 * 60;
 
 function signingKey(): string {
