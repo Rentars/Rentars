@@ -124,15 +124,18 @@ export async function loginUser(
     );
   }
 
-  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+  // Normalize to match the canonical form used at registration and password reset
+  const normalizedEmail = email.trim().toLowerCase();
+
+  const { data, error } = await supabase.auth.signInWithPassword({ email: normalizedEmail, password });
 
   if (error) {
-    await securityLogger.logAuthEvent('login_failure', undefined, { email });
+    await securityLogger.logAuthEvent('login_failure', undefined, { email: normalizedEmail });
     throw new AuthError(AuthErrorCode.INVALID_CREDENTIALS, error.message);
   }
 
   if (!data.user) {
-    await securityLogger.logAuthEvent('login_failure', undefined, { email });
+    await securityLogger.logAuthEvent('login_failure', undefined, { email: normalizedEmail });
     throw new AuthError(AuthErrorCode.USER_NOT_FOUND, 'Login failed: no user returned');
   }
 
@@ -155,7 +158,7 @@ export async function loginUser(
   // Long-lived refresh token stored in Redis (7 days)
   const refreshToken = await issueRefreshToken({ userId: data.user.id, role });
 
-  await securityLogger.logAuthEvent('login_success', data.user.id, { email });
+  await securityLogger.logAuthEvent('login_success', data.user.id, { email: normalizedEmail });
 
   const user: AuthUser = {
     id: data.user.id,
@@ -247,8 +250,10 @@ export async function verifyWalletChallenge(
     used: boolean;
   };
 
-  // Check expiration
-  if (new Date(dbChallenge.expires_at) < new Date()) {
+  // Check expiration — also reject records whose timestamp is missing or non-finite
+  // (malformed stored data must not bypass auth)
+  const expiryMs = new Date(dbChallenge.expires_at).getTime();
+  if (!Number.isFinite(expiryMs) || expiryMs < Date.now()) {
     throw new AuthError(AuthErrorCode.TOKEN_EXPIRED, 'Challenge has expired');
   }
 
@@ -337,10 +342,6 @@ export async function verifyWalletChallenge(
 // ─── Password reset ───────────────────────────────────────────────────────────
 
 const RESET_TOKEN_EXPIRES_MINUTES = 60;
-
-function hashToken(raw: string): string {
-  return crypto.createHash('sha256').update(raw).digest('hex');
-}
 
 /**
  * Request a password reset for the given email.
