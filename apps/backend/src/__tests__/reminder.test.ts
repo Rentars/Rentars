@@ -258,4 +258,34 @@ describe('runReminderScheduler()', () => {
     expect(result.success).toBe(true);
     expect(result.data!.errors).toBeGreaterThan(0);
   });
+
+  it('prevents duplicate sends with concurrent scheduler invocations', async () => {
+    const row = makeBookingRow('booking-concurrent');
+
+    // Simulate two concurrent invocations querying the same booking
+    mockNot
+      .mockResolvedValueOnce({ data: [row], error: null })
+      .mockResolvedValueOnce({ data: [], error: null })
+      .mockResolvedValueOnce({ data: [row], error: null })
+      .mockResolvedValueOnce({ data: [], error: null });
+
+    // First invocation succeeds, second gets unique violation (race condition)
+    mockInsert
+      .mockResolvedValueOnce({ data: [{ id: 'reminder-1' }], error: null }) // A: tenant sent
+      .mockResolvedValueOnce({ data: [{ id: 'reminder-2' }], error: null }) // A: host sent
+      .mockResolvedValueOnce({ error: { code: '23505', message: 'unique' } }) // B: tenant already sent
+      .mockResolvedValueOnce({ error: { code: '23505', message: 'unique' } }); // B: host already sent
+
+    const resultA = await runReminderScheduler();
+    const resultB = await runReminderScheduler();
+
+    // First invocation sends reminders
+    expect(resultA.data!.sent).toBeGreaterThan(0);
+    // Second invocation skips (already sent)
+    expect(resultB.data!.sent).toBe(0);
+    expect(resultB.data!.skipped).toBeGreaterThan(0);
+
+    // Notification service called only once per reminder
+    expect(mockCreateNotificationWithEmail.mock.calls.length).toBeLessThanOrEqual(2);
+  });
 });
