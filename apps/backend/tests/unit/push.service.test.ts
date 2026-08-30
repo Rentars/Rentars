@@ -29,6 +29,7 @@ import {
   removePushSubscription,
   savePushSubscription,
   sendPushToUser,
+  validatePushSubscription,
 } from '../../src/services/push.service.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -215,6 +216,96 @@ describe('push.service', () => {
 
       const result = await sendPushToUser('u1', { title: 'Test', body: 'Hello' });
       expect(result.success).toBe(false);
+    });
+  });
+
+  // ── validatePushSubscription ────────────────────────────────────────────
+
+  describe('validatePushSubscription', () => {
+    it('should accept a valid HTTPS subscription', () => {
+      const result = validatePushSubscription(mockSubscription);
+      expect(result).toBeNull();
+    });
+
+    it('should reject a subscription with blank endpoint', () => {
+      const result = validatePushSubscription({
+        endpoint: '   ',
+        keys: {
+          p256dh: 'base64-p256dh-key',
+          auth: 'base64-auth-secret',
+        },
+      });
+      expect(result).toBe('endpoint cannot be blank');
+    });
+
+    it('should reject a subscription with HTTP endpoint', () => {
+      const result = validatePushSubscription({
+        endpoint: 'http://push.example.com/subscription/abc',
+        keys: {
+          p256dh: 'base64-p256dh-key',
+          auth: 'base64-auth-secret',
+        },
+      });
+      expect(result).toBe('endpoint must use HTTPS protocol');
+    });
+
+    it('should reject a subscription with missing endpoint', () => {
+      const result = validatePushSubscription({
+        keys: {
+          p256dh: 'base64-p256dh-key',
+          auth: 'base64-auth-secret',
+        },
+      });
+      expect(result).toBe('endpoint is required and must be a string');
+    });
+
+    it('should reject a subscription with empty string endpoint', () => {
+      const result = validatePushSubscription({
+        endpoint: '',
+        keys: {
+          p256dh: 'base64-p256dh-key',
+          auth: 'base64-auth-secret',
+        },
+      });
+      expect(result).toBe('endpoint is required and must be a string');
+    });
+
+    it('should reject a subscription with non-URL endpoint string', () => {
+      const result = validatePushSubscription({
+        endpoint: 'not-a-url',
+        keys: {
+          p256dh: 'base64-p256dh-key',
+          auth: 'base64-auth-secret',
+        },
+      });
+      expect(result).toBe('endpoint must be a valid HTTPS URL');
+    });
+
+    it('should reject a subscription with missing keys', () => {
+      const result = validatePushSubscription({
+        endpoint: 'https://push.example.com/subscription/abc',
+      });
+      expect(result).toBe('keys object is required');
+    });
+
+    it('should reject a subscription with missing p256dh key', () => {
+      const result = validatePushSubscription({
+        endpoint: 'https://push.example.com/subscription/abc',
+        keys: {
+          auth: 'base64-auth-secret',
+        },
+      });
+      expect(result).toBe('keys.p256dh is required and must be a string');
+    });
+
+    it('should reject a subscription with missing auth key', () => {
+      const result = validatePushSubscription({
+        endpoint: 'https://push.example.com/subscription/abc',
+        keys: {
+          p256dh: 'base64-p256dh-key',
+        },
+      });
+      expect(result).toBe('keys.auth is required and must be a string');
     });
   });
 });

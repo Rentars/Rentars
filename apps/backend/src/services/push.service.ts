@@ -204,6 +204,20 @@ export function validatePushSubscription(subscription: unknown): string | null {
     return 'endpoint is required and must be a string';
   }
 
+  const endpoint = sub.endpoint.trim();
+  if (!endpoint) {
+    return 'endpoint cannot be blank';
+  }
+
+  try {
+    const url = new URL(endpoint);
+    if (url.protocol !== 'https:') {
+      return 'endpoint must use HTTPS protocol';
+    }
+  } catch {
+    return 'endpoint must be a valid HTTPS URL';
+  }
+
   if (!sub.keys || typeof sub.keys !== 'object') {
     return 'keys object is required';
   }
