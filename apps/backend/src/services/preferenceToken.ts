@@ -17,7 +17,24 @@
 
 import jwt from 'jsonwebtoken';
 
-const TTL_DAYS = Number(process.env.PREF_TOKEN_TTL_DAYS ?? 30);
+function getTTLDays(): number {
+  const defaultTTL = 30;
+  const envValue = process.env.PREF_TOKEN_TTL_DAYS;
+
+  if (!envValue) {
+    return defaultTTL;
+  }
+
+  const parsed = Number(envValue);
+
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return defaultTTL;
+  }
+
+  return parsed;
+}
+
+const TTL_DAYS = getTTLDays();
 const TTL_SECONDS = TTL_DAYS * 24 * 60 * 60;
 
 function signingKey(): string {
@@ -51,6 +68,19 @@ export function generatePreferenceToken(userId: string): string {
  * token is invalid, expired, or has the wrong purpose.
  */
 export function verifyPreferenceToken(token: string): string | null {
+  if (!token || typeof token !== 'string') {
+    return null;
+  }
+
+  const segments = token.split('.');
+  if (segments.length !== 3) {
+    return null;
+  }
+
+  if (segments.some((segment) => segment.length === 0)) {
+    return null;
+  }
+
   try {
     const decoded = jwt.verify(token, signingKey()) as PrefTokenPayload;
     if (decoded.pur !== 'pref' || !decoded.sub) return null;
