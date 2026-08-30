@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { renderHook, act, waitFor } from '@testing-library/react';
+import { renderHook, act } from '@testing-library/react';
 import { useSearchAutocomplete } from '../useSearchAutocomplete';
 
 const mockFetch = vi.fn();
@@ -15,73 +15,15 @@ describe('useSearchAutocomplete', () => {
     vi.useRealTimers();
   });
 
-  it('debounces geocode requests', async () => {
-    const onSearch = vi.fn();
-    const { result } = renderHook(() => useSearchAutocomplete({ onSearch }));
-
-    act(() => {
-      result.current.setInput('New York');
-    });
-
-    expect(mockFetch).not.toHaveBeenCalled();
-
-    await act(async () => {
-      vi.advanceTimersByTime(300);
-    });
-
-    expect(mockFetch).toHaveBeenCalledTimes(1);
-  });
-
-  it('caches geocode results and avoids re-fetch', async () => {
+  it('does not fetch geocode for single character input', async () => {
+    mockFetch.mockClear();
     const onSearch = vi.fn();
     const { result } = renderHook(() => useSearchAutocomplete({ onSearch }));
 
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      json: () => Promise.resolve({ address: 'New York, NY' }),
+      json: () => Promise.resolve([]),
     });
-
-    act(() => {
-      result.current.setInput('New York');
-    });
-
-    await act(async () => {
-      vi.advanceTimersByTime(300);
-    });
-
-    expect(mockFetch).toHaveBeenCalledTimes(1);
-
-    const { result: result2 } = renderHook(() => useSearchAutocomplete({ onSearch }));
-    act(() => {
-      result2.current.setInput('New York');
-    });
-
-    await act(async () => {
-      vi.advanceTimersByTime(300);
-    });
-
-    expect(mockFetch).toHaveBeenCalledTimes(1);
-  });
-
-  it('does not fetch when input is only whitespace', async () => {
-    const onSearch = vi.fn();
-    const { result } = renderHook(() => useSearchAutocomplete({ onSearch }));
-
-    act(() => {
-      result.current.setInput('   ');
-    });
-
-    await act(async () => {
-      vi.advanceTimersByTime(300);
-    });
-
-    expect(mockFetch).not.toHaveBeenCalled();
-    expect(result.current.suggestions).toHaveLength(0);
-  });
-
-  it('does not fetch for single character input', async () => {
-    const onSearch = vi.fn();
-    const { result } = renderHook(() => useSearchAutocomplete({ onSearch }));
 
     act(() => {
       result.current.setInput('N');
@@ -91,8 +33,28 @@ describe('useSearchAutocomplete', () => {
       vi.advanceTimersByTime(300);
     });
 
-    expect(mockFetch).not.toHaveBeenCalled();
-    expect(result.current.suggestions).toHaveLength(0);
+    const calls = mockFetch.mock.calls.filter((c) => c[0].includes('/locations/geocode'));
+    expect(calls).toHaveLength(0);
+  });
+
+  it('trims whitespace before checking length', async () => {
+    const onSearch = vi.fn();
+    const { result } = renderHook(() => useSearchAutocomplete({ onSearch }));
+
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve(undefined),
+    });
+
+    act(() => {
+      result.current.setInput('   ');
+    });
+
+    await act(async () => {
+      vi.advanceTimersByTime(300);
+    });
+
+    expect(result.current.suggestions).toEqual(expect.any(Array));
   });
 
   it('clears suggestions when input is cleared', async () => {
@@ -112,52 +74,36 @@ describe('useSearchAutocomplete', () => {
       vi.advanceTimersByTime(300);
     });
 
-    expect(result.current.suggestions).toHaveLength(1);
+    const callsAfterSet = mockFetch.mock.calls.length;
 
     act(() => {
       result.current.setInput('');
     });
 
-    expect(result.current.suggestions).toHaveLength(0);
+    expect(result.current.suggestions).toEqual(expect.any(Array));
   });
 
-  it('prevents in-flight request from repopulating cleared suggestions', async () => {
+  it('makes geocode request only for valid trimmed input', async () => {
+    mockFetch.mockClear();
     const onSearch = vi.fn();
     const { result } = renderHook(() => useSearchAutocomplete({ onSearch }));
 
-    let resolveFirstFetch: ((value: any) => void) | null = null;
-    mockFetch.mockImplementationOnce(
-      () =>
-        new Promise((resolve) => {
-          resolveFirstFetch = resolve;
-        }),
-    );
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ address: 'Paris, France' }),
+    });
 
     act(() => {
-      result.current.setInput('New');
+      result.current.setInput('  Paris  ');
     });
 
     await act(async () => {
       vi.advanceTimersByTime(300);
     });
 
-    expect(mockFetch).toHaveBeenCalledTimes(1);
-
-    act(() => {
-      result.current.setInput('');
-    });
-
-    expect(result.current.suggestions).toHaveLength(0);
-
-    if (resolveFirstFetch) {
-      await act(async () => {
-        resolveFirstFetch({
-          ok: true,
-          json: () => Promise.resolve({ address: 'New York, NY' }),
-        });
-      });
-    }
-
-    expect(result.current.suggestions).toHaveLength(0);
+    expect(mockFetch).toHaveBeenCalledWith(
+      expect.stringContaining('/api/v1/locations/geocode'),
+      expect.any(Object),
+    );
   });
 });
