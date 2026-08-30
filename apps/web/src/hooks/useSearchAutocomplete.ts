@@ -42,13 +42,15 @@ export function useSearchAutocomplete({ onSearch }: UseSearchAutocompleteOptions
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
 
-    if (input.length >= 2) {
+    const trimmed = input.trim();
+
+    if (trimmed.length >= 2) {
       debounceRef.current = setTimeout(async () => {
         if (abortRef.current) abortRef.current.abort();
         const controller = new AbortController();
         abortRef.current = controller;
 
-        const normalized = input.trim().toLowerCase();
+        const normalized = trimmed.toLowerCase();
         cleanCache();
         const cached = geocodeCache.get(normalized);
         if (cached) {
@@ -59,7 +61,7 @@ export function useSearchAutocomplete({ onSearch }: UseSearchAutocompleteOptions
 
         try {
           const res = await fetch(
-            `${API_URL}/api/v1/locations/geocode?address=${encodeURIComponent(input.trim())}`,
+            `${API_URL}/api/v1/locations/geocode?address=${encodeURIComponent(trimmed)}`,
             { signal: controller.signal },
           );
           if (!res.ok) throw new Error('Geocode failed');
@@ -74,7 +76,7 @@ export function useSearchAutocomplete({ onSearch }: UseSearchAutocompleteOptions
           // cancelled or failed
         }
       }, DEBOUNCE_MS);
-    } else if (input.length === 0) {
+    } else if (trimmed.length === 0) {
       getTrending();
       setLocalSuggestions([]);
       setShowSuggestions(true);
