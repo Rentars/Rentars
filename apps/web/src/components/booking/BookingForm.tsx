@@ -109,6 +109,7 @@ export default function BookingForm({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setDateError('');
+    setGuestError('');
     setAvailabilityError('');
 
     if (!checkIn || !checkOut) {
@@ -256,6 +257,7 @@ export default function BookingForm({
           id="guests"
           type="number"
           min="1"
+          step="1"
           max={maxGuests}
           value={guestCount}
           onChange={handleGuestChange}
