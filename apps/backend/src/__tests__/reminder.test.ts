@@ -8,11 +8,12 @@
  *     respects notification preferences
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   markReminderSent,
   isReminderSent,
   runReminderScheduler,
+  getLeadTimeHours,
 } from '../services/reminder.service.js';
 
 // ─── Supabase mock ────────────────────────────────────────────────────────────
@@ -287,5 +288,105 @@ describe('runReminderScheduler()', () => {
 
     // Notification service called only once per reminder
     expect(mockCreateNotificationWithEmail.mock.calls.length).toBeLessThanOrEqual(2);
+  });
+});
+
+// ─── getLeadTimeHours — env-driven configuration validation ──────────────────
+
+describe('getLeadTimeHours()', () => {
+  const ORIGINAL_ENV = { ...process.env };
+
+  afterEach(() => {
+    // Restore the original env after each test so values don't leak.
+    process.env.REMINDER_CHECKIN_HOURS  = ORIGINAL_ENV.REMINDER_CHECKIN_HOURS;
+    process.env.REMINDER_CHECKOUT_HOURS = ORIGINAL_ENV.REMINDER_CHECKOUT_HOURS;
+    if (ORIGINAL_ENV.REMINDER_CHECKIN_HOURS  === undefined) delete process.env.REMINDER_CHECKIN_HOURS;
+    if (ORIGINAL_ENV.REMINDER_CHECKOUT_HOURS === undefined) delete process.env.REMINDER_CHECKOUT_HOURS;
+  });
+
+  it('returns the hard-coded defaults when env vars are unset', () => {
+    delete process.env.REMINDER_CHECKIN_HOURS;
+    delete process.env.REMINDER_CHECKOUT_HOURS;
+    const { checkIn, checkOut } = getLeadTimeHours();
+    expect(checkIn).toBe(24);
+    expect(checkOut).toBe(12);
+  });
+
+  it('accepts valid positive integer values from env', () => {
+    process.env.REMINDER_CHECKIN_HOURS  = '48';
+    process.env.REMINDER_CHECKOUT_HOURS = '6';
+    const { checkIn, checkOut } = getLeadTimeHours();
+    expect(checkIn).toBe(48);
+    expect(checkOut).toBe(6);
+  });
+
+  it('accepts valid positive fractional values from env', () => {
+    process.env.REMINDER_CHECKIN_HOURS  = '0.5';
+    process.env.REMINDER_CHECKOUT_HOURS = '1.5';
+    const { checkIn, checkOut } = getLeadTimeHours();
+    expect(checkIn).toBe(0.5);
+    expect(checkOut).toBe(1.5);
+  });
+
+  it('falls back to default when env var is zero', () => {
+    process.env.REMINDER_CHECKIN_HOURS  = '0';
+    process.env.REMINDER_CHECKOUT_HOURS = '0';
+    const { checkIn, checkOut } = getLeadTimeHours();
+    expect(checkIn).toBe(24);
+    expect(checkOut).toBe(12);
+  });
+
+  it('falls back to default when env var is negative', () => {
+    process.env.REMINDER_CHECKIN_HOURS  = '-5';
+    process.env.REMINDER_CHECKOUT_HOURS = '-1';
+    const { checkIn, checkOut } = getLeadTimeHours();
+    expect(checkIn).toBe(24);
+    expect(checkOut).toBe(12);
+  });
+
+  it('falls back to default when env var is NaN (non-numeric string)', () => {
+    process.env.REMINDER_CHECKIN_HOURS  = 'badvalue';
+    process.env.REMINDER_CHECKOUT_HOURS = 'alsowrong';
+    const { checkIn, checkOut } = getLeadTimeHours();
+    expect(checkIn).toBe(24);
+    expect(checkOut).toBe(12);
+  });
+
+  it('falls back to default when env var is an empty string', () => {
+    // Number('') === 0, which is not > 0, so the default must be used.
+    process.env.REMINDER_CHECKIN_HOURS  = '';
+    process.env.REMINDER_CHECKOUT_HOURS = '';
+    const { checkIn, checkOut } = getLeadTimeHours();
+    expect(checkIn).toBe(24);
+    expect(checkOut).toBe(12);
+  });
+
+  it('falls back to default when env var is Infinity', () => {
+    process.env.REMINDER_CHECKIN_HOURS  = 'Infinity';
+    process.env.REMINDER_CHECKOUT_HOURS = 'Infinity';
+    const { checkIn, checkOut } = getLeadTimeHours();
+    expect(checkIn).toBe(24);
+    expect(checkOut).toBe(12);
+  });
+
+  it('returns only finite values — never NaN or Infinity', () => {
+    const badValues = ['', '0', '-1', 'NaN', 'Infinity', '-Infinity', 'abc'];
+    for (const v of badValues) {
+      process.env.REMINDER_CHECKIN_HOURS  = v;
+      process.env.REMINDER_CHECKOUT_HOURS = v;
+      const { checkIn, checkOut } = getLeadTimeHours();
+      expect(Number.isFinite(checkIn)).toBe(true);
+      expect(Number.isFinite(checkOut)).toBe(true);
+      expect(checkIn).toBeGreaterThan(0);
+      expect(checkOut).toBeGreaterThan(0);
+    }
+  });
+
+  it('invalid checkIn does not affect valid checkOut', () => {
+    process.env.REMINDER_CHECKIN_HOURS  = '-99';
+    process.env.REMINDER_CHECKOUT_HOURS = '6';
+    const { checkIn, checkOut } = getLeadTimeHours();
+    expect(checkIn).toBe(24);  // falls back
+    expect(checkOut).toBe(6);  // valid, kept as-is
   });
 });

@@ -8,7 +8,8 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { generateReceiptPdf, fetchReceiptData, type ReceiptData } from '../services/receipt.service.js';
+import { generateReceiptPdf, fetchReceiptData, calcNights, type ReceiptData } from '../services/receipt.service.js';
+import { pdfStr } from '../utils/pdf.js';
 
 // ─── Supabase mock ────────────────────────────────────────────────────────────
 
@@ -242,5 +243,114 @@ describe('Receipt authorization logic', () => {
 
   it('blocks receipt for Cancelled status', () => {
     expect(isReceiptableStatus('Cancelled')).toBe(false);
+  });
+});
+
+// ─── calcNights — DST-safe calendar arithmetic ────────────────────────────────
+
+describe('calcNights() — UTC date-only arithmetic', () => {
+  it('counts ordinary multi-night stays correctly', () => {
+    expect(calcNights('2027-08-01', '2027-08-05')).toBe(4);
+  });
+
+  it('counts a single-night stay as 1', () => {
+    expect(calcNights('2027-08-01', '2027-08-02')).toBe(1);
+  });
+
+  it('returns 1 for a same-day check-in/check-out (floor at 1)', () => {
+    expect(calcNights('2027-08-01', '2027-08-01')).toBe(1);
+  });
+
+  it('counts correctly across a month boundary', () => {
+    expect(calcNights('2027-07-30', '2027-08-03')).toBe(4);
+  });
+
+  it('counts correctly across a year boundary', () => {
+    expect(calcNights('2026-12-29', '2027-01-02')).toBe(4);
+  });
+
+  // DST spring-forward: clocks move ahead 1 hour, making that day 23 h long.
+  // In Europe (CET→CEST) this happens on the last Sunday of March.
+  // 2027-03-28 is the spring-forward night in many European timezones.
+  // A plain Date.getTime() diff would yield 23 h = 0.958… days → rounds to 1,
+  // which is WRONG for a 2-night stay.  UTC midnight arithmetic must give 2.
+  it('gives the correct count across a spring-forward DST boundary (2 nights)', () => {
+    expect(calcNights('2027-03-27', '2027-03-29')).toBe(2);
+  });
+
+  // DST fall-back: clocks move back 1 hour, making that day 25 h long.
+  // 2027-10-31 is the fall-back night in many European timezones.
+  // A plain diff would yield 25 h = 1.041… days → rounds to 1, WRONG for 2 nights.
+  it('gives the correct count across a fall-back DST boundary (2 nights)', () => {
+    expect(calcNights('2027-10-30', '2027-11-01')).toBe(2);
+  });
+
+  // Single night spanning the spring-forward transition (23-hour day).
+  it('returns 1 for a single night spanning spring-forward', () => {
+    expect(calcNights('2027-03-28', '2027-03-29')).toBe(1);
+  });
+
+  // Single night spanning the fall-back transition (25-hour day).
+  it('returns 1 for a single night spanning fall-back', () => {
+    expect(calcNights('2027-10-31', '2027-11-01')).toBe(1);
+  });
+
+  it('counts a long stay (30 nights) correctly', () => {
+    expect(calcNights('2027-06-01', '2027-07-01')).toBe(30);
+  });
+});
+
+// ─── generateReceiptPdf — special-character escaping ─────────────────────────
+
+describe('generateReceiptPdf() — PDF text escaping', () => {
+  it('produces a parseable PDF when propertyTitle contains parentheses', () => {
+    const data: ReceiptData = {
+      ...RECEIPT_DATA,
+      propertyTitle: 'Villa (Deluxe) Suite',
+    };
+    const buf = generateReceiptPdf(data);
+    // Must still start and end with valid PDF delimiters
+    expect(buf.slice(0, 4).toString()).toBe('%PDF');
+    expect(buf.slice(-8).toString()).toContain('%%EOF');
+    // Parentheses in the content stream must be escaped, not bare
+    const stream = buf.toString('latin1');
+    expect(stream).toContain('\\(Deluxe\\)');
+  });
+
+  it('produces a parseable PDF when propertyTitle contains backslashes', () => {
+    const data: ReceiptData = {
+      ...RECEIPT_DATA,
+      propertyTitle: 'Studio \\ Loft',
+    };
+    const buf = generateReceiptPdf(data);
+    expect(buf.slice(0, 4).toString()).toBe('%PDF');
+    const stream = buf.toString('latin1');
+    // Backslash must be doubled in the PDF string literal
+    expect(stream).toContain('\\\\');
+  });
+
+  it('produces a parseable PDF when propertyAddress contains parentheses and backslash', () => {
+    const data: ReceiptData = {
+      ...RECEIPT_DATA,
+      propertyAddress: '12 (Main) St \\ Town',
+    };
+    const buf = generateReceiptPdf(data);
+    expect(buf.slice(0, 4).toString()).toBe('%PDF');
+    expect(buf.slice(-8).toString()).toContain('%%EOF');
+  });
+
+  it('leaves normal ASCII text completely unchanged', () => {
+    const title = 'Seaside Cottage';
+    const data: ReceiptData = { ...RECEIPT_DATA, propertyTitle: title };
+    const stream = generateReceiptPdf(data).toString('latin1');
+    expect(stream).toContain(title);
+  });
+
+  it('pdfStr round-trip: escapes then embeds correctly', () => {
+    // Verify pdfStr itself handles all PDF-special characters correctly.
+    expect(pdfStr('hello')).toBe('hello');
+    expect(pdfStr('say (hi)')).toBe('say \\(hi\\)');
+    expect(pdfStr('back\\slash')).toBe('back\\\\slash');
+    expect(pdfStr('(both) \\ combined')).toBe('\\(both\\) \\\\ combined');
   });
 });

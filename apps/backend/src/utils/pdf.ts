@@ -52,8 +52,11 @@ export function hexToRgb(hex: string): [number, number, number] {
   return [r, g, b];
 }
 
-/** Escape a string for use in a PDF string literal. */
-function pdfStr(s: string): string {
+/**
+ * Escape a string for use in a PDF string literal.
+ * Exported so callers can sanitise dynamic text before passing it to PdfBuilder.
+ */
+export function pdfStr(s: string): string {
   return s
     .replace(/\\/g, '\\\\')
     .replace(/\(/g, '\\(')

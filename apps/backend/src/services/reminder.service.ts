@@ -34,10 +34,29 @@ export interface ReminderResult {
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-function getLeadTimeHours(): { checkIn: number; checkOut: number } {
+const LEAD_TIME_DEFAULTS = { checkIn: 24, checkOut: 12 } as const;
+
+/**
+ * Parse and validate lead-time hours from the environment.
+ *
+ * Rules:
+ *  - The raw value is converted with Number().
+ *  - Values that are NaN, non-finite, zero, or negative are invalid and
+ *    replaced with the hard-coded default.
+ *  - A positive finite value (including fractional hours) is accepted as-is.
+ *
+ * This prevents a bad deployment setting from scheduling reminders in the
+ * past or suppressing them entirely.
+ */
+export function getLeadTimeHours(): { checkIn: number; checkOut: number } {
+  const parse = (raw: string | undefined, fallback: number): number => {
+    const n = Number(raw ?? fallback);
+    return Number.isFinite(n) && n > 0 ? n : fallback;
+  };
+
   return {
-    checkIn:  Number(process.env.REMINDER_CHECKIN_HOURS  ?? 24),
-    checkOut: Number(process.env.REMINDER_CHECKOUT_HOURS ?? 12),
+    checkIn:  parse(process.env.REMINDER_CHECKIN_HOURS,  LEAD_TIME_DEFAULTS.checkIn),
+    checkOut: parse(process.env.REMINDER_CHECKOUT_HOURS, LEAD_TIME_DEFAULTS.checkOut),
   };
 }
 
