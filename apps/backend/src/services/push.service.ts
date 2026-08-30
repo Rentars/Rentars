@@ -35,6 +35,8 @@ export interface PushPayload {
   data?: Record<string, unknown>;
 }
 
+const VAPID_TOKEN_EXPIRATION_HOURS = 12;
+
 export async function savePushSubscription(
   userId: string,
   subscription: PushSubscription
@@ -91,7 +93,7 @@ function buildVapidToken(endpoint: string): string | null {
   if (!publicKey || !privateKey) return null;
 
   const origin = new URL(endpoint).origin;
-  const expiration = Math.floor(Date.now() / 1000) + 12 * 3600;
+  const expiration = Math.floor(Date.now() / 1000) + VAPID_TOKEN_EXPIRATION_HOURS * 3600;
 
   const header = Buffer.from(JSON.stringify({ typ: 'JWT', alg: 'ES256' })).toString('base64url');
   const payload = Buffer.from(
