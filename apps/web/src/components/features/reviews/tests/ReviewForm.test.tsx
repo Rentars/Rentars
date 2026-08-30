@@ -105,6 +105,65 @@ describe('ReviewForm', () => {
     });
   });
 
+  it('sends exactly one request when submit is clicked twice while fetch is pending', async () => {
+    // First call hangs so the second click arrives while submitting is true
+    let resolveFetch!: (v: Response) => void;
+    fetchMock.mockReturnValueOnce(
+      new Promise<Response>((res) => { resolveFetch = res; })
+    );
+
+    render(<ReviewForm {...defaultProps} />);
+
+    const stars = screen.getAllByRole('button').filter((b) => b.getAttribute('type') === 'button');
+    await user.click(stars[3]); // 4 stars
+
+    const submitBtn = screen.getByRole('button', { name: /submit review/i });
+
+    // First click — starts the request
+    await user.click(submitBtn);
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /submitting/i })).toBeDisabled();
+    });
+
+    // Second click while in-flight — should be swallowed by the guard
+    await user.click(screen.getByRole('button', { name: /submitting/i }));
+
+    // Resolve the single pending fetch
+    resolveFetch({
+      ok: true,
+      json: () => Promise.resolve({ id: 'review-1' }),
+    } as Response);
+
+    await waitFor(() => {
+      expect(defaultProps.onSuccess).toHaveBeenCalledTimes(1);
+    });
+
+    // Only one network request should ever have been made
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('re-enables the submit button after a failed submission', async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      json: () => Promise.resolve({ error: 'Server error' }),
+    } as Response);
+
+    render(<ReviewForm {...defaultProps} />);
+
+    const stars = screen.getAllByRole('button').filter((b) => b.getAttribute('type') === 'button');
+    await user.click(stars[2]); // 3 stars
+
+    await user.click(screen.getByRole('button', { name: /submit review/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText('Server error')).toBeInTheDocument();
+    });
+
+    // Button must be re-enabled so the user can try again
+    expect(screen.getByRole('button', { name: /submit review/i })).not.toBeDisabled();
+  });
+
   it('resets form after successful submission', async () => {
     render(<ReviewForm {...defaultProps} />);
 

@@ -20,6 +20,8 @@ export default function ReviewForm({ bookingId, targetId, propertyId, onSuccess 
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
+    // Guard against duplicate submissions while a request is already in-flight
+    if (submitting) return;
     if (rating === 0) {
       setError('Please select a rating');
       return;

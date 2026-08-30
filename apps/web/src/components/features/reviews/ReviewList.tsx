@@ -38,16 +38,25 @@ export default function ReviewList({
   hideSummaryHeader = false,
 }: ReviewListProps) {
   const [flagged, setFlagged] = useState<Set<string>>(new Set());
+  const [flagError, setFlagError] = useState<string | null>(null);
   const [respondingTo, setRespondingTo] = useState<string | null>(null);
   const [localResponses, setLocalResponses] = useState<Record<string, string>>({});
 
   async function handleFlag(reviewId: string) {
-    const token = localStorage.getItem('token');
-    await fetch(`${API_URL}/api/v1/reviews/${reviewId}/flag`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    setFlagged((prev) => new Set([...prev, reviewId]));
+    setFlagError(null);
+    try {
+      const token = localStorage.getItem('token');
+      const res = await fetch(`${API_URL}/api/v1/reviews/${reviewId}/flag`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) {
+        throw new Error('Failed to report review');
+      }
+      setFlagged((prev) => new Set([...prev, reviewId]));
+    } catch {
+      setFlagError('Failed to report review. Please try again.');
+    }
   }
 
   function handleResponseSuccess(reviewId: string, responseText: string) {
@@ -59,6 +68,13 @@ export default function ReviewList({
 
   return (
     <div className="space-y-4">
+      {/* Accessible live region — announced by screen readers when a flag request fails */}
+      {flagError && (
+        <p role="alert" className="text-sm text-red-600">
+          {flagError}
+        </p>
+      )}
+
       {/* Legacy summary header — hidden when PropertyReviewsSection renders RatingSummary */}
       {!hideSummaryHeader && (
         <div className="flex items-center gap-3">
