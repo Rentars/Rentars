@@ -42,56 +42,57 @@ interface UseSearchOptions {
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
 
+function serializeFilters(filters: Partial<FilterState>): string {
+  return JSON.stringify(filters);
+}
+
 export function usePropertySearch(options: UseSearchOptions = {}) {
   const { debounceMs = 300 } = options;
-  const [results, setResults]                           = useState<SearchResult[]>([]);
-  const [loading, setLoading]                           = useState(false);
-  const [error, setError]                               = useState<string | null>(null);
-  const [suggestions, setSuggestions]                   = useState<string[]>([]);
+  const [results, setResults] = useState<SearchResult[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [suggestions, setSuggestions] = useState<string[]>([]);
   const [zeroResultSuggestions, setZeroResultSuggestions] = useState<ZeroResultSuggestion[]>([]);
-  const [histogram, setHistogram]                       = useState<PriceHistogramResult | null>(null);
-  const [page, setPage]                                 = useState(1);
+  const [histogram, setHistogram] = useState<PriceHistogramResult | null>(null);
+  const [page, setPage] = useState(1);
+  const [total, setTotal] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
 
-  const abortControllerRef  = useRef<AbortController | null>(null);
-  const debounceTimerRef    = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const lastQueryRef        = useRef<string>('');
-
-  // ── Build URLSearchParams from filters ──────────────────────────────────────
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const requestIdRef = useRef<number>(0);
+  const lastFiltersRef = useRef<Partial<FilterState>>({});
+  const lastQueryRef = useRef<string>('');
 
   function buildParams(query: string, filters: Partial<FilterState>, pageNum: number): URLSearchParams {
     const params = new URLSearchParams();
-    if (query)                                  params.append('q', query);
-    if (filters.priceMin !== undefined)         params.append('min_price', String(filters.priceMin));
-    if (filters.priceMax !== undefined)         params.append('max_price', String(filters.priceMax));
-    if (filters.guests !== undefined)           params.append('guests', String(filters.guests));
-    if (filters.bedrooms !== undefined)         params.append('bedrooms', String(filters.bedrooms));
-    if (filters.minBathrooms !== undefined)     params.append('min_bathrooms', String(filters.minBathrooms));
-    if (filters.propertyType)                  params.append('property_types', filters.propertyType);
-    if (filters.sortBy)                         params.append('sortBy', filters.sortBy);
-    if (filters.amenities?.length)              filters.amenities.forEach((a) => params.append('amenities', a));
-    if (filters.checkIn)                        params.append('checkIn', filters.checkIn);
-    if (filters.checkOut)                       params.append('checkOut', filters.checkOut);
+    if (query) params.append('q', query);
+    if (filters.priceMin !== undefined) params.append('min_price', String(filters.priceMin));
+    if (filters.priceMax !== undefined) params.append('max_price', String(filters.priceMax));
+    if (filters.guests !== undefined) params.append('guests', String(filters.guests));
+    if (filters.bedrooms !== undefined) params.append('bedrooms', String(filters.bedrooms));
+    if (filters.minBathrooms !== undefined) params.append('min_bathrooms', String(filters.minBathrooms));
+    if (filters.propertyType) params.append('property_types', filters.propertyType);
+    if (filters.sortBy) params.append('sortBy', filters.sortBy);
+    if (filters.amenities?.length) filters.amenities.forEach((a) => params.append('amenities', a));
+    if (filters.checkIn) params.append('checkIn', filters.checkIn);
+    if (filters.checkOut) params.append('checkOut', filters.checkOut);
     params.append('page', String(pageNum));
     params.append('limit', '20');
     return params;
   }
 
-  // ── Advanced search ─────────────────────────────────────────────────────────
-
-  const abortRef      = useRef<AbortController | null>(null);
-  const debounceRef   = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const lastQueryRef  = useRef<string>('');
-  const lastFiltersRef = useRef<Partial<FilterState>>({});
-
-  // ── Core search ────────────────────────────────────────────────────────────
   const search = useCallback(
     async (query: string, filters: Partial<FilterState> = {}, pageNum = 1) => {
       if (abortControllerRef.current) abortControllerRef.current.abort();
       abortControllerRef.current = new AbortController();
 
+      requestIdRef.current += 1;
+      const currentRequestId = requestIdRef.current;
+
       setLoading(true);
       setError(null);
-      lastQueryRef.current   = query;
+      lastQueryRef.current = query;
       lastFiltersRef.current = filters;
 
       try {
@@ -104,12 +105,19 @@ export function usePropertySearch(options: UseSearchOptions = {}) {
         if (!response.ok) throw new Error('Search failed');
 
         const data = await response.json();
+
+        if (currentRequestId !== requestIdRef.current) return;
+
         setResults(data.data ?? []);
         setPage(pageNum);
+        setTotal(data.total ?? 0);
+        setHasMore(data.hasMore ?? false);
         setZeroResultSuggestions(data._suggestions ?? []);
         setHistogram(data.histogram ?? null);
       } catch (err) {
         if (err instanceof Error && err.name === 'AbortError') return;
+        if (currentRequestId !== requestIdRef.current) return;
+
         setError(err instanceof Error ? err.message : 'Search error');
         setResults([]);
         setTotal(0);
@@ -117,15 +125,21 @@ export function usePropertySearch(options: UseSearchOptions = {}) {
         setZeroResultSuggestions([]);
         setHistogram(null);
       } finally {
-        setLoading(false);
+        if (currentRequestId === requestIdRef.current) {
+          setLoading(false);
+        }
       }
     },
     [],
   );
 
-  // ── Map bounds search ───────────────────────────────────────────────────────
+  const loadMore = useCallback(async () => {
+    if (!hasMore) return;
 
-  // ── Map viewport search ────────────────────────────────────────────────────
+    const nextPage = page + 1;
+    await search(lastQueryRef.current, lastFiltersRef.current, nextPage);
+  }, [hasMore, page, search]);
+
   const searchByBounds = useCallback(
     (bounds: LatLngBounds, filters: Partial<FilterState> = {}) => {
       if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
@@ -134,6 +148,9 @@ export function usePropertySearch(options: UseSearchOptions = {}) {
         if (abortControllerRef.current) abortControllerRef.current.abort();
         abortControllerRef.current = new AbortController();
 
+        requestIdRef.current += 1;
+        const currentRequestId = requestIdRef.current;
+
         setLoading(true);
         setError(null);
 
@@ -141,16 +158,16 @@ export function usePropertySearch(options: UseSearchOptions = {}) {
           const params = new URLSearchParams();
           params.append('north', String(bounds.getNorth()));
           params.append('south', String(bounds.getSouth()));
-          params.append('east',  String(bounds.getEast()));
-          params.append('west',  String(bounds.getWest()));
-          if (filters.priceMin !== undefined)     params.append('min_price', String(filters.priceMin));
-          if (filters.priceMax !== undefined)     params.append('max_price', String(filters.priceMax));
-          if (filters.guests !== undefined)       params.append('guests', String(filters.guests));
-          if (filters.bedrooms !== undefined)     params.append('bedrooms', String(filters.bedrooms));
+          params.append('east', String(bounds.getEast()));
+          params.append('west', String(bounds.getWest()));
+          if (filters.priceMin !== undefined) params.append('min_price', String(filters.priceMin));
+          if (filters.priceMax !== undefined) params.append('max_price', String(filters.priceMax));
+          if (filters.guests !== undefined) params.append('guests', String(filters.guests));
+          if (filters.bedrooms !== undefined) params.append('bedrooms', String(filters.bedrooms));
           if (filters.minBathrooms !== undefined) params.append('min_bathrooms', String(filters.minBathrooms));
-          if (filters.propertyType)              params.append('property_types', filters.propertyType);
-          if (filters.sortBy)                     params.append('sortBy', filters.sortBy);
-          if (filters.amenities?.length)          filters.amenities.forEach((a) => params.append('amenities', a));
+          if (filters.propertyType) params.append('property_types', filters.propertyType);
+          if (filters.sortBy) params.append('sortBy', filters.sortBy);
+          if (filters.amenities?.length) filters.amenities.forEach((a) => params.append('amenities', a));
           params.append('limit', '100');
 
           const response = await fetch(`/api/v1/properties/search/bounds?${params}`, {
@@ -160,25 +177,33 @@ export function usePropertySearch(options: UseSearchOptions = {}) {
           if (!response.ok) throw new Error('Search failed');
 
           const data = await response.json();
+
+          if (currentRequestId !== requestIdRef.current) return;
+
           setResults(data.data ?? []);
           setPage(1);
           setHasMore(false);
         } catch (err) {
           if (err instanceof Error && err.name === 'AbortError') return;
+          if (currentRequestId !== requestIdRef.current) return;
+
           setError(err instanceof Error ? err.message : 'Search error');
           setResults([]);
         } finally {
-          setLoading(false);
+          if (currentRequestId === requestIdRef.current) {
+            setLoading(false);
+          }
         }
       }, debounceMs);
     },
     [debounceMs],
   );
 
-  // ── Autocomplete suggestions ────────────────────────────────────────────────
-
   const getSuggestions = useCallback(async (prefix: string) => {
-    if (prefix.length < 2) { setSuggestions([]); return; }
+    if (prefix.length < 2) {
+      setSuggestions([]);
+      return;
+    }
     try {
       const res = await fetch(`/api/v1/properties/search/suggestions?q=${encodeURIComponent(prefix)}&limit=5`);
       if (!res.ok) throw new Error();
@@ -188,8 +213,6 @@ export function usePropertySearch(options: UseSearchOptions = {}) {
       setSuggestions([]);
     }
   }, []);
-
-  // ── Trending ────────────────────────────────────────────────────────────────
 
   const getTrending = useCallback(async () => {
     try {
@@ -201,8 +224,6 @@ export function usePropertySearch(options: UseSearchOptions = {}) {
       setSuggestions([]);
     }
   }, []);
-
-  // ── Zero-result suggestion acceptance ──────────────────────────────────────
 
   const applyZeroResultSuggestion = useCallback(
     async (suggestion: ZeroResultSuggestion, currentFilters: Partial<FilterState> = {}) => {
@@ -216,8 +237,6 @@ export function usePropertySearch(options: UseSearchOptions = {}) {
     },
     [search],
   );
-
-  // ── Cleanup ─────────────────────────────────────────────────────────────────
 
   useEffect(() => () => {
     abortControllerRef.current?.abort();
@@ -234,7 +253,6 @@ export function usePropertySearch(options: UseSearchOptions = {}) {
     suggestions,
     zeroResultSuggestions,
     histogram,
-    page,
     search,
     loadMore,
     searchByBounds,
