@@ -151,6 +151,56 @@ describe('preferenceToken', () => {
       );
       expect(verifyPreferenceToken(noSub)).toBeNull();
     });
+
+    it('returns null for a token with extra segments (four-part)', () => {
+      const token = generatePreferenceToken(TEST_USER_ID);
+      const malformed = `${token}.extra`;
+      expect(verifyPreferenceToken(malformed)).toBeNull();
+    });
+
+    it('returns null for a token with missing segments (two-part)', () => {
+      const parts = 'header.payload';
+      expect(verifyPreferenceToken(parts)).toBeNull();
+    });
+
+    it('returns null for a token with empty segment (missing header)', () => {
+      const token = generatePreferenceToken(TEST_USER_ID);
+      const parts = token.split('.');
+      const malformed = `.${parts[1]}.${parts[2]}`;
+      expect(verifyPreferenceToken(malformed)).toBeNull();
+    });
+
+    it('returns null for a token with empty segment (missing payload)', () => {
+      const token = generatePreferenceToken(TEST_USER_ID);
+      const parts = token.split('.');
+      const malformed = `${parts[0]}..${parts[2]}`;
+      expect(verifyPreferenceToken(malformed)).toBeNull();
+    });
+
+    it('returns null for a token with empty segment (missing signature)', () => {
+      const token = generatePreferenceToken(TEST_USER_ID);
+      const parts = token.split('.');
+      const malformed = `${parts[0]}.${parts[1]}.`;
+      expect(verifyPreferenceToken(malformed)).toBeNull();
+    });
+
+    it('returns null for null token', () => {
+      expect(verifyPreferenceToken(null as unknown as string)).toBeNull();
+    });
+
+    it('returns null for undefined token', () => {
+      expect(verifyPreferenceToken(undefined as unknown as string)).toBeNull();
+    });
+
+    it('returns null for numeric token', () => {
+      expect(verifyPreferenceToken(12345 as unknown as string)).toBeNull();
+    });
+
+    it('still verifies a valid token after early rejection checks', () => {
+      const token = generatePreferenceToken(TEST_USER_ID);
+      const result = verifyPreferenceToken(token);
+      expect(result).toBe(TEST_USER_ID);
+    });
   });
 
   // ── buildPreferenceUrl ──────────────────────────────────────────────────

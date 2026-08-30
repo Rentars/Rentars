@@ -68,6 +68,19 @@ export function generatePreferenceToken(userId: string): string {
  * token is invalid, expired, or has the wrong purpose.
  */
 export function verifyPreferenceToken(token: string): string | null {
+  if (!token || typeof token !== 'string') {
+    return null;
+  }
+
+  const segments = token.split('.');
+  if (segments.length !== 3) {
+    return null;
+  }
+
+  if (segments.some((segment) => segment.length === 0)) {
+    return null;
+  }
+
   try {
     const decoded = jwt.verify(token, signingKey()) as PrefTokenPayload;
     if (decoded.pur !== 'pref' || !decoded.sub) return null;
