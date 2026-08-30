@@ -43,6 +43,8 @@ export function useNotifications(userId?: string, pageSize = 20) {
 
   // Track the initial fetch so we don't double-fire
   const initialFetched = useRef(false);
+  // Track in-flight load-more request to prevent duplicates on rapid calls
+  const loadMoreInFlight = useRef(false);
 
   /** Fetch a page of notifications. When cursor is null, fetches the first page. */
   const fetchPage = useCallback(
@@ -63,6 +65,12 @@ export function useNotifications(userId?: string, pageSize = 20) {
         const res = await fetch(`${API_BASE}?${params.toString()}`, {
           headers: { Authorization: `Bearer ${token}` },
         });
+
+        // Check token again after request completes (it may have been removed during the request)
+        const currentToken = getToken();
+        if (!currentToken) {
+          return;
+        }
 
         if (res.ok) {
           const body = await res.json();
@@ -108,8 +116,11 @@ export function useNotifications(userId?: string, pageSize = 20) {
 
   /** Load the next page (appends to list). */
   const loadMore = useCallback(() => {
-    if (!hasMore || isLoadingMore) return;
-    fetchPage(nextCursor, false);
+    if (!hasMore || isLoadingMore || loadMoreInFlight.current) return;
+    loadMoreInFlight.current = true;
+    fetchPage(nextCursor, false).finally(() => {
+      loadMoreInFlight.current = false;
+    });
   }, [hasMore, isLoadingMore, nextCursor, fetchPage]);
 
   /** Refetch from the first page (e.g. after a pull-to-refresh). */

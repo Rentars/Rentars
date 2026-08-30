@@ -60,7 +60,16 @@ export function useDashboard(
         });
 
         if (!res.ok) {
-          throw new Error(`HTTP ${res.status}`);
+          let errorMessage = `HTTP ${res.status}`;
+          try {
+            const errorBody = await res.json();
+            if (errorBody && typeof errorBody.error === 'string') {
+              errorMessage = errorBody.error;
+            }
+          } catch {
+            // Malformed JSON or unparseable response, use default message
+          }
+          throw new Error(errorMessage);
         }
 
         const body = await res.json();
@@ -84,8 +93,9 @@ export function useDashboard(
           setNextCursor(page.nextCursor);
           setHasMore(page.nextCursor !== null);
         }
-      } catch {
-        setError('Failed to load bookings');
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Failed to load bookings';
+        setError(message);
       } finally {
         if (isFirst) setIsLoading(false);
         else {
@@ -98,9 +108,12 @@ export function useDashboard(
   );
 
   useEffect(() => {
+    setBookings([]);
+    setNextCursor(null);
+    setHasMore(false);
     initialFetched.current = false;
     fetchPage(null, true);
-  }, [fetchPage]);
+  }, [statusFilter, sort, order, pageSize, fetchPage]);
 
   const loadMore = useCallback(() => {
     if (!hasMore || isLoadingMoreRef.current) return;
