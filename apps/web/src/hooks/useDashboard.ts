@@ -31,6 +31,7 @@ export function useDashboard(
   const [hasMore, setHasMore] = useState(false);
 
   const initialFetched = useRef(false);
+  const isLoadingMoreRef = useRef(false);
 
   const fetchPage = useCallback(
     async (cursor: string | null, isFirst: boolean) => {
@@ -46,6 +47,7 @@ export function useDashboard(
         setError(null);
       } else {
         setIsLoadingMore(true);
+        isLoadingMoreRef.current = true;
       }
 
       try {
@@ -86,7 +88,10 @@ export function useDashboard(
         setError('Failed to load bookings');
       } finally {
         if (isFirst) setIsLoading(false);
-        else setIsLoadingMore(false);
+        else {
+          setIsLoadingMore(false);
+          isLoadingMoreRef.current = false;
+        }
       }
     },
     [pageSize, statusFilter, sort, order],
@@ -98,9 +103,9 @@ export function useDashboard(
   }, [fetchPage]);
 
   const loadMore = useCallback(() => {
-    if (!hasMore || isLoadingMore) return;
+    if (!hasMore || isLoadingMoreRef.current) return;
     fetchPage(nextCursor, false);
-  }, [hasMore, isLoadingMore, nextCursor, fetchPage]);
+  }, [hasMore, nextCursor, fetchPage]);
 
   const refetch = useCallback(() => {
     initialFetched.current = false;
