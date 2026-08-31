@@ -25,9 +25,17 @@ export default function BlockchainVerification({
   const [pollCount, setPollCount] = useState(0);
   const [pollingTimedOut, setPollingTimedOut] = useState(false);
 
-  const loadStatus = useCallback(async () => {
+  /**
+   * Fetch the current blockchain status.
+   *
+   * @param silent - When true the global loading spinner is suppressed.
+   *   Pass `true` from background poll ticks so the pending UI is never
+   *   replaced by the spinner mid-cycle, and the pollingTimedOut branch
+   *   is not accidentally masked by `loading === true`.
+   */
+  const loadStatus = useCallback(async (silent = false) => {
     try {
-      setLoading(true);
+      if (!silent) setLoading(true);
       setError(null);
       const data = await getBlockchainStatus(propertyId);
       setStatus(data);
@@ -36,7 +44,7 @@ export default function BlockchainVerification({
       setError(err instanceof Error ? err.message : 'Failed to load status');
       return null;
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, [propertyId]);
 
@@ -57,7 +65,9 @@ export default function BlockchainVerification({
     }
 
     const timer = setTimeout(async () => {
-      const updatedStatus = await loadStatus();
+      // Use silent mode so background polls never flash the loading spinner
+      // and never mask the pollingTimedOut render branch.
+      const updatedStatus = await loadStatus(true);
       // Terminal states stop the poll counter from advancing further
       if (updatedStatus && (updatedStatus.verified || updatedStatus.failed)) {
         return;
@@ -130,7 +140,7 @@ export default function BlockchainVerification({
         </div>
         <p className="text-sm text-red-600">{error}</p>
         <button
-          onClick={loadStatus}
+          onClick={() => loadStatus()}
           className="mt-2 text-xs text-red-700 underline hover:no-underline"
         >
           Retry
