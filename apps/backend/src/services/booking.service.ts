@@ -291,11 +291,11 @@ export class BookingService {
       };
     }
 
-    if (!total_price || total_price <= 0) {
+    if (!Number.isFinite(total_price) || total_price <= 0) {
       return { success: false, error: 'total_price must be a positive number' };
     }
 
-    if (!guest_count || guest_count < 1) {
+    if (!Number.isFinite(guest_count) || !Number.isInteger(guest_count) || guest_count < 1) {
       return { success: false, error: 'guest_count must be at least 1' };
     }
 

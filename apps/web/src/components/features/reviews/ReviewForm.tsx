@@ -26,6 +26,10 @@ export default function ReviewForm({ bookingId, targetId, propertyId, onSuccess 
       setError('Please select a rating');
       return;
     }
+    if (comment.length > 2000) {
+      setError('Comment must be at most 2000 characters');
+      return;
+    }
     setSubmitting(true);
     setError(null);
 
@@ -67,6 +71,7 @@ export default function ReviewForm({ bookingId, targetId, propertyId, onSuccess 
           value={comment}
           onChange={(e) => setComment(e.target.value)}
           rows={3}
+          maxLength={2000}
           className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
           placeholder="Share your experience..."
         />
