@@ -172,7 +172,7 @@ export async function addHostResponse(
 
   const { data: review, error: reviewError } = await supabase
     .from('reviews')
-    .select('id, target_id, property_id')
+    .select('id, target_id, property_id, host_response')
     .eq('id', reviewId)
     .single();
 
@@ -180,7 +180,16 @@ export async function addHostResponse(
     return { success: false, error: 'Review not found' };
   }
 
-  const r = review as { id: string; target_id: string; property_id: string | null };
+  const r = review as {
+    id: string;
+    target_id: string;
+    property_id: string | null;
+    host_response: string | null;
+  };
+
+  if (r.host_response) {
+    return { success: false, error: 'This review already has a host response' };
+  }
 
   // Verify host owns the reviewed property; fall back to target_id check when no property
   if (r.property_id) {
@@ -207,10 +216,14 @@ export async function addHostResponse(
     .from('reviews')
     .update({ host_response: cleanResponse, host_response_at: new Date().toISOString() })
     .eq('id', reviewId)
+    .is('host_response', null)
     .select()
     .single();
 
   if (error) return { success: false, error: error.message };
+  if (!data) {
+    return { success: false, error: 'This review already has a host response' };
+  }
 
   // Notify the reviewer that the host has responded
   try {
