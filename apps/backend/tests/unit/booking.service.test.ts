@@ -322,6 +322,36 @@ describe('BookingService', () => {
       expect(result.success).toBe(false);
       expect(result.error).toContain('total_price must be a positive number');
     });
+
+    it('should return error when total_price is Infinity', async () => {
+      const result = await bookingService.createBooking({ ...validInput, total_price: Infinity });
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('total_price must be a positive number');
+    });
+
+    it('should return error when total_price is NaN', async () => {
+      const result = await bookingService.createBooking({ ...validInput, total_price: NaN });
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('total_price must be a positive number');
+    });
+
+    it('should return error when guest_count is Infinity', async () => {
+      const result = await bookingService.createBooking({ ...validInput, guest_count: Infinity });
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('guest_count must be at least 1');
+    });
+
+    it('should return error when guest_count is a fraction', async () => {
+      const result = await bookingService.createBooking({ ...validInput, guest_count: 1.5 });
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('guest_count must be at least 1');
+    });
+
+    it('should accept guest_count of 1', async () => {
+      setupPropertyAndProfiles();
+      const result = await bookingService.createBooking({ ...validInput, guest_count: 1 });
+      expect(result.success).toBe(true);
+    });
   });
 
   // ── cancelBooking ───────────────────────────────────────────────────────────
