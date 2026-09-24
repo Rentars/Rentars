@@ -224,3 +224,67 @@ jobs:
           name: playwright-report-journey
           path: apps/web/playwright-report/
           retention-days: 14
+
+  # ─── Job 6: Visual regression tests ─────────────────────────────────────────
+  # Captures screenshots of critical routes and diffs them against committed
+  # baselines. Nondeterministic content (timestamps, maps, charts) is masked
+  # before capture to avoid false failures.
+  #
+  # Updating baselines:
+  #   Run locally:  npx playwright test e2e/visual-regression.spec.ts --update-snapshots
+  #   Commit the new snapshots from apps/web/e2e/*.spec.ts-snapshots/
+  visual-regression:
+    name: Visual Regression Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: yarn
+          cache-dependency-path: apps/web/yarn.lock
+
+      - name: Install web dependencies
+        working-directory: apps/web
+        run: yarn install --frozen-lockfile
+
+      - name: Install Playwright browsers
+        working-directory: apps/web
+        # Chromium only for visual regression — consistent rendering across OS
+        run: yarn playwright install --with-deps chromium
+
+      - name: Build Next.js app
+        working-directory: apps/web
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:3000
+          NEXT_PUBLIC_SUPABASE_URL: https://mock.supabase.co
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: mock-anon-key
+        run: yarn build
+
+      - name: Run visual regression tests
+        working-directory: apps/web
+        env:
+          CI: true
+          PLAYWRIGHT_BASE_URL: http://localhost:3001
+          NEXT_PUBLIC_API_URL: http://localhost:3000
+          PORT: "3001"
+        run: yarn playwright test --project=chromium e2e/visual-regression.spec.ts
+
+      - name: Upload visual regression report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-regression-report
+          path: apps/web/playwright-report/
+          retention-days: 30
+
+      - name: Upload visual regression diff snapshots on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-regression-diffs
+          # Playwright writes *-actual.png and *-diff.png next to the baseline
+          path: apps/web/e2e/**/*-snapshots/
+          retention-days: 30
