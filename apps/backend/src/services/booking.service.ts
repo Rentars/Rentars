@@ -28,6 +28,7 @@ import {
 } from '@/middleware/metrics.middleware.js';
 import { checkDateRangeAvailability } from './availability.service.js';
 import { calculateRangePrice } from './pricing.service.js';
+import { bookingAuthorizationService } from './bookingAuthorization.service.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -636,6 +637,7 @@ export class BookingService {
     bookingId: string,
     userId: string,
     now: Date = new Date(),
+    userRole?: string,
   ): Promise<ServiceResponse<Booking>> {
     if (!bookingId) {
       return { success: false, error: 'Booking ID is required' };
@@ -659,8 +661,10 @@ export class BookingService {
     const booking = bookingData as Booking & { properties?: { owner_id: string } | null };
     const hostId = booking.properties?.owner_id ?? null;
 
-    // 2. Authorisation: only the tenant may cancel
-    if (booking.tenant_id && booking.tenant_id !== userId) {
+    // 2. Authorisation: only the tenant or admin/moderator may cancel
+    const isTenant = booking.tenant_id === userId;
+    const isAdmin = ['admin', 'moderator'].includes(userRole ?? '');
+    if (!isTenant && !isAdmin) {
       return {
         success: false,
         error: 'Forbidden: only the tenant can cancel a booking',
@@ -802,14 +806,14 @@ export class BookingService {
    * Confirm a booking: release the escrow to the property owner, then update
    * DB and on-chain status to Confirmed.
    */
-  async confirmBooking(bookingId: string, userId: string): Promise<ServiceResponse<Booking>> {
+  async confirmBooking(bookingId: string, userId: string, userRole?: string): Promise<ServiceResponse<Booking>> {
     if (!bookingId) {
       return { success: false, error: 'Booking ID is required' };
     }
 
     const { data: bookingData, error: fetchError } = await supabase
       .from('bookings')
-      .select('*')
+      .select('*, properties!inner(owner_id)')
       .eq('id', bookingId)
       .single();
 
@@ -817,7 +821,17 @@ export class BookingService {
       return { success: false, error: 'Booking not found' };
     }
 
-    const booking = bookingData as Booking;
+    const booking = bookingData as Booking & { properties?: { owner_id: string } | null };
+
+    // Authorization: only the host (property owner) or admin can confirm
+    const hostId = booking.properties?.owner_id;
+    if (!hostId || (hostId !== userId && !['admin', 'moderator'].includes(userRole ?? ''))) {
+      return {
+        success: false,
+        error: 'Forbidden: only the host may confirm a booking',
+        statusCode: 403,
+      };
+    }
 
     if (booking.status === 'Confirmed') {
       return { success: false, error: 'Booking is already confirmed' };
@@ -921,7 +935,7 @@ export class BookingService {
    * @param bookingId - UUID of the booking to complete
    * @param userId    - ID of the caller (must be the tenant)
    */
-  async completeBooking(bookingId: string, userId: string): Promise<ServiceResponse<Booking>> {
+  async completeBooking(bookingId: string, userId: string, userRole?: string): Promise<ServiceResponse<Booking>> {
     if (!bookingId) {
       return { success: false, error: 'Booking ID is required' };
     }
@@ -949,9 +963,15 @@ export class BookingService {
       };
     }
 
-    // Authorisation: only the tenant may mark as completed
-    if (booking.tenant_id && booking.tenant_id !== userId) {
-      return { success: false, error: 'Forbidden: only the tenant can complete a booking' };
+    // Authorisation: only the tenant or admin/moderator may mark as completed
+    const isTenant = booking.tenant_id === userId;
+    const isAdmin = ['admin', 'moderator'].includes(userRole ?? '');
+    if (!isTenant && !isAdmin) {
+      return {
+        success: false,
+        error: 'Forbidden: only the tenant can complete a booking',
+        statusCode: 403,
+      };
     }
 
     // Release escrow if still open (idempotent — if already released this is a no-op on TW)
@@ -1315,7 +1335,8 @@ export class BookingService {
     bookingId: string,
     userId: string,
     resolution: 'refund_tenant' | 'release_to_host',
-    adminNotes?: string
+    adminNotes?: string,
+    userRole?: string,
   ): Promise<ServiceResponse<Booking>> {
     if (!bookingId) {
       return { success: false, error: 'Booking ID is required' };
@@ -1325,8 +1346,14 @@ export class BookingService {
       return { success: false, error: 'User ID is required' };
     }
 
-    // TODO: Check if user is an admin/moderator
-    // For now, we'll assume the authorization check happens at the controller level
+    // Authorization: only admin or moderator can resolve disputes
+    if (!['admin', 'moderator'].includes(userRole ?? '')) {
+      return {
+        success: false,
+        error: 'Forbidden: only admins or moderators may resolve disputes',
+        statusCode: 403,
+      };
+    }
 
     // Fetch the booking
     const { data: bookingData, error: fetchError } = await supabase

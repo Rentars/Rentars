@@ -232,13 +232,13 @@ export async function createBooking(req: Request, res: Response): Promise<void> 
  * tenant and host are notified. Only the tenant may cancel.
  */
 export async function cancelBooking(req: Request, res: Response): Promise<void> {
-  const authUser = (req as Request & { user?: { id: string } }).user;
+  const authUser = (req as Request & { user?: { id: string; role?: string } }).user;
   if (!authUser) {
     res.status(401).json({ error: 'Unauthorized' });
     return;
   }
 
-  const result = await bookingService.cancelBooking(req.params.id, authUser.id);
+  const result = await bookingService.cancelBooking(req.params.id, authUser.id, new Date(), authUser.role);
 
   if (!result.success) {
     const statusCode =
@@ -261,11 +261,17 @@ export async function cancelBooking(req: Request, res: Response): Promise<void> 
 }
 
 export async function confirmBooking(req: Request, res: Response): Promise<void> {
-  const userId = (req as Request & { user?: { id: string } }).user?.id ?? '';
-  const result = await bookingService.confirmBooking(req.params.id, userId);
+  const authUser = (req as Request & { user?: { id: string; role?: string } }).user;
+  if (!authUser) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const result = await bookingService.confirmBooking(req.params.id, authUser.id, authUser.role);
 
   if (!result.success) {
-    res.status(400).json({ error: result.error });
+    const statusCode = result.statusCode ?? (result.error?.startsWith('Forbidden') ? 403 : 400);
+    res.status(statusCode).json({ error: result.error });
     return;
   }
 
@@ -279,19 +285,19 @@ export async function confirmBooking(req: Request, res: Response): Promise<void>
  * Only the booking tenant may call this endpoint.
  */
 export async function completeBooking(req: Request, res: Response): Promise<void> {
-  const authUser = (req as Request & { user?: { id: string } }).user;
+  const authUser = (req as Request & { user?: { id: string; role?: string } }).user;
   if (!authUser) {
     res.status(401).json({ error: 'Unauthorized' });
     return;
   }
 
-  const result = await bookingService.completeBooking(req.params.id, authUser.id);
+  const result = await bookingService.completeBooking(req.params.id, authUser.id, authUser.role);
 
   if (!result.success) {
-    const statusCode =
-      result.error?.startsWith('Forbidden') ? 403
+    const statusCode = result.statusCode ??
+      (result.error?.startsWith('Forbidden') ? 403
       : result.error === 'Booking not found'  ? 404
-      : 400;
+      : 400);
     res.status(statusCode).json({ error: result.error });
     return;
   }
@@ -513,37 +519,29 @@ export async function raiseDispute(req: Request, res: Response): Promise<void> {
  * Resolve a dispute on a booking. Only admins/moderators may resolve disputes.
  */
 export async function resolveDispute(req: Request, res: Response): Promise<void> {
-  const userId = (req as Request & { user?: { id: string } }).user?.id;
+  const authUser = (req as Request & { user?: { id: string; role?: string } }).user;
 
-  if (!userId) {
+  if (!authUser) {
     res.status(401).json({ error: 'Unauthorized' });
     return;
   }
 
-  // TODO: Check if user is admin/moderator
-  // For now, we'll return 403 for all users until admin role check is implemented
-  // In a real implementation, you would check user role here
-  const isAdmin = false; // Placeholder - replace with actual admin check
-
-  if (!isAdmin) {
-    res.status(403).json({ error: 'Forbidden: only admins may resolve disputes' });
-    return;
-  }
-
-  const { resolution, admin_notes } = req.body as { 
-    resolution: 'refund_tenant' | 'release_to_host'; 
+  const { resolution, admin_notes } = req.body as {
+    resolution: 'refund_tenant' | 'release_to_host';
     admin_notes?: string;
   };
 
   const result = await bookingService.resolveDispute(
-    req.params.id, 
-    userId, 
-    resolution, 
-    admin_notes
+    req.params.id,
+    authUser.id,
+    resolution,
+    admin_notes,
+    authUser.role
   );
 
   if (!result.success) {
-    res.status(400).json({ error: result.error });
+    const statusCode = result.statusCode ?? (result.error?.startsWith('Forbidden') ? 403 : 400);
+    res.status(statusCode).json({ error: result.error });
     return;
   }
 
