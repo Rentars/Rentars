@@ -150,6 +150,32 @@ const envSchema = z.object({
   // When unset the endpoint is restricted to localhost only.
   METRICS_TOKEN: z.string().optional(),
 
+  // Distributed tracing sample rate (0.0 to 1.0). Default: 0.1 (10%)
+  TRACE_SAMPLE_RATE: z
+    .string()
+    .default('0.1')
+    .transform((v) => {
+      const n = Number(v);
+      if (isNaN(n) || n < 0 || n > 1) throw new Error('TRACE_SAMPLE_RATE must be between 0 and 1');
+      return n;
+    }),
+
+  // Deployment version for trace tagging
+  DEPLOYMENT_VERSION: z.string().optional(),
+
+  // Probe configuration
+  PROBES_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  PROBE_LOCATION: z.string().optional(),
+  FRONTEND_URL: z.string().url().optional(),
+  API_URL: z.string().url().optional(),
+  PROBE_TEST_EMAIL: z.string().email().optional(),
+  PROBE_TEST_PASSWORD: z.string().optional(),
+  PROBE_BOOKING_EMAIL: z.string().email().optional(),
+  PROBE_BOOKING_PASSWORD: z.string().optional(),
+
   // ── Security headers ──────────────────────────────────────────────────────
   // Set to "true" to force-enable HSTS even outside NODE_ENV=production.
   // Useful when running behind a TLS-terminating proxy in staging.
