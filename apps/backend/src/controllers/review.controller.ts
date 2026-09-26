@@ -13,6 +13,7 @@ import {
   rejectReview,
   getPendingReviews,
 } from '../services/review.service.js';
+import { getEligibilityExplanation } from '../services/reviewEligibility.service.js';
 
 export async function createReview(req: AuthRequest, res: Response): Promise<void> {
   const { bookingId, targetId, rating, comment, propertyId } = req.body;
@@ -155,6 +156,25 @@ export async function rejectReviewHandler(req: AuthRequest, res: Response): Prom
   const result = await rejectReview(req.params.id, reason, req.userId);
   if (!result.success) {
     res.status(400).json({ error: result.error });
+    return;
+  }
+  res.json(result.data);
+}
+
+/**
+ * GET /api/v1/reviews/eligibility/:bookingId
+ *
+ * Returns the eligibility snapshot for a booking so support staff can
+ * explain to users why a review was accepted or rejected.
+ * Admin/moderator/support only.
+ */
+export async function getEligibilityExplanationHandler(
+  req: Request,
+  res: Response,
+): Promise<void> {
+  const result = await getEligibilityExplanation(req.params.bookingId);
+  if (!result.success) {
+    res.status(404).json({ error: result.error });
     return;
   }
   res.json(result.data);

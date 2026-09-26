@@ -565,4 +565,40 @@ export const emailService = {
     });
     await send(data.to, 'Reset your Rentars password', html, text);
   },
+
+  /**
+   * Generic operational / security alert email.
+   *
+   * Used for mandatory trust-workflow notifications (dispute updates, security
+   * alerts, trust case actions).  Keeps the template simple: a headline, a
+   * body message, and the standard footer with preferences link.
+   *
+   * Content inserted into `body` is already sanitised by callers; escapeHtml
+   * is applied here as a defence-in-depth measure.
+   */
+  async sendGenericAlert(data: {
+    to: string;
+    userName: string;
+    subject: string;
+    body: string;
+    preferencesUrl?: string;
+  }): Promise<void> {
+    const { html, text } = renderEmail({
+      title: data.subject,
+      preheader: data.subject,
+      // Generic alerts are essential operational emails — they are shown even
+      // when the layout would normally suppress essential-only sections.
+      isEssential: true,
+      body: `
+        <p style="margin:0 0 16px;font-size:16px;">Hi ${escapeHtml(data.userName || 'there')},</p>
+        <p style="margin:0 0 20px;font-size:15px;line-height:1.6;">${escapeHtml(data.body)}</p>
+        <p style="margin:16px 0 0;font-size:13px;color:#6B7280;">
+          If you have questions, please reply to this email or visit the
+          <a href="${escapeHtml(process.env.FRONTEND_URL ?? '')}/help" style="color:#2563EB;">
+            Help Centre</a>.
+        </p>`,
+      preferencesUrl: data.preferencesUrl,
+    });
+    await send(data.to, data.subject, html, text);
+  },
 };

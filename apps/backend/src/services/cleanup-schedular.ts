@@ -1,6 +1,7 @@
 import { syncAllBookings, syncAllProperties, reconcileAllPendingEscrows } from './sync.service.js';
 import { purgeExpired as purgeExpiredIdempotencyKeys } from './idempotency.service.js';
 import { BookingService } from './booking.service.js';
+import { runWorkerCycle } from './notificationOutbox.service.js';
 
 const bookingService = new BookingService();
 
@@ -8,6 +9,9 @@ const SYNC_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const RECONCILIATION_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const IDEMPOTENCY_CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const BOOKING_EXPIRY_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+/** Outbox worker polls every 30 seconds. Fast enough for near-real-time delivery
+ *  without hammering the DB when the queue is idle. */
+const OUTBOX_WORKER_INTERVAL_MS = 30 * 1000; // 30 seconds
 const MAX_CONCURRENT_RECONCILIATIONS = 5;
 const INITIAL_BACKOFF_MS = 1000; // 1 second
 const MAX_BACKOFF_MS = 30000; // 30 seconds
@@ -105,6 +109,22 @@ export function startSyncScheduler(): void {
     runBookingExpiryCleanup().catch((err) => console.error('[expiry] Scheduler error:', err));
   }, BOOKING_EXPIRY_INTERVAL_MS);
 
+  // ── Notification outbox worker ─────────────────────────────────────────────
+  //
+  // Polls every 30 seconds.  Claims due rows, delivers them across channels,
+  // retries on transient failures (exponential back-off), and dead-letters on
+  // permanent failure.  Worker restart safety: stale 'processing' locks older
+  // than 10 minutes are automatically reclaimed at the start of each cycle.
+  setInterval(() => {
+    runOutboxWorker().catch((err) => console.error('[outbox] Worker error:', err));
+  }, OUTBOX_WORKER_INTERVAL_MS);
+
+  // Run the outbox worker once shortly after startup to flush any rows that
+  // accumulated while the server was down.
+  setTimeout(() => {
+    runOutboxWorker().catch((err) => console.error('[outbox] Startup flush error:', err));
+  }, 15_000); // 15 seconds after boot
+
   // Run an initial cleanup shortly after startup so stale keys don't linger
   // across a server restart that happens to be more than 24 h after creation.
   setTimeout(() => {
@@ -150,8 +170,26 @@ export function startSyncScheduler(): void {
     `[sync] Scheduler started — sync interval: ${SYNC_INTERVAL_MS / 1000}s, ` +
     `reconciliation interval: ${RECONCILIATION_INTERVAL_MS / 1000}s, ` +
     `idempotency cleanup interval: ${IDEMPOTENCY_CLEANUP_INTERVAL_MS / 1000}s, ` +
-    `booking expiry interval: ${BOOKING_EXPIRY_INTERVAL_MS / 1000}s`,
+    `booking expiry interval: ${BOOKING_EXPIRY_INTERVAL_MS / 1000}s, ` +
+    `outbox worker interval: ${OUTBOX_WORKER_INTERVAL_MS / 1000}s`,
   );
+}
+
+async function runOutboxWorker(): Promise<void> {
+  const result = await runWorkerCycle();
+  if (result.success) {
+    const { processed, delivered, failed, deadLettered } = result.data ?? {
+      processed: 0, delivered: 0, failed: 0, deadLettered: 0,
+    };
+    if (processed > 0) {
+      console.log(
+        `[outbox] Cycle — processed: ${processed}, delivered: ${delivered}, ` +
+        `failed: ${failed}, dead-lettered: ${deadLettered}`,
+      );
+    }
+  } else {
+    console.error(`[outbox] Worker cycle failed: ${result.error}`);
+  }
 }
 
 async function runIdempotencyCleanup(): Promise<void> {

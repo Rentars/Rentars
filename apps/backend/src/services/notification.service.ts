@@ -30,7 +30,15 @@ export type NotificationType =
   | 'new_property'
   | 'system_alert'
   | 'report_created'
-  | 'message_received';
+  | 'message_received'
+  // ── Trust / security workflow types ──────────────────────────────────────
+  // These are MANDATORY — they are always delivered via the user's mandatory_channel
+  // regardless of email_notifications / push_notifications settings.
+  | 'account_security_alert'   // password reset, session invalidation, suspicious login
+  | 'dispute_update'           // moderator posted an update on an open dispute
+  | 'trust_case_action'        // automated action applied (hold, step-up verification)
+  | 'trust_case_cleared'       // false-positive recovery — action lifted by moderator
+  | 'review_eligibility_denied'; // review submission rejected with explanation
 
 export interface Notification {
   id: string;
@@ -53,6 +61,12 @@ export interface NotificationPreferences {
   quiet_hours_end?: string | null;
   /** IANA timezone used when evaluating the quiet window. Defaults to UTC. */
   quiet_hours_timezone?: string | null;
+  /**
+   * Channel used to deliver mandatory operational notifications (dispute opened,
+   * security alerts, trust actions) regardless of email/push opt-outs.
+   * 'in_app' (default) | 'email'
+   */
+  mandatory_channel?: 'in_app' | 'email';
   updated_at?: string;
 }
 
@@ -80,7 +94,28 @@ const EMAIL_TEMPLATES: Partial<Record<NotificationType, string>> = {
   system_alert: 'System Alert',
   report_created: 'New Report Submitted',
   message_received: 'New Message',
+  // Trust / security workflow
+  account_security_alert:    'Important: Account Security Notice',
+  dispute_update:            'Update on Your Dispute',
+  trust_case_action:         'Account Review Notice',
+  trust_case_cleared:        'Account Review Complete',
+  review_eligibility_denied: 'Review Submission Notice',
 };
+
+/**
+ * Notification types that MUST be delivered regardless of the user's
+ * email_notifications or push_notifications opt-outs.
+ *
+ * These are operational / safety-critical messages. The user can choose
+ * their preferred mandatory channel (in_app or email) but cannot silence them.
+ */
+export const MANDATORY_NOTIFICATION_TYPES = new Set<NotificationType>([
+  'dispute_initiated',
+  'dispute_update',
+  'account_security_alert',
+  'trust_case_action',
+  'trust_case_cleared',
+]);
 
 const VALID_NOTIFICATION_TYPES: ReadonlyArray<NotificationType> = [
   'booking_created',
@@ -99,6 +134,12 @@ const VALID_NOTIFICATION_TYPES: ReadonlyArray<NotificationType> = [
   'system_alert',
   'report_created',
   'message_received',
+  // Trust / security workflow
+  'account_security_alert',
+  'dispute_update',
+  'trust_case_action',
+  'trust_case_cleared',
+  'review_eligibility_denied',
 ];
 
 export async function createNotification(
@@ -256,6 +297,7 @@ export async function getPreferences(
       quiet_hours_start: null,
       quiet_hours_end: null,
       quiet_hours_timezone: null,
+      mandatory_channel: 'in_app',
     };
     return { success: true, data: defaults };
   }
@@ -278,6 +320,15 @@ export async function updatePreferences(
 }
 
 async function shouldSendEmail(userId: string, type: NotificationType): Promise<boolean> {
+  // Mandatory types bypass the global email opt-out.
+  // They are delivered via the user's mandatory_channel; if that is 'email'
+  // they go through email regardless of email_notifications=false.
+  if (MANDATORY_NOTIFICATION_TYPES.has(type)) {
+    const prefsResult = await getPreferences(userId);
+    const prefs = prefsResult.data;
+    return (prefs?.mandatory_channel ?? 'in_app') === 'email';
+  }
+
   const prefsResult = await getPreferences(userId);
   if (!prefsResult.success || !prefsResult.data) return true;
   const prefs = prefsResult.data;
@@ -287,6 +338,10 @@ async function shouldSendEmail(userId: string, type: NotificationType): Promise<
 }
 
 async function shouldSendPush(userId: string, type: NotificationType): Promise<boolean> {
+  // Mandatory types are never push-only — push requires device opt-in and
+  // cannot be treated as reliable. Mandatory notifications go in-app or email.
+  if (MANDATORY_NOTIFICATION_TYPES.has(type)) return false;
+
   const prefsResult = await getPreferences(userId);
   if (!prefsResult.success || !prefsResult.data) return true;
   const prefs = prefsResult.data;
@@ -296,6 +351,10 @@ async function shouldSendPush(userId: string, type: NotificationType): Promise<b
 }
 
 export async function shouldSendInApp(userId: string, type: NotificationType): Promise<boolean> {
+  // Mandatory types always get an in-app notification (it is the documented
+  // fallback channel when email is unavailable or undeliverable).
+  if (MANDATORY_NOTIFICATION_TYPES.has(type)) return true;
+
   const prefsResult = await getPreferences(userId);
   if (!prefsResult.success || !prefsResult.data) return true;
   const prefs = prefsResult.data;
@@ -398,6 +457,80 @@ export async function createNotificationWithAllChannels(
 }
 
 export { EMAIL_TEMPLATES };
+
+// ─── Mandatory notification delivery ─────────────────────────────────────────
+
+/**
+ * Deliver a mandatory operational notification (dispute update, security alert,
+ * trust action) through the user's documented mandatory channel.
+ *
+ * Rules:
+ *  - Always creates an in-app notification (permanent record, cannot be
+ *    disabled).
+ *  - Additionally sends email when the user's mandatory_channel is 'email'.
+ *  - Deduplicates by idempotency_key: if a notification with the same key
+ *    already exists in the notifications table, the call is a no-op.
+ *
+ * @param userId         - Recipient user ID.
+ * @param type           - Must be a MANDATORY_NOTIFICATION_TYPES member.
+ * @param data           - Notification payload (must include booking/case links,
+ *                         must NOT include private details about other users).
+ * @param idempotencyKey - Stable key to prevent duplicate delivery on retries.
+ * @param userEmail      - Recipient email address (required for email delivery).
+ * @param userName       - Recipient display name (used in email template).
+ */
+export async function sendMandatoryNotification(
+  userId: string,
+  type: NotificationType,
+  data: Record<string, unknown>,
+  idempotencyKey: string,
+  userEmail?: string,
+  userName?: string,
+): Promise<ServiceResponse<Notification>> {
+  // Deduplication: skip if we've already delivered this exact notification.
+  const { data: existing } = await supabase
+    .from('notifications')
+    .select('id')
+    .eq('user_id', userId)
+    .eq('type', type)
+    .filter('data->>idempotency_key', 'eq', idempotencyKey)
+    .maybeSingle();
+
+  if (existing) {
+    // Already delivered — return the existing row id as a sentinel.
+    return { success: true, data: existing as Notification };
+  }
+
+  // Always create in-app notification (embeds the idempotency key in data).
+  const result = await createNotification(userId, type, {
+    ...data,
+    idempotency_key: idempotencyKey,
+  });
+  if (!result.success) return result;
+
+  // Optionally also send email based on mandatory_channel preference.
+  const prefsResult = await getPreferences(userId);
+  const mandatoryChannel = prefsResult.data?.mandatory_channel ?? 'in_app';
+
+  if (mandatoryChannel === 'email' && userEmail) {
+    const preferencesUrl = buildPreferenceUrlForUser(userId);
+    const subject = EMAIL_TEMPLATES[type] ?? 'Important Notice from Rentars';
+
+    await emailService
+      .sendGenericAlert({
+        to: userEmail,
+        userName: userName ?? '',
+        subject,
+        body: String(data.message ?? subject),
+        preferencesUrl,
+      })
+      .catch((err) =>
+        console.error(`[NotificationService] Mandatory email failed for ${type}:`, err),
+      );
+  }
+
+  return result;
+}
 
 // ─── Host-follow new-listing fan-out ──────────────────────────────────────────
 

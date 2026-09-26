@@ -12,6 +12,8 @@ export const createReviewSchema = z.object({
     .int('rating must be an integer')
     .min(1, 'Rating must be between 1 and 5')
     .max(5, 'Rating must be between 1 and 5'),
+  // Comment is required for tenant→host reviews but optional for host→tenant.
+  // The service enforces the non-empty requirement after perspective resolution.
   comment: z.string().max(2000, 'Comment must be at most 2000 characters').optional(),
   propertyId: z.string().uuid('propertyId must be a valid UUID').optional(),
 });
