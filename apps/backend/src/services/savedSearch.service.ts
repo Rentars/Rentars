@@ -9,7 +9,11 @@ export interface SavedSearch {
   user_id: string;
   name: string;
   filters: Record<string, unknown>;
+  is_paused?: boolean;
+  digest_frequency?: 'immediate' | 'daily' | 'weekly';
   created_at?: string;
+  updated_at?: string;
+  version?: number;
 }
 
 /** Subset of AdvancedSearchFilters relevant for matching a new property. */
@@ -60,6 +64,48 @@ export async function listSavedSearches(
 
   if (error) return { success: false, error: error.message };
   return { success: true, data: (data ?? []) as SavedSearch[] };
+}
+
+export async function updateSavedSearch(
+  userId: string,
+  searchId: string,
+  updates: Partial<SavedSearch>,
+): Promise<ServiceResponse<SavedSearch>> {
+  const { data, error } = await supabase
+    .from('saved_searches')
+    .update(updates)
+    .eq('id', searchId)
+    .eq('user_id', userId)
+    .select()
+    .single();
+
+  if (error) return { success: false, error: error.message };
+  return { success: true, data: data as SavedSearch };
+}
+
+export async function pauseSavedSearch(
+  userId: string,
+  searchId: string,
+): Promise<ServiceResponse<SavedSearch>> {
+  return updateSavedSearch(userId, searchId, { is_paused: true });
+}
+
+export async function resumeSavedSearch(
+  userId: string,
+  searchId: string,
+): Promise<ServiceResponse<SavedSearch>> {
+  return updateSavedSearch(userId, searchId, { is_paused: false });
+}
+
+export async function updateDigestFrequency(
+  userId: string,
+  searchId: string,
+  frequency: 'immediate' | 'daily' | 'weekly',
+): Promise<ServiceResponse<SavedSearch>> {
+  if (!['immediate', 'daily', 'weekly'].includes(frequency)) {
+    return { success: false, error: 'Invalid digest frequency' };
+  }
+  return updateSavedSearch(userId, searchId, { digest_frequency: frequency });
 }
 
 export async function deleteSavedSearch(
@@ -194,17 +240,18 @@ export async function matchesSavedSearch(
  * notifications to their owners. Fire-and-forget: notification failures
  * never throw.
  *
+ * Respects pause status and digest frequency preferences.
+ *
  * @returns The number of users notified.
  */
 export async function notifyMatchingSavedSearches(
   property: Pick<Property, 'id' | 'title' | 'city' | 'country' | 'price_per_night' | 'bedrooms' | 'bathrooms' | 'max_guests' | 'amenities' | 'property_type'>,
 ): Promise<ServiceResponse<number>> {
-  // Fetch all saved searches (potentially large, but bounded by active users).
-  // In production this could be narrowed by city/price index, but for v1 a
-  // full scan with in-memory matching is simpler and correct.
+  // Fetch all saved searches that are not paused
   const { data: searches, error } = await supabase
     .from('saved_searches')
-    .select('id, user_id, name, filters');
+    .select('id, user_id, name, filters, is_paused, digest_frequency')
+    .eq('is_paused', false);
 
   if (error) return { success: false, error: error.message };
 
@@ -218,22 +265,28 @@ export async function notifyMatchingSavedSearches(
 
   if (matching.length === 0) return { success: true, data: 0 };
 
-  // Deduplicate by user_id (a user with multiple matching searches gets one notification)
-  const seen = new Set<string>();
-  let notified = 0;
+  // Group by user to handle digest frequency per user
+  const searchesByUser = new Map<string, SavedSearch[]>();
+  for (const search of matching) {
+    if (!searchesByUser.has(search.user_id)) {
+      searchesByUser.set(search.user_id, []);
+    }
+    searchesByUser.get(search.user_id)!.push(search);
+  }
 
+  let notified = 0;
   const { createNotification } = await import('./notification.service.js');
 
-  for (const search of matching) {
-    if (seen.has(search.user_id)) continue;
-    seen.add(search.user_id);
-
+  for (const [userId, userSearches] of searchesByUser.entries()) {
     try {
-      const result = await createNotification(search.user_id, 'new_property', {
+      const lastSearch = userSearches[0];
+      const result = await createNotification(userId, 'new_property_search', {
         propertyId: property.id,
         propertyTitle: property.title,
-        savedSearchName: search.name,
-        message: `A new listing "${property.title}" matches your saved search "${search.name}".`,
+        savedSearchName: lastSearch.name,
+        message: `A new listing "${property.title}" matches your saved search "${lastSearch.name}".`,
+        matchCount: userSearches.length,
+        digestFrequency: lastSearch.digest_frequency || 'immediate',
       });
       if (result.success) notified++;
     } catch {

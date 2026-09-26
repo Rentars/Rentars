@@ -54,12 +54,18 @@ export async function followHost(
   followerId: string,
   hostId: string,
 ): Promise<ServiceResponse<HostFollow>> {
-  if (!followerId || !hostId) {
+  const trimmedFollowerId = (followerId ?? '').trim();
+  const trimmedHostId = (hostId ?? '').trim();
+
+  if (!trimmedFollowerId || !trimmedHostId) {
     return { success: false, error: 'follower_id and host_id are required' };
   }
-  if (followerId === hostId) {
+  if (trimmedFollowerId === trimmedHostId) {
     return { success: false, error: 'You cannot follow yourself' };
   }
+
+  followerId = trimmedFollowerId;
+  hostId = trimmedHostId;
 
   // Verify the target user exists (prevents ghost follows)
   const { data: target, error: targetErr } = await supabase

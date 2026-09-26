@@ -199,7 +199,7 @@ describe('real migrations directory — documents existing duplicates', () => {
     expect(() => parseMigrationFiles(REAL_DIR)).not.toThrow();
   });
 
-  it('documents the known duplicate prefixes (12, 13, 14, 17)', () => {
+  it('documents the known duplicate prefixes (2, 13, 14, 17, 20, 21, 28, 32)', () => {
     if (!fs.existsSync(REAL_DIR)) {
       console.warn(`Skipping: migrations dir not found at ${REAL_DIR}`);
       return;
@@ -212,7 +212,9 @@ describe('real migrations directory — documents existing duplicates', () => {
     // This is a documentation test — it records the known legacy duplicates.
     // These files are already applied to production and must NOT be renamed.
     // The validate-migrations script prevents NEW duplicates from being added.
-    const known = [12, 13, 14, 17];
+    // Note: prefix 12 was resolved — 00012_add_booking_dispute_status.sql was
+    // renamed to 00035_add_booking_dispute_status.sql.
+    const known = [2, 13, 14, 17, 20, 21, 28, 32];
     for (const p of known) {
       if (!dupPrefixes.includes(p)) {
         console.log(`  Note: prefix ${p} is no longer a duplicate — may have been resolved.`);

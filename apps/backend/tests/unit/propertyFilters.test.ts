@@ -224,6 +224,75 @@ describe('property filters', () => {
     });
   });
 
+  // ── #420 price bounds validation (mirrors getProperties controller guard) ──
+
+  describe('price bounds validation (#420)', () => {
+    /**
+     * Mirror the controller guard logic so we can unit-test each branch
+     * without spinning up an HTTP server.
+     */
+    function validatePriceBounds(
+      rawMin: string | undefined,
+      rawMax: string | undefined,
+    ): { ok: true; min?: number; max?: number } | { ok: false; error: string } {
+      const parsedMin = rawMin !== undefined ? Number(rawMin) : undefined;
+      const parsedMax = rawMax !== undefined ? Number(rawMax) : undefined;
+
+      if (parsedMin !== undefined && (!Number.isFinite(parsedMin) || parsedMin < 0)) {
+        return { ok: false, error: 'min_price must be a non-negative number' };
+      }
+      if (parsedMax !== undefined && (!Number.isFinite(parsedMax) || parsedMax < 0)) {
+        return { ok: false, error: 'max_price must be a non-negative number' };
+      }
+      if (parsedMin !== undefined && parsedMax !== undefined && parsedMin > parsedMax) {
+        return { ok: false, error: 'min_price must be less than or equal to max_price' };
+      }
+      return { ok: true, min: parsedMin, max: parsedMax };
+    }
+
+    it('rejects a non-numeric min_price string', () => {
+      const r = validatePriceBounds('abc', undefined);
+      expect(r.ok).toBe(false);
+      expect((r as { ok: false; error: string }).error).toMatch(/min_price/);
+    });
+
+    it('rejects a negative min_price', () => {
+      const r = validatePriceBounds('-10', undefined);
+      expect(r.ok).toBe(false);
+      expect((r as { ok: false; error: string }).error).toMatch(/non-negative/);
+    });
+
+    it('rejects an inverted range (min > max)', () => {
+      const r = validatePriceBounds('300', '100');
+      expect(r.ok).toBe(false);
+      expect((r as { ok: false; error: string }).error).toMatch(/less than or equal/);
+    });
+
+    it('accepts zero min_price', () => {
+      const r = validatePriceBounds('0', undefined);
+      expect(r.ok).toBe(true);
+      expect((r as { ok: true; min?: number }).min).toBe(0);
+    });
+
+    it('accepts a valid positive range unchanged', () => {
+      const r = validatePriceBounds('50', '200');
+      expect(r.ok).toBe(true);
+      const ok = r as { ok: true; min?: number; max?: number };
+      expect(ok.min).toBe(50);
+      expect(ok.max).toBe(200);
+    });
+
+    it('accepts equal min and max (single-price filter)', () => {
+      const r = validatePriceBounds('100', '100');
+      expect(r.ok).toBe(true);
+    });
+
+    it('accepts undefined price params (no filter applied)', () => {
+      const r = validatePriceBounds(undefined, undefined);
+      expect(r.ok).toBe(true);
+    });
+  });
+
   // ── histogram price-filter exclusion ─────────────────────────────────────
 
   describe('getPriceHistogram — price filter exclusion', () => {

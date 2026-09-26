@@ -13,11 +13,12 @@ import {
   updatePreferencesByToken,
 } from '../controllers/notification.controller.js';
 import { authenticate } from '../middleware/auth.middleware.js';
+import { validatePagination } from '../validators/pagination.validator.js';
 
 const router = Router();
 
 // GET /api/v1/notifications
-router.get('/', authenticate, listNotifications);
+router.get('/', authenticate, validatePagination, listNotifications);
 
 // PATCH /api/v1/notifications/read-all
 router.patch('/read-all', authenticate, readAllNotifications);

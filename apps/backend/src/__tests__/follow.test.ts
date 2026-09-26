@@ -88,14 +88,32 @@ describe('followHost()', () => {
     expect(r.error).toMatch(/required/i);
   });
 
+  it('rejects whitespace-only follower_id', async () => {
+    const r = await followHost('   ', HOST_ID);
+    expect(r.success).toBe(false);
+    expect(r.error).toMatch(/required/i);
+  });
+
   it('rejects empty host_id', async () => {
     const r = await followHost(FOLLOWER_ID, '');
     expect(r.success).toBe(false);
     expect(r.error).toMatch(/required/i);
   });
 
+  it('rejects whitespace-only host_id', async () => {
+    const r = await followHost(FOLLOWER_ID, '   ');
+    expect(r.success).toBe(false);
+    expect(r.error).toMatch(/required/i);
+  });
+
   it('rejects self-follow', async () => {
     const r = await followHost(HOST_ID, HOST_ID);
+    expect(r.success).toBe(false);
+    expect(r.error).toMatch(/cannot follow yourself/i);
+  });
+
+  it('rejects self-follow even with surrounding whitespace', async () => {
+    const r = await followHost(` ${HOST_ID} `, ` ${HOST_ID} `);
     expect(r.success).toBe(false);
     expect(r.error).toMatch(/cannot follow yourself/i);
   });

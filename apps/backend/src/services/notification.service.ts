@@ -3,6 +3,8 @@ import { emailService } from './email.service.js';
 import { buildPreferenceUrlForUser } from './preferenceToken.js';
 import type { ServiceResponse } from './index.js';
 import { decodeCursor, buildCursorPage } from '../utils/cursor.js';
+import type { PaginatedResult } from '../types/pagination.js';
+import { executePaginatedQuery } from '../utils/pagination.js';
 
 export interface CursorPaginatedResult<T> {
   data: T[];
@@ -13,6 +15,9 @@ export type NotificationType =
   | 'booking_created'
   | 'booking_confirmed'
   | 'booking_cancelled'
+  | 'booking_completed'
+  | 'booking_disputed'
+  | 'booking_expired'
   | 'booking_modification_requested'
   | 'booking_modification_accepted'
   | 'booking_modification_declined'
@@ -42,6 +47,12 @@ export interface NotificationPreferences {
   email_notifications: boolean;
   push_notifications: boolean;
   notification_types: Partial<Record<NotificationType, boolean>>;
+  /** Wall-clock start of the quiet window, e.g. '22:00'. Null = no quiet window. */
+  quiet_hours_start?: string | null;
+  /** Wall-clock end of the quiet window, e.g. '08:00'. May wrap past midnight. */
+  quiet_hours_end?: string | null;
+  /** IANA timezone used when evaluating the quiet window. Defaults to UTC. */
+  quiet_hours_timezone?: string | null;
   updated_at?: string;
 }
 
@@ -71,11 +82,34 @@ const EMAIL_TEMPLATES: Partial<Record<NotificationType, string>> = {
   message_received: 'New Message',
 };
 
+const VALID_NOTIFICATION_TYPES: ReadonlyArray<NotificationType> = [
+  'booking_created',
+  'booking_confirmed',
+  'booking_cancelled',
+  'booking_modification_requested',
+  'booking_modification_accepted',
+  'booking_modification_declined',
+  'payment_received',
+  'booking_reminder',
+  'review_requested',
+  'review_submitted',
+  'host_response',
+  'dispute_initiated',
+  'new_property',
+  'system_alert',
+  'report_created',
+  'message_received',
+];
+
 export async function createNotification(
   userId: string,
   type: NotificationType,
   data: Record<string, unknown>
 ): Promise<ServiceResponse<Notification>> {
+  if (!VALID_NOTIFICATION_TYPES.includes(type)) {
+    return { success: false, error: `Unknown notification type: ${type}` };
+  }
+
   const { data: notification, error } = await supabase
     .from('notifications')
     .insert({ user_id: userId, type, data })
@@ -86,16 +120,16 @@ export async function createNotification(
   return { success: true, data: notification as Notification };
 }
 
-export async function getNotifications(userId: string): Promise<ServiceResponse<Notification[]>> {
-  const { data, error } = await supabase
+export async function getNotifications(userId: string, page = 1, pageSize = 20): Promise<ServiceResponse<PaginatedResult<Notification>>> {
+  const query = supabase
     .from('notifications')
-    .select('*')
+    .select('*', { count: 'exact' })
     .eq('user_id', userId)
-    .order('created_at', { ascending: false })
-    .limit(50);
+    .order('created_at', { ascending: false });
 
-  if (error) return { success: false, error: error.message };
-  return { success: true, data: (data ?? []) as Notification[] };
+  const response = await executePaginatedQuery(query, page, Math.min(Math.max(1, pageSize), 100));
+  if (response.error) return { success: false, error: response.error };
+  return { success: true, data: response.result };
 }
 
 /**
@@ -163,6 +197,10 @@ export async function markAsRead(
 }
 
 export async function markAllAsRead(userId: string): Promise<ServiceResponse<void>> {
+  if (!userId || !userId.trim()) {
+    return { success: false, error: 'user_id is required' };
+  }
+
   const { error } = await supabase
     .from('notifications')
     .update({ read: true })
@@ -215,6 +253,9 @@ export async function getPreferences(
       email_notifications: true,
       push_notifications: true,
       notification_types: {},
+      quiet_hours_start: null,
+      quiet_hours_end: null,
+      quiet_hours_timezone: null,
     };
     return { success: true, data: defaults };
   }

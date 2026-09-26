@@ -55,6 +55,34 @@ describe('wishlist.service', () => {
       expect(result.success).toBe(false);
       expect(result.error).toBe('Syntax error');
     });
+
+    it('rejects a whitespace-only property ID without issuing a DB query', async () => {
+      const result = await addToWishlist('u1', '   ');
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('User ID and property ID are required');
+      expect(mockFrom).not.toHaveBeenCalled();
+    });
+
+    it('rejects a whitespace-only user ID without issuing a DB query', async () => {
+      const result = await addToWishlist('  ', 'p1');
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('User ID and property ID are required');
+      expect(mockFrom).not.toHaveBeenCalled();
+    });
+
+    it('trims surrounding whitespace from valid IDs before inserting', async () => {
+      let capturedPayload: unknown;
+      mockFrom.mockImplementation(() => ({
+        insert: mock(async (payload: unknown) => {
+          capturedPayload = payload;
+          return { error: null };
+        }),
+      }));
+
+      const result = await addToWishlist('  u1  ', '  p1  ');
+      expect(result.success).toBe(true);
+      expect(capturedPayload).toEqual({ user_id: 'u1', property_id: 'p1' });
+    });
   });
 
   // ── removeFromWishlist ──────────────────────────────────────────────────────
@@ -64,7 +92,36 @@ describe('wishlist.service', () => {
       mockFrom.mockImplementation(() => ({
         delete: mock(() => ({
           eq: mock(() => ({
-            eq: mock(async () => ({ error: null })),
+            eq: mock(async () => ({ error: null, count: 1 })),
+          })),
+        })),
+      }));
+
+      const result = await removeFromWishlist('u1', 'p1');
+      expect(result.success).toBe(true);
+    });
+
+    it('returns not-found when zero rows were deleted', async () => {
+      mockFrom.mockImplementation(() => ({
+        delete: mock(() => ({
+          eq: mock(() => ({
+            eq: mock(async () => ({ error: null, count: 0 })),
+          })),
+        })),
+      }));
+
+      const result = await removeFromWishlist('u1', 'p-not-in-list');
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('Item not found in wishlist');
+    });
+
+    it('treats a null count (older Supabase) as a successful deletion', async () => {
+      // When PostgREST omits the count header the client returns null.
+      // We should not reject those as not-found.
+      mockFrom.mockImplementation(() => ({
+        delete: mock(() => ({
+          eq: mock(() => ({
+            eq: mock(async () => ({ error: null, count: null })),
           })),
         })),
       }));
@@ -77,7 +134,7 @@ describe('wishlist.service', () => {
       mockFrom.mockImplementation(() => ({
         delete: mock(() => ({
           eq: mock(() => ({
-            eq: mock(async () => ({ error: { message: 'Delete failed' } })),
+            eq: mock(async () => ({ error: { message: 'Delete failed' }, count: null })),
           })),
         })),
       }));

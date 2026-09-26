@@ -1,0 +1,80 @@
+name: Bug report
+description: Something is broken or behaving incorrectly.
+labels: [bug, triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Before opening**: search existing issues to avoid duplicates.
+        If you are reporting a security vulnerability, email the maintainers directly instead of filing a public issue.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of the platform is affected?
+      options:
+        - Search & Discovery
+        - Booking & Availability
+        - Payment & Escrow
+        - Blockchain / Stellar
+        - Authentication / Wallet
+        - Notifications
+        - Reviews
+        - Host Dashboard
+        - Admin
+        - API / Backend
+        - Frontend / UI
+        - Infrastructure / DevOps
+        - i18n / Localization
+        - Analytics
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Severity
+      description: P0 = production outage/data loss · P1 = major feature broken · P2 = degraded but workaround exists · P3 = minor / cosmetic
+      options:
+        - P0 — Critical (production down or data loss)
+        - P1 — High (major feature broken, no workaround)
+        - P2 — Medium (degraded, workaround available)
+        - P3 — Low (minor or cosmetic)
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the bug. Include the exact steps to reproduce and the expected vs actual result.
+      placeholder: |
+        Steps to reproduce:
+        1. Go to …
+        2. Click …
+        Expected: …
+        Actual: …
+    validations:
+      required: true
+
+  - type: input
+    id: source_ref
+    attributes:
+      label: Source reference (file:line or route)
+      description: Link to the relevant source file and line if known.
+      placeholder: "apps/backend/src/services/booking.service.ts:145"
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Node/Bun version, browser, OS, Stellar network (testnet/mainnet).
+      placeholder: "Bun 1.x, Chrome 125, macOS 14, testnet"
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or screenshots
+      render: shell

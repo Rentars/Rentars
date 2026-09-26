@@ -1,9 +1,13 @@
 import { syncAllBookings, syncAllProperties, reconcileAllPendingEscrows } from './sync.service.js';
 import { purgeExpired as purgeExpiredIdempotencyKeys } from './idempotency.service.js';
+import { BookingService } from './booking.service.js';
+
+const bookingService = new BookingService();
 
 const SYNC_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const RECONCILIATION_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const IDEMPOTENCY_CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+const BOOKING_EXPIRY_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
 const MAX_CONCURRENT_RECONCILIATIONS = 5;
 const INITIAL_BACKOFF_MS = 1000; // 1 second
 const MAX_BACKOFF_MS = 30000; // 30 seconds
@@ -79,18 +83,27 @@ export function startSyncScheduler(): void {
     runIdempotencyCleanup().catch((err) => console.error('[idempotency] Cleanup error:', err));
   }, IDEMPOTENCY_CLEANUP_INTERVAL_MS);
 
+  // Booking expiry cleanup — runs every 10 minutes, expires stale Pending bookings.
+  setInterval(() => {
+    runBookingExpiryCleanup().catch((err) => console.error('[expiry] Scheduler error:', err));
+  }, BOOKING_EXPIRY_INTERVAL_MS);
+
   // Run an initial cleanup shortly after startup so stale keys don't linger
   // across a server restart that happens to be more than 24 h after creation.
   setTimeout(() => {
     runIdempotencyCleanup().catch((err) =>
       console.error('[idempotency] Initial cleanup error:', err),
     );
+    runBookingExpiryCleanup().catch((err) =>
+      console.error('[expiry] Initial cleanup error:', err),
+    );
   }, 30_000); // 30 seconds after startup
 
   console.log(
     `[sync] Scheduler started — sync interval: ${SYNC_INTERVAL_MS / 1000}s, ` +
     `reconciliation interval: ${RECONCILIATION_INTERVAL_MS / 1000}s, ` +
-    `idempotency cleanup interval: ${IDEMPOTENCY_CLEANUP_INTERVAL_MS / 1000}s`,
+    `idempotency cleanup interval: ${IDEMPOTENCY_CLEANUP_INTERVAL_MS / 1000}s, ` +
+    `booking expiry interval: ${BOOKING_EXPIRY_INTERVAL_MS / 1000}s`,
   );
 }
 
@@ -102,5 +115,17 @@ async function runIdempotencyCleanup(): Promise<void> {
     }
   } else {
     console.error(`[idempotency] Cleanup failed: ${result.error}`);
+  }
+}
+
+async function runBookingExpiryCleanup(): Promise<void> {
+  const result = await bookingService.expireStaleBookings();
+  if (result.success) {
+    const { expired, failed } = result.data ?? { expired: 0, failed: 0 };
+    if (expired > 0 || failed > 0) {
+      console.log(`[expiry] Expired ${expired} booking(s), ${failed} failure(s)`);
+    }
+  } else {
+    console.error(`[expiry] Cleanup failed: ${result.error}`);
   }
 }

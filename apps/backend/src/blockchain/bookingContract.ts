@@ -30,7 +30,8 @@ import type { BookingStatus, EscrowStatus } from './types.js';
 function requireContractId(): void {
   if (!BOOKING_CONTRACT_ID) {
     throw new ContractError(
-      'BOOKING_CONTRACT_ID is not configured',
+      'BOOKING_CONTRACT_ID environment variable is not set — ' +
+        'configure it with a valid Soroban contract address before using booking operations',
     );
   }
 }

@@ -67,9 +67,7 @@ export function useRealTimeUpdates(options: RealtimeOptions = {}): RealtimeResul
 
   // Keep the current Supabase client and its channel subscriptions
   const supabaseRef = useRef<ReturnType<typeof createClient> | null>(null);
-  const subscriptionsRef = useRef<ReturnType<
-    ReturnType<ReturnType<typeof createClient>['channel']>['subscribe']
-  >[]>([]);
+  const subscriptionsRef = useRef<unknown[]>([]);
 
   /** Fetch notifications created after lastSeenAt and merge them in. */
   const catchUpMissedNotifications = useCallback(async () => {
@@ -112,10 +110,10 @@ export function useRealTimeUpdates(options: RealtimeOptions = {}): RealtimeResul
   }, []);
 
   const cleanup = useCallback(() => {
-    subscriptionsRef.current.forEach((sub) => {
+    if (!supabaseRef.current) return;
+    subscriptionsRef.current.forEach((channel) => {
       try {
-        // RealtimeChannel returned by .subscribe() — remove it from the client
-        supabaseRef.current?.removeChannel(sub as Parameters<typeof supabaseRef.current.removeChannel>[0]);
+        supabaseRef.current?.removeChannel(channel);
       } catch {
         /* ignore */
       }
@@ -172,9 +170,7 @@ export function useRealTimeUpdates(options: RealtimeOptions = {}): RealtimeResul
           }
         });
 
-      subscriptionsRef.current.push(bookingChannel as unknown as ReturnType<
-        ReturnType<ReturnType<typeof createClient>['channel']>['subscribe']
-      >);
+      subscriptionsRef.current.push(bookingChannel);
 
       // ── Host new-booking notifications ───────────────────────────────────────
       if (userId) {
@@ -198,9 +194,7 @@ export function useRealTimeUpdates(options: RealtimeOptions = {}): RealtimeResul
           )
           .subscribe();
 
-        subscriptionsRef.current.push(hostChannel as unknown as ReturnType<
-          ReturnType<ReturnType<typeof createClient>['channel']>['subscribe']
-        >);
+        subscriptionsRef.current.push(hostChannel);
       }
 
       // ── Escrow status updates ────────────────────────────────────────────────
@@ -226,9 +220,7 @@ export function useRealTimeUpdates(options: RealtimeOptions = {}): RealtimeResul
         )
         .subscribe();
 
-      subscriptionsRef.current.push(escrowChannel as unknown as ReturnType<
-        ReturnType<ReturnType<typeof createClient>['channel']>['subscribe']
-      >);
+      subscriptionsRef.current.push(escrowChannel);
 
     } catch (error) {
       console.error('[useRealTimeUpdates] Failed to set up subscriptions:', error);

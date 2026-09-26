@@ -15,6 +15,11 @@ import {
   getViewStatsHandler,
   getOccupancyHeatmapHandler,
   trackSuggestionAcceptedHandler,
+  createDraftHandler,
+  getHostDraftsHandler,
+  publishDraftHandler,
+  getPropertyVersionsHandler,
+  rollbackPropertyVersionHandler,
 } from '@/controllers/property.controller.js';
 import { searchPropertiesEndpoint, searchNearbyEndpoint } from '@/controllers/propertySearch.controller.js';
 import {
@@ -37,11 +42,12 @@ import { authenticate } from '@/middleware/auth.middleware.js';
 import { requireEmailVerified } from '@/middleware/emailVerified.middleware.js';
 import { upload } from '@/middleware/multer.js';
 import { geoSearchSchema, validateQuery } from '@/validators/property.validator.js';
+import { validatePagination } from '@/validators/pagination.validator.js';
 
 const router = Router();
 
 // GET /api/v1/properties
-router.get('/', getProperties);
+router.get('/', validatePagination, getProperties);
 
 // GET /api/v1/properties/search/advanced - Advanced search with filters
 router.get('/search/advanced', advancedSearchHandler);
@@ -83,6 +89,19 @@ router.get('/:id/views', authenticate, getViewStatsHandler);
 // GET /api/v1/properties/:id/occupancy-heatmap  (host-only)
 router.get('/:id/occupancy-heatmap', authenticate, getOccupancyHeatmapHandler);
 
+// ── Draft Management ──────────────────────────────────────────────────────────
+
+// POST /api/v1/properties/draft - create draft
+router.post('/draft', authenticate, createDraftHandler);
+
+// GET /api/v1/properties/drafts - list host's drafts
+router.get('/drafts', authenticate, getHostDraftsHandler);
+
+// PATCH /api/v1/properties/:id/publish - publish draft to active
+router.patch('/:id/publish', authenticate, publishDraftHandler);
+
+// ── Property Management ────────────────────────────────────────────────────────
+
 // POST /api/v1/properties  (requires email verification)
 router.post('/', authenticate, requireEmailVerified, createPropertyHandler);
 
@@ -94,6 +113,14 @@ router.put('/:id', authenticate, updatePropertyHandler);
 
 // DELETE /api/v1/properties/:id
 router.delete('/:id', authenticate, deletePropertyHandler);
+
+// ── Version history ────────────────────────────────────────────────────────────
+
+// GET /api/v1/properties/:id/versions  (host or admin only)
+router.get('/:id/versions', authenticate, getPropertyVersionsHandler);
+
+// POST /api/v1/properties/:id/versions/:versionId/rollback  (host only)
+router.post('/:id/versions/:versionId/rollback', authenticate, requireEmailVerified, rollbackPropertyVersionHandler);
 
 // ── Image management ───────────────────────────────────────────────────────────
 

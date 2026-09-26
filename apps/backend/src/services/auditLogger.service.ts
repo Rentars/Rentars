@@ -8,28 +8,41 @@
  * Every sensitive action — login, logout, registration, property changes,
  * bookings, admin operations — should call auditLogger.log().
  *
+ * Prevents logging of sensitive data:
+ * - Tokens, secrets, passwords, seeds
+ * - Full payment card information
+ * - SSN, driver's license numbers
+ * - Only hashes or IDs are logged
+ *
  * Entry shape:
  * {
- *   timestamp:    ISO 8601
- *   actor_id:     user ID performing the action (undefined for unauthenticated)
- *   action:       verb describing what happened (e.g. "property.create")
- *   resource_type: "user" | "property" | "booking" | "dispute" | "auth" | ...
- *   resource_id:  ID of the affected resource (if applicable)
- *   ip:           client IP address
- *   meta:         additional context (no secrets, no PII beyond IDs)
+ *   timestamp:       ISO 8601
+ *   correlation_id:  request/operation ID for tracing
+ *   actor_id:        user ID performing the action (undefined for unauthenticated)
+ *   action:          verb describing what happened (e.g. "property.create")
+ *   resource_type:   "user" | "property" | "booking" | "dispute" | "auth" | ...
+ *   resource_id:     ID of the affected resource (if applicable)
+ *   target_ids:      array of affected resource IDs (for bulk operations)
+ *   ip:              client IP address
+ *   success:         true if action succeeded
+ *   error:           error message if action failed
+ *   meta:            additional context (no secrets, no PII beyond IDs)
  * }
  */
 
 import { supabase } from '@/config/supabase.js';
+import crypto from 'crypto';
 
 export type AuditAction =
   // Auth
   | 'auth.register'
   | 'auth.login'
   | 'auth.logout'
+  | 'auth.logout_all_devices'
   | 'auth.token_refresh'
   | 'auth.password_reset_request'
   | 'auth.password_reset_confirm'
+  | 'auth.email_verify'
   | 'auth.unauthorized_access'
   // Properties
   | 'property.create'
@@ -37,26 +50,48 @@ export type AuditAction =
   | 'property.delete'
   | 'property.suspend'
   | 'property.activate'
+  | 'property.publish'
+  | 'property.unpublish'
+  | 'property.change_owner'
   // Bookings
   | 'booking.create'
   | 'booking.cancel'
   | 'booking.confirm'
   | 'booking.delete'
+  | 'booking.modify'
+  | 'booking.complete'
   // Payments
   | 'payment.submit'
   | 'payment.confirmed'
   | 'payment.failed'
   | 'payment.retry'
+  | 'payment.refund'
   // Disputes
   | 'dispute.open'
   | 'dispute.resolve'
+  | 'dispute.modify'
+  // Account
+  | 'account.email_change'
+  | 'account.role_change'
+  | 'account.delete'
+  | 'account.disable_2fa'
+  | 'account.enable_2fa'
+  | 'account.wallet_link'
+  | 'account.wallet_unlink'
   // Admin
   | 'admin.user_suspend'
   | 'admin.user_activate'
+  | 'admin.user_delete'
   | 'admin.property_suspend'
   | 'admin.property_activate'
   | 'admin.featured_set'
-  | 'admin.featured_clear';
+  | 'admin.featured_clear'
+  | 'admin.refund_approve'
+  | 'admin.refund_reject'
+  | 'admin.session_revoke'
+  | 'admin.settings_change'
+  | 'admin.role_grant'
+  | 'admin.role_revoke';
 
 export type ResourceType =
   | 'user'
@@ -65,27 +100,70 @@ export type ResourceType =
   | 'payment'
   | 'dispute'
   | 'auth'
-  | 'admin';
+  | 'admin'
+  | 'account'
+  | 'session';
 
 export interface AuditLogEntry {
   actorId?: string;
   action: AuditAction;
   resourceType: ResourceType;
   resourceId?: string;
+  targetIds?: string[];
   ip?: string;
+  correlationId?: string;
+  success?: boolean;
+  error?: string;
   meta?: Record<string, unknown>;
 }
 
+/**
+ * Sanitize metadata to prevent logging of sensitive data.
+ */
+function sanitizeMeta(meta?: Record<string, unknown>): Record<string, unknown> | undefined {
+  if (!meta) return undefined;
+
+  const sanitized: Record<string, unknown> = {};
+  const sensitiveKeys = /token|secret|password|seed|key|pin|card|ssn|cvv|signature|private/i;
+
+  for (const [key, value] of Object.entries(meta)) {
+    if (sensitiveKeys.test(key)) {
+      // Log that this field was present but redacted
+      sanitized[key] = '[REDACTED]';
+    } else if (typeof value === 'string' && value.length > 255) {
+      // Truncate long strings
+      sanitized[key] = value.slice(0, 255) + '...[TRUNCATED]';
+    } else if (typeof value === 'object' && value !== null) {
+      // Recursively sanitize nested objects
+      sanitized[key] = sanitizeMeta(value as Record<string, unknown>);
+    } else {
+      sanitized[key] = value;
+    }
+  }
+
+  return sanitized;
+}
+
 class AuditLogger {
+  /**
+   * Log an audit event with optional correlation ID for request tracing.
+   */
   async log(entry: AuditLogEntry): Promise<void> {
+    const correlationId = entry.correlationId || crypto.randomUUID();
+    const timestamp = new Date().toISOString();
+
     const record = {
-      timestamp: new Date().toISOString(),
+      timestamp,
+      correlation_id: correlationId,
       actor_id: entry.actorId ?? null,
       action: entry.action,
       resource_type: entry.resourceType,
       resource_id: entry.resourceId ?? null,
+      target_ids: entry.targetIds ?? null,
       ip: entry.ip ?? null,
-      meta: entry.meta ?? null,
+      success: entry.success ?? true,
+      error: entry.error ?? null,
+      meta: sanitizeMeta(entry.meta),
     };
 
     // Always emit to stdout as structured JSON for log aggregation
@@ -97,6 +175,103 @@ class AuditLogger {
     } catch (err) {
       console.error('[AuditLogger] Failed to persist audit log entry:', err);
     }
+  }
+
+  /**
+   * Query audit logs with pagination and filtering.
+   * Restricted to authenticated admins only.
+   *
+   * @param filters - Filter options
+   * @param limit - Results per page (max 100)
+   * @param offset - Pagination offset
+   */
+  async query(
+    filters: {
+      actorId?: string;
+      resourceType?: ResourceType;
+      resourceId?: string;
+      action?: AuditAction;
+      since?: Date;
+      until?: Date;
+    },
+    limit: number = 50,
+    offset: number = 0,
+  ): Promise<{ entries: any[]; total: number }> {
+    let query = supabase
+      .from('audit_logs')
+      .select('*', { count: 'exact' });
+
+    if (filters.actorId) {
+      query = query.eq('actor_id', filters.actorId);
+    }
+
+    if (filters.resourceType) {
+      query = query.eq('resource_type', filters.resourceType);
+    }
+
+    if (filters.resourceId) {
+      query = query.eq('resource_id', filters.resourceId);
+    }
+
+    if (filters.action) {
+      query = query.eq('action', filters.action);
+    }
+
+    if (filters.since) {
+      query = query.gte('timestamp', filters.since.toISOString());
+    }
+
+    if (filters.until) {
+      query = query.lte('timestamp', filters.until.toISOString());
+    }
+
+    // Apply pagination
+    const cappedLimit = Math.min(limit, 100);
+    query = query
+      .order('timestamp', { ascending: false })
+      .range(offset, offset + cappedLimit - 1);
+
+    const { data, error, count } = await query;
+
+    if (error) {
+      throw new Error(`Audit log query failed: ${error.message}`);
+    }
+
+    return {
+      entries: data ?? [],
+      total: count ?? 0,
+    };
+  }
+
+  /**
+   * Get logs for a specific resource and trace changes over time.
+   */
+  async getResourceHistory(
+    resourceType: ResourceType,
+    resourceId: string,
+    limit: number = 50,
+  ): Promise<any[]> {
+    const { entries } = await this.query(
+      { resourceType, resourceId },
+      limit,
+    );
+
+    return entries;
+  }
+
+  /**
+   * Get all actions performed by an actor (user).
+   */
+  async getActorHistory(
+    actorId: string,
+    limit: number = 50,
+  ): Promise<any[]> {
+    const { entries } = await this.query(
+      { actorId },
+      limit,
+    );
+
+    return entries;
   }
 }
 

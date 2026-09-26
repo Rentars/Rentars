@@ -9,6 +9,15 @@
  *
  * Mount this as the FIRST middleware in the Express chain so every
  * response — including error responses — carries the correct headers.
+ *
+ * === Token Transport & Cookie Security ===
+ * This API uses JWT tokens for authentication (Bearer tokens in Authorization header).
+ * Optional session cookies (when used) are configured with:
+ *   - Secure: set to true in production (HTTPS only)
+ *   - HttpOnly: true (blocks JavaScript access, prevents XSS token theft)
+ *   - SameSite: Strict (only sent to same-site requests, prevents CSRF)
+ * CSRF protection is enforced by csrfMiddleware for state-changing requests.
+ * See csrf.middleware.ts for CSRF token generation and validation.
  */
 
 import helmet from 'helmet';

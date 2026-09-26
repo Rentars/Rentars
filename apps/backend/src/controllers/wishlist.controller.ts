@@ -6,7 +6,8 @@ export async function listWishlist(req: AuthRequest, res: Response): Promise<voi
   const userId = req.userId;
   if (!userId) { res.status(401).json({ error: 'Unauthorized' }); return; }
 
-  const result = await getWishlist(userId);
+  const pagination = (req as AuthRequest & { parsedPagination?: { page: number; pageSize: number } }).parsedPagination;
+  const result = await getWishlist(userId, pagination?.page ?? 1, pagination?.pageSize ?? 20);
   if (!result.success) { res.status(400).json({ error: result.error }); return; }
   res.json(result.data);
 }

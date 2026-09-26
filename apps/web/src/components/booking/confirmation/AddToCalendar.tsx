@@ -18,12 +18,25 @@ interface AddToCalendarProps {
  *   All-day  → YYYYMMDD
  *   With time → YYYYMMDDTHHmmssZ
  */
-function toGcalDate(iso: string): string {
-  if (!iso.includes('T')) {
-    return iso.replace(/-/g, '');
+function parseCalendarDate(iso: string): Date | null {
+  const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso);
+  const d = new Date(dateOnly ? `${iso}T00:00:00Z` : iso);
+  if (!Number.isFinite(d.getTime())) return null;
+
+  // Date.parse normalises invalid dates such as 2024-02-30. Reject those
+  // rather than emitting a different booking date to the calendar provider.
+  if (dateOnly) {
+    const normalised = d.toISOString().slice(0, 10);
+    if (normalised !== iso) return null;
   }
-  const d = new Date(iso);
+  return d;
+}
+
+function toGcalDate(iso: string): string | null {
+  const d = parseCalendarDate(iso);
+  if (!d) return null;
   const pad = (n: number) => n.toString().padStart(2, '0');
+  if (!iso.includes('T')) return iso.replace(/-/g, '');
   return (
     d.getUTCFullYear().toString() +
     pad(d.getUTCMonth() + 1) +
@@ -40,9 +53,10 @@ function toGcalDate(iso: string): string {
  * For all-day check-out dates we shift the end by +1 day so that the stay
  * shows as inclusive in Google Calendar (it uses half-open intervals).
  */
-function toGcalEndDate(iso: string): string {
+function toGcalEndDate(iso: string): string | null {
+  const d = parseCalendarDate(iso);
+  if (!d) return null;
   if (!iso.includes('T')) {
-    const d = new Date(iso + 'T00:00:00Z');
     d.setUTCDate(d.getUTCDate() + 1);
     const y = d.getUTCFullYear();
     const m = (d.getUTCMonth() + 1).toString().padStart(2, '0');
@@ -52,24 +66,31 @@ function toGcalEndDate(iso: string): string {
   return toGcalDate(iso);
 }
 
-function buildGoogleCalendarUrl(props: AddToCalendarProps): string {
+export function buildGoogleCalendarUrl(props: AddToCalendarProps): string | null {
+  const start = toGcalDate(props.checkIn);
+  const end = toGcalEndDate(props.checkOut);
+  if (!start || !end) return null;
+
   const params = new URLSearchParams({
     action: 'TEMPLATE',
     text: `Stay at ${props.propertyTitle}`,
-    dates: `${toGcalDate(props.checkIn)}/${toGcalEndDate(props.checkOut)}`,
+    dates: `${start}/${end}`,
     details: `Booking ID: ${props.bookingId}`,
     location: props.propertyLocation,
   });
   return `https://calendar.google.com/calendar/render?${params.toString()}`;
 }
 
-function buildOutlookUrl(props: AddToCalendarProps): string {
+export function buildOutlookUrl(props: AddToCalendarProps): string | null {
   // Outlook Live / Outlook.com deep-link
+  const start = parseCalendarDate(props.checkIn);
+  const end = parseCalendarDate(props.checkOut);
+  if (!start || !end) return null;
   const startDate = props.checkIn.includes('T')
-    ? new Date(props.checkIn).toISOString()
+    ? start.toISOString()
     : `${props.checkIn}T00:00:00`;
   const endDate = props.checkOut.includes('T')
-    ? new Date(props.checkOut).toISOString()
+    ? end.toISOString()
     : `${props.checkOut}T00:00:00`;
 
   const params = new URLSearchParams({
@@ -89,6 +110,8 @@ function buildOutlookUrl(props: AddToCalendarProps): string {
 export default function AddToCalendar(props: AddToCalendarProps) {
   const [open, setOpen] = useState(false);
   const [downloading, setDownloading] = useState(false);
+  const googleUrl = buildGoogleCalendarUrl(props);
+  const outlookUrl = buildOutlookUrl(props);
   const [downloadError, setDownloadError] = useState('');
 
   const handleIcsDownload = async () => {
@@ -163,13 +186,14 @@ export default function AddToCalendar(props: AddToCalendarProps) {
           <div className="border-t border-gray-100" />
 
           {/* Google Calendar */}
-          <a
-            role="menuitem"
-            href={buildGoogleCalendarUrl(props)}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="flex w-full items-center gap-3 px-4 py-3 text-sm text-gray-700 hover:bg-gray-50 transition"
-          >
+          {googleUrl ? (
+            <a
+              role="menuitem"
+              href={googleUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex w-full items-center gap-3 px-4 py-3 text-sm text-gray-700 hover:bg-gray-50 transition"
+            >
             {/* Inline Google icon — avoids an external image dep */}
             <svg
               aria-hidden="true"
@@ -197,19 +221,29 @@ export default function AddToCalendar(props: AddToCalendarProps) {
                 fill="#EA4335"
               />
             </svg>
-            Google Calendar
-          </a>
+              Google Calendar
+            </a>
+          ) : (
+            <span
+              role="menuitem"
+              aria-disabled="true"
+              className="flex w-full items-center gap-3 px-4 py-3 text-sm text-gray-400 cursor-not-allowed"
+            >
+              Google Calendar unavailable
+            </span>
+          )}
 
           <div className="border-t border-gray-100" />
 
           {/* Outlook */}
-          <a
-            role="menuitem"
-            href={buildOutlookUrl(props)}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="flex w-full items-center gap-3 px-4 py-3 text-sm text-gray-700 hover:bg-gray-50 transition rounded-b-lg"
-          >
+          {outlookUrl ? (
+            <a
+              role="menuitem"
+              href={outlookUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex w-full items-center gap-3 px-4 py-3 text-sm text-gray-700 hover:bg-gray-50 transition rounded-b-lg"
+            >
             <svg
               aria-hidden="true"
               className="flex-shrink-0"
@@ -226,8 +260,17 @@ export default function AddToCalendar(props: AddToCalendarProps) {
                 opacity="0.9"
               />
             </svg>
-            Outlook Calendar
-          </a>
+              Outlook Calendar
+            </a>
+          ) : (
+            <span
+              role="menuitem"
+              aria-disabled="true"
+              className="flex w-full items-center gap-3 px-4 py-3 text-sm text-gray-400 cursor-not-allowed rounded-b-lg"
+            >
+              Outlook Calendar unavailable
+            </span>
+          )}
         </div>
       )}
 

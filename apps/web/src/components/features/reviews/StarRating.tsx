@@ -11,6 +11,8 @@ interface StarRatingProps {
 }
 
 export default function StarRating({ rating, max = 5, interactive = false, onChange, size = 16 }: StarRatingProps) {
+  const effectiveRating = Math.min(Math.max(rating, 0), max);
+
   return (
     <div className="flex gap-0.5">
       {Array.from({ length: max }, (_, i) => (
@@ -23,7 +25,7 @@ export default function StarRating({ rating, max = 5, interactive = false, onCha
         >
           <Star
             size={size}
-            className={i < rating ? 'fill-yellow-400 text-yellow-400' : 'text-gray-300'}
+            className={i < effectiveRating ? 'fill-yellow-400 text-yellow-400' : 'text-gray-300'}
           />
         </button>
       ))}

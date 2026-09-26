@@ -8,6 +8,7 @@ import WalletConnectionModal from '@/components/booking/WalletConnectionModal';
 import HouseRulesAcknowledgement, {
   type HouseRules,
 } from '@/components/booking/HouseRulesAcknowledgement';
+import { TermsDisclosure, type TermsAcceptance } from '@/components/shared/TermsDisclosure';
 import { isValidStellarAddress } from '@/lib/freighter-utils';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
@@ -25,6 +26,9 @@ export default function BookingPage() {
   // House rules state
   const [houseRules, setHouseRules] = useState<HouseRules | null>(null);
   const [rulesAcknowledgedAt, setRulesAcknowledgedAt] = useState('');
+
+  // Terms acceptance state
+  const [termsAcceptance, setTermsAcceptance] = useState<TermsAcceptance | null>(null);
 
   // Check for existing wallet connection on mount
   useEffect(() => {
@@ -83,6 +87,10 @@ export default function BookingPage() {
       return; // button will be disabled, but guard anyway
     }
 
+    if (!termsAcceptance) {
+      return; // button will be disabled, but guard anyway
+    }
+
     setIsLoading(true);
     try {
       const token = localStorage.getItem('token');
@@ -100,6 +108,8 @@ export default function BookingPage() {
           total_price: data.totalPrice,
           wallet_address: walletAddress,
           rules_acknowledged_at: rulesAcknowledgedAt || new Date().toISOString(),
+          terms_version: termsAcceptance.termsVersion,
+          terms_accepted_at: termsAcceptance.termsAcceptedAt,
         }),
       });
 
@@ -180,11 +190,22 @@ export default function BookingPage() {
               Please acknowledge the house rules above to continue.
             </p>
           )}
+
+          {/* Terms & Disclosures — must be accepted before confirming */}
+          <div className="mb-6">
+            <TermsDisclosure
+              variant="booking"
+              accepted={!!termsAcceptance}
+              onAcceptanceChange={setTermsAcceptance}
+            />
+          </div>
+
           <BookingForm
             propertyId={propertyId}
             pricePerNight={100}
             onSubmit={handleBookingSubmit}
             isLoading={isLoading}
+            disabled={!termsAcceptance}
           />
         </div>
       </div>

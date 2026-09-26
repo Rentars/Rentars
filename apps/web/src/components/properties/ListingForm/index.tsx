@@ -10,6 +10,7 @@ import PhotosStep from './steps/PhotosStep';
 import PricingStep from './steps/PricingStep';
 import HouseRulesStep from './steps/HouseRulesStep';
 import ReviewStep from './steps/ReviewStep';
+import { TermsDisclosure, type TermsAcceptance } from '@/components/shared/TermsDisclosure';
 
 const STEPS: ListingStep[] = [
   'basic',
@@ -48,6 +49,7 @@ export default function ListingForm() {
   });
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [uploadsInProgress, setUploadsInProgress] = useState(false);
+  const [termsAcceptance, setTermsAcceptance] = useState<TermsAcceptance | null>(null);
 
   const currentStepIndex = STEPS.indexOf(currentStep);
 
@@ -64,6 +66,11 @@ export default function ListingForm() {
   };
 
   const handleSubmit = async () => {
+    if (!termsAcceptance) {
+      setErrors({ submit: 'You must accept the platform terms before publishing your listing.' });
+      return;
+    }
+
     try {
       const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
       const token = localStorage.getItem('token');
@@ -80,6 +87,9 @@ export default function ListingForm() {
           formDataToSend.append(key, String(value));
         }
       });
+      // Record terms acceptance alongside the listing
+      formDataToSend.append('terms_version', termsAcceptance.termsVersion);
+      formDataToSend.append('terms_accepted_at', termsAcceptance.termsAcceptedAt);
 
       const response = await fetch(`${API_URL}/api/properties`, {
         method: 'POST',
@@ -154,6 +164,17 @@ export default function ListingForm() {
           <ReviewStep formData={formData} errors={errors} />
         )}
 
+        {/* Terms — shown on final review step only */}
+        {currentStep === 'review' && (
+          <div className="mt-6">
+            <TermsDisclosure
+              variant="listing"
+              accepted={!!termsAcceptance}
+              onAcceptanceChange={setTermsAcceptance}
+            />
+          </div>
+        )}
+
         {/* Navigation */}
         <div className="flex gap-4 mt-8">
           <button
@@ -176,7 +197,10 @@ export default function ListingForm() {
           ) : (
             <button
               onClick={handleSubmit}
-              className={`${formStyles.button} ${formStyles.buttonPrimary}`}
+              disabled={currentStep === 'review' && !termsAcceptance}
+              className={`${formStyles.button} ${formStyles.buttonPrimary} ${
+                currentStep === 'review' && !termsAcceptance ? 'opacity-50 cursor-not-allowed' : ''
+              }`}
             >
               Submit Listing
             </button>

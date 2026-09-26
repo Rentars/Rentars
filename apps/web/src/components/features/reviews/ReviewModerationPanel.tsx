@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import StarRating from './StarRating';
 
 interface FlaggedReview {
@@ -17,19 +17,45 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
 export default function ReviewModerationPanel() {
   const [reviews, setReviews] = useState<FlaggedReview[]>([]);
   const [loading, setLoading] = useState(true);
+  const activeRequest = useRef<AbortController | null>(null);
 
   async function load() {
-    const token = localStorage.getItem('token');
-    const res = await fetch(`${API_URL}/api/v1/reviews/moderation/flagged`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    if (res.ok) {
-      setReviews(await res.json());
+    // Abort any in-flight request so a stale response cannot overwrite newer data
+    if (activeRequest.current) {
+      activeRequest.current.abort();
     }
-    setLoading(false);
+    const controller = new AbortController();
+    activeRequest.current = controller;
+
+    try {
+      const token = localStorage.getItem('token');
+      const res = await fetch(`${API_URL}/api/v1/reviews/moderation/flagged`, {
+        headers: { Authorization: `Bearer ${token}` },
+        signal: controller.signal,
+      });
+      if (res.ok) {
+        setReviews(await res.json());
+      }
+    } catch (err) {
+      // Ignore aborted requests — they are intentionally cancelled
+      if (err instanceof Error && err.name === 'AbortError') return;
+    } finally {
+      // Only clear loading state when this request is still the active one
+      if (activeRequest.current === controller) {
+        setLoading(false);
+        activeRequest.current = null;
+      }
+    }
   }
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    load();
+    return () => {
+      // Cancel any pending request when the component unmounts
+      activeRequest.current?.abort();
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function moderate(reviewId: string, approve: boolean) {
     const token = localStorage.getItem('token');

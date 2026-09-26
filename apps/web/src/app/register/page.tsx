@@ -3,7 +3,6 @@
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { RegisterForm } from '@/components/auth/RegisterForm';
-import { SocialLoginButton } from '@/components/auth/SocialLoginButton';
 import { type RegisterInput } from '@/validations/auth.schema';
 import toast from 'react-hot-toast';
 import Link from 'next/link';
@@ -37,17 +36,6 @@ export default function RegisterPage() {
     }
   };
 
-  const handleSocialSignup = async (provider: 'google' | 'github') => {
-    try {
-      setError(null);
-      toast.success(`${provider} signup coming soon`);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : t('registerFailed');
-      setError(message);
-      toast.error(message);
-    }
-  };
-
   return (
     <main
       id="main-content"
@@ -70,18 +58,7 @@ export default function RegisterPage() {
 
         <RegisterForm onSubmit={handleRegister} />
 
-        <div className="my-6 flex items-center gap-3" aria-hidden="true">
-          <div className="flex-1 h-px bg-gray-300 dark:bg-gray-700" />
-          <span className="text-gray-500 dark:text-gray-400 text-sm">{t('orContinueWith')}</span>
-          <div className="flex-1 h-px bg-gray-300 dark:bg-gray-700" />
-        </div>
-
-        <div className="space-y-3">
-          <SocialLoginButton provider="google" onClick={() => handleSocialSignup('google')} />
-          <SocialLoginButton provider="github" onClick={() => handleSocialSignup('github')} />
-        </div>
-
-        <p className="text-center text-gray-600 dark:text-gray-400 text-sm mt-6">
+        <p className="text-center text-gray-600 dark:text-gray-400 text-sm mt-8">
           {t('alreadyHaveAccount')}{' '}
           <Link href="/login" className="text-blue-600 hover:underline font-medium">
             {t('signInLink')}

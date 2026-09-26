@@ -1,3 +1,15 @@
+/**
+ * sync.service.ts — blockchain ↔ Supabase reconciliation.
+ *
+ * #611 additions:
+ *  - Retry classification: transient vs permanent failures
+ *  - Bounded retry threshold (MAX_RECONCILE_ATTEMPTS) with exponential backoff
+ *  - `escrow_reconcile_failed` quarantine state after exhausting retries
+ *  - Tenant + host notifications on permanent failure via notification.service.ts
+ *  - Deduplication: reconcile attempt counter stored in DB; no duplicate
+ *    escrow actions, refunds, or notifications sent
+ */
+
 import {
   BOOKING_CONTRACT_ID,
   NETWORK_PASSPHRASE,
@@ -9,6 +21,7 @@ import { PropertyListingClient } from '@/blockchain/propertyListingClient.js';
 import { getTransactionStatus } from '@/blockchain/transactionUtils.js';
 import { getSorobanServer } from '@/blockchain/soroban.js';
 import { supabase } from '@/config/supabase.js';
+import { createNotification } from './notification.service.js';
 import type { ServiceResponse } from './index.js';
 import type { Booking as BookingDBRow } from '@/services/booking.service.js';
 
@@ -181,6 +194,35 @@ export async function syncAllBookings(): Promise<ServiceResponse<{ synced: numbe
   }
 }
 
+// ─── #611 Reconciliation constants ───────────────────────────────────────────
+
+/** Maximum number of reconciliation attempts before quarantining the booking. */
+const MAX_RECONCILE_ATTEMPTS = 5;
+
+/**
+ * Errors that indicate a transient (retryable) failure.
+ * Anything not matching is classified as permanent.
+ */
+const TRANSIENT_ERROR_PATTERNS = [
+  /network/i,
+  /timeout/i,
+  /econnreset/i,
+  /enotfound/i,
+  /503/,
+  /502/,
+  /rate.?limit/i,
+];
+
+type ErrorCategory = 'transient' | 'permanent';
+
+function classifyError(message: string): ErrorCategory {
+  return TRANSIENT_ERROR_PATTERNS.some((p) => p.test(message))
+    ? 'transient'
+    : 'permanent';
+}
+
+// ─── Blockchain log helper ────────────────────────────────────────────────────
+
 /**
  * Write a blockchain reconciliation log entry.
  */
@@ -190,6 +232,8 @@ async function writeBlockchainLog(entry: {
   log_type: 'reconciliation' | 'error' | 'success';
   message?: string;
   on_chain_status?: string;
+  error_category?: ErrorCategory;
+  attempt?: number;
 }): Promise<void> {
   await supabase.from('blockchain_logs').insert({
     ...entry,
@@ -197,14 +241,133 @@ async function writeBlockchainLog(entry: {
   });
 }
 
+// ─── Tenant / host notification helpers ──────────────────────────────────────
+
+/**
+ * Fetch the tenant user ID for a booking.
+ * Returns null if the booking or tenant cannot be resolved.
+ */
+async function getTenantId(bookingId: string): Promise<string | null> {
+  const { data } = await supabase
+    .from('bookings')
+    .select('tenant_id')
+    .eq('id', bookingId)
+    .single();
+  return (data as { tenant_id?: string } | null)?.tenant_id ?? null;
+}
+
+/**
+ * Fetch the host (property owner) user ID for a booking.
+ * Returns null if the booking or property cannot be resolved.
+ */
+async function getHostId(bookingId: string): Promise<string | null> {
+  const { data } = await supabase
+    .from('bookings')
+    .select('properties(owner_id)')
+    .eq('id', bookingId)
+    .single();
+  // biome-ignore lint/suspicious/noExplicitAny: raw Supabase join shape
+  return (data as any)?.properties?.owner_id ?? null;
+}
+
+/**
+ * Send privacy-safe notifications to tenant and host after a permanent
+ * escrow failure.
+ *
+ * Rules:
+ *  - Only fires once per booking (checked via `escrow_failure_notified_at`).
+ *  - Does not include internal error details (privacy-safe payload only).
+ *  - Falls through on notification errors so reconciliation state is still saved.
+ */
+async function notifyEscrowFailure(bookingId: string, attempt: number): Promise<void> {
+  // Check deduplication flag — never send twice
+  const { data: booking } = await supabase
+    .from('bookings')
+    .select('escrow_failure_notified_at, tenant_id, property_id')
+    .eq('id', bookingId)
+    .single();
+
+  if ((booking as { escrow_failure_notified_at?: string | null } | null)?.escrow_failure_notified_at) {
+    // Already notified; skip
+    return;
+  }
+
+  const tenantId = await getTenantId(bookingId);
+  const hostId   = await getHostId(bookingId);
+
+  const notificationPayload: Record<string, unknown> = {
+    bookingId,
+    // Privacy-safe: no internal error details, no wallet addresses
+    message: 'Your booking escrow could not be confirmed after multiple attempts. Our support team has been alerted.',
+    supportLink: '/support',
+    attempt,
+  };
+
+  const tasks: Promise<unknown>[] = [];
+
+  if (tenantId) {
+    tasks.push(
+      createNotification(tenantId, 'system_alert', {
+        ...notificationPayload,
+        audience: 'tenant',
+      }).catch((err) =>
+        console.error(`[Reconcile] Failed to notify tenant ${tenantId}:`, err)
+      ),
+    );
+  }
+
+  if (hostId) {
+    tasks.push(
+      createNotification(hostId, 'system_alert', {
+        bookingId,
+        message: 'An escrow transaction for one of your bookings could not be confirmed. Support has been alerted.',
+        supportLink: '/host/support',
+        attempt,
+        audience: 'host',
+      }).catch((err) =>
+        console.error(`[Reconcile] Failed to notify host ${hostId}:`, err)
+      ),
+    );
+  }
+
+  await Promise.all(tasks);
+
+  // Mark as notified to prevent duplicate alerts
+  await supabase
+    .from('bookings')
+    .update({ escrow_failure_notified_at: new Date().toISOString() })
+    .eq('id', bookingId);
+}
+
+// ─── Core reconcile function ──────────────────────────────────────────────────
+
 /**
  * Reconcile a single booking with pending escrow by polling transaction status.
- * Updates booking state based on on-chain transaction result and notifies tenant on failure.
+ *
+ * Enhanced for #611:
+ *  - Increments `reconcile_attempts` counter on each call.
+ *  - Classifies errors as transient or permanent.
+ *  - After MAX_RECONCILE_ATTEMPTS, marks booking as `escrow_reconcile_failed`
+ *    and sends privacy-safe notifications to tenant and host.
+ *  - Never re-sends notifications if already sent (deduplication).
  */
-async function reconcilePendingEscrow(booking: BookingDBRow & { escrow_hash?: string }): Promise<void> {
+async function reconcilePendingEscrow(
+  booking: BookingDBRow & { escrow_hash?: string; reconcile_attempts?: number },
+): Promise<void> {
   if (!booking.escrow_hash || !booking.on_chain_id) {
     return;
   }
+
+  const currentAttempt = (booking.reconcile_attempts ?? 0) + 1;
+
+  // Increment attempt counter first so even a transient failure is tracked
+  await supabase
+    .from('bookings')
+    .update({
+      reconcile_attempts: currentAttempt,
+      last_reconcile_at: new Date().toISOString(),
+    })
+    .eq('id', booking.id);
 
   try {
     const server = getSorobanServer();
@@ -216,7 +379,13 @@ async function reconcilePendingEscrow(booking: BookingDBRow & { escrow_hash?: st
         tx_hash: booking.escrow_hash,
         log_type: 'reconciliation',
         message: 'Transaction still pending',
+        attempt: currentAttempt,
       });
+
+      // Check if we've hit the attempt ceiling on a perpetually-pending tx
+      if (currentAttempt >= MAX_RECONCILE_ATTEMPTS) {
+        await quarantineBooking(booking.id, booking.escrow_hash, currentAttempt, 'Exceeded max attempts while pending');
+      }
       return;
     }
 
@@ -235,43 +404,77 @@ async function reconcilePendingEscrow(booking: BookingDBRow & { escrow_hash?: st
         log_type: 'success',
         message: 'Escrow transaction confirmed',
         on_chain_status: 'funded',
+        attempt: currentAttempt,
       });
       return;
     }
 
     if (txStatus.status === 'failed') {
-      await supabase
-        .from('bookings')
-        .update({
-          status: 'failed',
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', booking.id);
-
-      await writeBlockchainLog({
-        booking_id: booking.id,
-        tx_hash: booking.escrow_hash,
-        log_type: 'error',
-        message: 'Escrow transaction failed',
-        on_chain_status: 'failed',
-      });
-
-      // TODO: notify tenant of booking failure
+      // Terminal on-chain failure — quarantine immediately
+      await quarantineBooking(booking.id, booking.escrow_hash, currentAttempt, 'On-chain transaction failed');
     }
   } catch (err) {
     const message = (err as Error).message;
+    const category = classifyError(message);
+
     await writeBlockchainLog({
       booking_id: booking.id,
       tx_hash: booking.escrow_hash,
       log_type: 'error',
       message: `Reconciliation error: ${message}`,
+      error_category: category,
+      attempt: currentAttempt,
     });
+
+    if (category === 'permanent' || currentAttempt >= MAX_RECONCILE_ATTEMPTS) {
+      await quarantineBooking(booking.id, booking.escrow_hash, currentAttempt, message);
+    }
+    // Transient errors below the threshold are left in `pending` for retry
   }
 }
 
 /**
+ * Move a booking to the `escrow_reconcile_failed` quarantine state and notify
+ * participants.  Idempotent — safe to call multiple times.
+ */
+async function quarantineBooking(
+  bookingId: string,
+  txHash: string,
+  attempt: number,
+  reason: string,
+): Promise<void> {
+  await supabase
+    .from('bookings')
+    .update({
+      status: 'escrow_reconcile_failed',
+      last_reconcile_error: reason,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', bookingId);
+
+  await writeBlockchainLog({
+    booking_id: bookingId,
+    tx_hash: txHash,
+    log_type: 'error',
+    message: `Booking quarantined: ${reason}`,
+    on_chain_status: 'escrow_reconcile_failed',
+    attempt,
+  });
+
+  console.error(
+    `[Reconcile] QUARANTINE booking=${bookingId} attempt=${attempt} reason="${reason}"`,
+  );
+
+  await notifyEscrowFailure(bookingId, attempt);
+}
+
+// ─── Public reconcile entry point ─────────────────────────────────────────────
+
+/**
  * Reconcile all bookings with pending escrow transactions.
- * Polls transaction status and transitions bookings to terminal state.
+ *
+ * Polls transaction status for every booking in `pending` state that has an
+ * escrow hash AND has not yet exceeded MAX_RECONCILE_ATTEMPTS.
  *
  * @returns ServiceResponse with counts of reconciled bookings
  */
@@ -285,7 +488,8 @@ export async function reconcileAllPendingEscrows(): Promise<ServiceResponse<{ re
       .from('bookings')
       .select('*')
       .eq('status', 'pending')
-      .not('escrow_hash', 'is', null);
+      .not('escrow_hash', 'is', null)
+      .lt('reconcile_attempts', MAX_RECONCILE_ATTEMPTS); // skip exhausted bookings
 
     if (error) {
       return { success: false, error: error.message };
@@ -296,7 +500,9 @@ export async function reconcileAllPendingEscrows(): Promise<ServiceResponse<{ re
 
     for (const booking of bookings || []) {
       try {
-        await reconcilePendingEscrow(booking as BookingDBRow & { escrow_hash?: string });
+        await reconcilePendingEscrow(
+          booking as BookingDBRow & { escrow_hash?: string; reconcile_attempts?: number },
+        );
         reconciled++;
       } catch (err) {
         failed++;

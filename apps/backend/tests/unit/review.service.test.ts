@@ -202,13 +202,25 @@ describe('review.service', () => {
   // ── getAverageRating ──────────────────────────────────────────────────────
 
   describe('getAverageRating', () => {
-    it('returns 0 when user has no reviews', async () => {
+    it('returns 0 when user has no reviews (empty array)', async () => {
       mockFrom.mockImplementation((_: string) =>
         chain({ data: [], error: null }),
       );
       const result = await getAverageRating('u1');
       expect(result.success).toBe(true);
       expect(result.data).toBe(0);
+    });
+
+    it('returns numeric 0 — not NaN — when data is null', async () => {
+      // Some Supabase versions return null rather than [] for zero-row results.
+      mockFrom.mockImplementation((_: string) =>
+        chain({ data: null, error: null }),
+      );
+      const result = await getAverageRating('u-no-reviews');
+      expect(result.success).toBe(true);
+      // Must be exactly 0, not NaN
+      expect(result.data).toBe(0);
+      expect(Number.isNaN(result.data)).toBe(false);
     });
 
     it('calculates average correctly', async () => {
@@ -220,12 +232,55 @@ describe('review.service', () => {
       expect(result.data).toBe(4); // (4+5+3)/3 = 4
     });
 
+    it('rounds to one decimal place', async () => {
+      mockFrom.mockImplementation((_: string) =>
+        chain({ data: [{ rating: 4 }, { rating: 5 }], error: null }),
+      );
+      const result = await getAverageRating('u1');
+      expect(result.success).toBe(true);
+      expect(result.data).toBe(4.5);
+    });
+
     it('returns error on DB failure', async () => {
       mockFrom.mockImplementation((_: string) =>
         chain({ data: null, error: { message: 'timeout' } }),
       );
       const result = await getAverageRating('u1');
       expect(result.success).toBe(false);
+    });
+  });
+
+  // ── submitReview — comment validation ────────────────────────────────────
+
+  describe('submitReview — comment validation', () => {
+    it('rejects an empty comment', async () => {
+      // An empty string is immediately empty after sanitize — rejected before DB.
+      const result = await submitReview('b1', 'u1', 'u2', 4, '');
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('Comment is required');
+      expect(mockFrom).not.toHaveBeenCalled();
+    });
+
+    it('rejects a whitespace-only comment after real sanitization', async () => {
+      // Override the sanitize stub for this test to simulate real trimming:
+      // sanitizeLongText trims leading/trailing whitespace, so "   " → "".
+      const { sanitizeLongText: mockSanitize } = await import('../../src/utils/sanitize.js') as any;
+      mockSanitize.mockImplementationOnce((_s: string) => '');
+
+      const result = await submitReview('b1', 'u1', 'u2', 4, '   ');
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('Comment is required');
+      expect(mockFrom).not.toHaveBeenCalled();
+    });
+
+    it('accepts a non-empty comment and proceeds to booking check', async () => {
+      // Non-empty comment clears validation; next stop is the booking lookup.
+      mockFrom.mockImplementation((_: string) =>
+        chain({ data: null, error: { message: 'not found' } }),
+      );
+      const result = await submitReview('b1', 'u1', 'u2', 4, 'great stay');
+      // Fails at booking lookup, NOT at comment validation
+      expect(result.error).toBe('Booking not found or not owned by reviewer');
     });
   });
 });

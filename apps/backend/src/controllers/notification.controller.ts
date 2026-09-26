@@ -24,30 +24,8 @@ export async function listNotifications(req: AuthRequest, res: Response): Promis
     return;
   }
 
-  // If ?cursor param is present (or ?limit), use cursor pagination
-  const hasCursorParam = 'cursor' in req.query;
-  const hasLimitParam = 'limit' in req.query;
-
-  if (hasCursorParam || hasLimitParam) {
-    const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : null;
-    const limit = req.query.limit ? Number(req.query.limit) : 20;
-
-    if (Number.isNaN(limit) || limit < 1) {
-      res.status(422).json({ error: 'limit must be a positive integer' });
-      return;
-    }
-
-    const result = await getNotificationsCursor(userId, cursor, limit);
-    if (!result.success) {
-      res.status(400).json({ error: result.error });
-      return;
-    }
-    res.json(result.data);
-    return;
-  }
-
-  // Fallback: legacy offset-compatible list (returns flat array)
-  const result = await getNotifications(userId);
+  const pagination = (req as AuthRequest & { parsedPagination?: { page: number; pageSize: number } }).parsedPagination;
+  const result = await getNotifications(userId, pagination?.page ?? 1, pagination?.pageSize ?? 20);
   if (!result.success) {
     res.status(400).json({ error: result.error });
     return;

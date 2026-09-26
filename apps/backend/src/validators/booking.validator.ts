@@ -31,6 +31,21 @@ export const createBookingSchema = z
       .string({ required_error: 'rules_acknowledged_at is required' })
       .datetime('rules_acknowledged_at must be a valid ISO 8601 datetime'),
 
+    /**
+     * Platform policy version string the tenant agreed to (from GET /api/v1/policy/current).
+     * Required so the accepted terms snapshot is immutably stored with the booking.
+     */
+    terms_version: z
+      .string({ required_error: 'terms_version is required' })
+      .min(1, 'terms_version must not be empty'),
+
+    /**
+     * UTC timestamp when the tenant ticked the terms checkbox in the UI.
+     */
+    terms_accepted_at: z
+      .string({ required_error: 'terms_accepted_at is required' })
+      .datetime('terms_accepted_at must be a valid ISO 8601 datetime'),
+
     total_price: z
       .number({ invalid_type_error: 'total_price must be a number' })
       .positive('total_price must be positive')
@@ -105,6 +120,11 @@ export const requestModificationSchema = z.object({
   requested_end: z
     .string({ required_error: 'requested_end is required' })
     .date('requested_end must be a valid ISO date (YYYY-MM-DD)'),
+  guest_count: z
+    .number({ invalid_type_error: 'guest_count must be a number' })
+    .int('guest_count must be an integer')
+    .positive('guest_count must be a positive integer')
+    .optional(),
   reason: z
     .string()
     .max(1000, 'reason must not exceed 1000 characters')

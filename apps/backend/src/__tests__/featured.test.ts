@@ -152,6 +152,29 @@ describe('promoteFeatureToTop() — cap enforcement', () => {
     expect(result.filter((p) => p.is_featured).length).toBe(FEATURED_CAP);
   });
 
+  it('promotes the highest-weight featured entries even when they appear after the cap position', () => {
+    // First FEATURED_CAP entries have weight 1; the entry at position FEATURED_CAP
+    // has weight 100.  Without post-sort slicing it would be wrongly excluded.
+    const properties = [
+      ...Array.from({ length: FEATURED_CAP }, (_, i) =>
+        makeProperty({ id: `low-${i}`, featured_until: futureDate(), featured_weight: 1 }),
+      ),
+      makeProperty({ id: 'high-weight', featured_until: futureDate(), featured_weight: 100 }),
+    ];
+
+    const result = searchPromote(properties);
+
+    // The high-weight entry must be in the featured block
+    const highWeightEntry = result.find((p) => p.id === 'high-weight');
+    expect(highWeightEntry?.is_featured).toBe(true);
+
+    // Total featured count must not exceed the cap
+    expect(result.filter((p) => p.is_featured).length).toBe(FEATURED_CAP);
+
+    // Total count is preserved
+    expect(result).toHaveLength(FEATURED_CAP + 1);
+  });
+
   it('preserves total count — no properties are dropped', () => {
     const total = 10;
     const properties = Array.from({ length: total }, (_, i) =>

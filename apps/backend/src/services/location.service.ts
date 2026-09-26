@@ -69,8 +69,12 @@ export class LocationService {
         `https://nominatim.openstreetmap.org/reverse?lat=${roundedLat}&lon=${roundedLng}&format=json`;
       const response = await fetch(url, {
         headers: { 'User-Agent': 'Rentars/1.0 (rentals platform)' },
+        signal: AbortSignal.timeout(10_000),
       });
 
+      if (response.status === 429) {
+        return { success: false, error: 'Reverse geocoding rate limit exceeded', statusCode: 429 };
+      }
       if (!response.ok) {
         return { success: false, error: 'Reverse geocoding service unavailable', statusCode: 502 };
       }
@@ -120,8 +124,12 @@ export class LocationService {
       const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(address)}&format=json&limit=1`;
       const response = await fetch(url, {
         headers: { 'User-Agent': 'Rentars/1.0 (rentals platform)' },
+        signal: AbortSignal.timeout(10_000),
       });
 
+      if (response.status === 429) {
+        return { success: false, error: 'Geocoding rate limit exceeded', statusCode: 429 };
+      }
       if (!response.ok) {
         return { success: false, error: 'Geocoding service unavailable', statusCode: 502 };
       }
@@ -156,8 +164,14 @@ export class LocationService {
     lng: number,
     radius: number,
   ): Promise<ServiceResponse<PropertyWithDistance[]>> {
-    if (isNaN(lat) || isNaN(lng) || isNaN(radius)) {
+    if (!isFinite(lat) || !isFinite(lng) || isNaN(radius)) {
       return { success: false, error: 'Invalid latitude, longitude, or radius', statusCode: 400 };
+    }
+    if (lat < -90 || lat > 90) {
+      return { success: false, error: 'Latitude must be between -90 and 90', statusCode: 400 };
+    }
+    if (lng < -180 || lng > 180) {
+      return { success: false, error: 'Longitude must be between -180 and 180', statusCode: 400 };
     }
 
     if (radius <= 0) {

@@ -52,3 +52,152 @@ export async function resolveReportHandler(req: AuthRequest, res: Response): Pro
 
   res.json(result.data);
 }
+
+// ─── Moderation Workflow ──────────────────────────────────────────────────────
+
+export async function assignReportHandler(req: AuthRequest, res: Response): Promise<void> {
+  const { moderatorId } = req.body;
+  if (!moderatorId) {
+    res.status(400).json({ error: 'moderatorId is required' });
+    return;
+  }
+
+  const { assignReport } = await import('../services/report.service.js');
+  const result = await assignReport(req.params.id, moderatorId);
+
+  if (!result.success) {
+    res.status(400).json({ error: result.error });
+    return;
+  }
+
+  res.json(result.data);
+}
+
+export async function setSeverityHandler(req: AuthRequest, res: Response): Promise<void> {
+  const { severity } = req.body;
+  if (!severity) {
+    res.status(400).json({ error: 'severity is required' });
+    return;
+  }
+
+  const { setSeverity } = await import('../services/report.service.js');
+  const result = await setSeverity(req.params.id, severity);
+
+  if (!result.success) {
+    res.status(400).json({ error: result.error });
+    return;
+  }
+
+  res.json(result.data);
+}
+
+export async function addEvidenceHandler(req: AuthRequest, res: Response): Promise<void> {
+  const { type, url, description } = req.body;
+  if (!type || !url) {
+    res.status(400).json({ error: 'type and url are required' });
+    return;
+  }
+
+  const { addEvidence } = await import('../services/report.service.js');
+  const result = await addEvidence(req.params.id, { type, url, description });
+
+  if (!result.success) {
+    res.status(400).json({ error: result.error });
+    return;
+  }
+
+  res.json(result.data);
+}
+
+export async function hidePropertyHandler(req: AuthRequest, res: Response): Promise<void> {
+  const { hideProperty } = await import('../services/report.service.js');
+  const result = await hideProperty(req.params.id);
+
+  if (!result.success) {
+    res.status(400).json({ error: result.error });
+    return;
+  }
+
+  res.json(result.data);
+}
+
+export async function unhidePropertyHandler(req: AuthRequest, res: Response): Promise<void> {
+  const { unhideProperty } = await import('../services/report.service.js');
+  const result = await unhideProperty(req.params.id);
+
+  if (!result.success) {
+    res.status(400).json({ error: result.error });
+    return;
+  }
+
+  res.json(result.data);
+}
+
+export async function submitAppealHandler(req: AuthRequest, res: Response): Promise<void> {
+  const hostId = req.userId;
+  if (!hostId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const { appealReason } = req.body;
+  if (!appealReason) {
+    res.status(400).json({ error: 'appealReason is required' });
+    return;
+  }
+
+  const { submitAppeal } = await import('../services/report.service.js');
+  const result = await submitAppeal(req.params.id, hostId, appealReason);
+
+  if (!result.success) {
+    res.status(400).json({ error: result.error });
+    return;
+  }
+
+  res.json(result.data);
+}
+
+export async function reviewAppealHandler(req: AuthRequest, res: Response): Promise<void> {
+  const moderatorId = req.userId;
+  if (!moderatorId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const { approved } = req.body;
+  if (approved === undefined) {
+    res.status(400).json({ error: 'approved (boolean) is required' });
+    return;
+  }
+
+  const { reviewAppeal } = await import('../services/report.service.js');
+  const result = await reviewAppeal(req.params.id, moderatorId, approved);
+
+  if (!result.success) {
+    res.status(400).json({ error: result.error });
+    return;
+  }
+
+  res.json(result.data);
+}
+
+export async function getReportImpactHandler(req: AuthRequest, res: Response): Promise<void> {
+  const { targetType, targetId } = req.query;
+  if (!targetType || !targetId) {
+    res.status(400).json({ error: 'targetType and targetId are required' });
+    return;
+  }
+
+  const { getReportImpact } = await import('../services/report.service.js');
+  const result = await getReportImpact(
+    targetType as string,
+    targetId as string,
+  );
+
+  if (!result.success) {
+    res.status(500).json({ error: result.error });
+    return;
+  }
+
+  res.json(result.data);
+}

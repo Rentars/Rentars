@@ -49,8 +49,13 @@ describe('isBot()', () => {
     expect(isBot('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')).toBe(false);
   });
 
-  it('returns false for undefined UA', () => {
-    expect(isBot(undefined)).toBe(false);
+  it('returns true for undefined UA', () => {
+    expect(isBot(undefined)).toBe(true);
+  });
+
+  it('returns true for a blank user agent', () => {
+    expect(isBot('')).toBe(true);
+    expect(isBot('   ')).toBe(true);
   });
 
   it('detects Googlebot', () => {
@@ -143,6 +148,7 @@ describe('recordPropertyView()', () => {
     const r = await recordPropertyView({
       propertyId: 'prop-1',
       userId:     'user-abc',
+      userAgent:  'Mozilla/5.0',
     });
     expect(r.success).toBe(true);
     expect(r.data?.recorded).toBe(false);
@@ -153,6 +159,7 @@ describe('recordPropertyView()', () => {
     const r = await recordPropertyView({
       propertyId: 'prop-1',
       userId:     'user-abc',
+      userAgent:  'Mozilla/5.0',
     });
     expect(r.success).toBe(false);
     expect(r.error).toBeDefined();
@@ -160,7 +167,7 @@ describe('recordPropertyView()', () => {
 
   it('includes window_start in the insert payload', async () => {
     mockInsert.mockResolvedValueOnce({ error: null });
-    await recordPropertyView({ propertyId: 'prop-1', userId: 'user-abc' });
+    await recordPropertyView({ propertyId: 'prop-1', userId: 'user-abc', userAgent: 'Mozilla/5.0' });
     const insertArg = mockInsert.mock.calls[0][0];
     // window_start should be an ISO string with minutes/seconds zeroed
     expect(insertArg.window_start).toMatch(/T\d{2}:00:00/);

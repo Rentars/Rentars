@@ -138,4 +138,68 @@ describe('useNotifications', () => {
     expect(mockClient.channel).toHaveBeenCalledWith('notifications');
     expect(mockChannel.subscribe).toHaveBeenCalled();
   });
+
+  it('ignores pending results after logout (issue #457)', async () => {
+    mockFetch.mockImplementation(
+      async () =>
+        new Promise((resolve) => {
+          setTimeout(() => {
+            resolve({
+              ok: true,
+              json: async () => ({ data: mockNotifications, nextCursor: null }),
+            });
+          }, 50);
+        })
+    );
+
+    const { result } = renderHook(() => useNotifications());
+    expect(result.current.isLoading).toBe(true);
+
+    await act(async () => {
+      localStorage.removeItem('token');
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    });
+
+    expect(result.current.notifications).toHaveLength(0);
+  });
+
+  it('prevents duplicate pagination on rapid loadMore calls (issue #458)', async () => {
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          data: mockNotifications,
+          nextCursor: 'cursor-1',
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          data: [
+            {
+              id: 'n3',
+              user_id: 'u1',
+              type: 'message',
+              data: {},
+              read: false,
+              created_at: '2024-01-03T00:00:00Z',
+            },
+          ],
+          nextCursor: null,
+        }),
+      });
+
+    const { result } = renderHook(() => useNotifications(undefined, 20));
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    await act(async () => {
+      result.current.loadMore();
+      result.current.loadMore();
+    });
+
+    await waitFor(() => expect(result.current.isLoadingMore).toBe(false));
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(result.current.notifications).toHaveLength(3);
+  });
 });

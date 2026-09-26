@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Property } from '@/types/property';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
@@ -84,4 +84,89 @@ export async function reverseGeocodeCoords(
   } catch {
     return null;
   }
+}
+
+export interface UseLocationSearchOptions {
+  onLocationSelected?: (location: GeocodedLocation) => void;
+}
+
+export function useLocationSearch(options: UseLocationSearchOptions = {}) {
+  const { onLocationSelected } = options;
+  const [input, setInput] = useState('');
+  const [suggestions, setSuggestions] = useState<GeocodedLocation[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const abortRef = useRef<AbortController | null>(null);
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const searchLocations = useCallback(async (query: string) => {
+    const trimmedQuery = query.trim();
+
+    if (!trimmedQuery) {
+      setSuggestions([]);
+      setLoading(false);
+      setError(null);
+      return;
+    }
+
+    if (trimmedQuery.length < 2) {
+      setSuggestions([]);
+      setError(null);
+      setLoading(false);
+      return;
+    }
+
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    if (abortRef.current) abortRef.current.abort();
+
+    setLoading(true);
+    setError(null);
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    debounceRef.current = setTimeout(async () => {
+      try {
+        const location = await geocodeAddress(trimmedQuery);
+        if (!controller.signal.aborted && location) {
+          setSuggestions([location]);
+        } else if (!controller.signal.aborted) {
+          setSuggestions([]);
+        }
+      } catch {
+        if (!controller.signal.aborted) {
+          setError('Failed to search locations');
+          setSuggestions([]);
+        }
+      } finally {
+        if (!controller.signal.aborted) {
+          setLoading(false);
+        }
+      }
+    }, 300);
+  }, []);
+
+  const selectLocation = useCallback((location: GeocodedLocation) => {
+    setInput(location.address);
+    setSuggestions([]);
+    onLocationSelected?.(location);
+  }, [onLocationSelected]);
+
+  useEffect(() => {
+    return () => {
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+      if (abortRef.current) abortRef.current.abort();
+    };
+  }, []);
+
+  return {
+    input,
+    setInput,
+    suggestions,
+    loading,
+    error,
+    searchLocations,
+    selectLocation,
+  };
 }

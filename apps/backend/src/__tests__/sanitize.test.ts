@@ -196,6 +196,72 @@ describe('sanitizeResponse', () => {
   });
 });
 
+// ─── Issue #481: Numeric entity code validation ───────────────────────────────
+
+describe('sanitizeText — numeric entity code validation (issue #481)', () => {
+  it('decodes a normal decimal entity (&#60; → <, then stripped)', () => {
+    // &#60; is '<'; after decoding the resulting tag is stripped
+    const out = sanitizeText('&#60;b&#62;bold&#60;/b&#62;');
+    expect(out).not.toContain('<b>');
+    // The visible text is preserved
+    expect(out).toContain('bold');
+  });
+
+  it('decodes a valid printable entity (&#65; → A)', () => {
+    const out = sanitizeText('Hello &#65;!');
+    expect(out).toContain('Hello A!');
+  });
+
+  it('leaves an out-of-range decimal entity unchanged (> 0x10FFFF)', () => {
+    // 1114112 (0x110000) is one above the maximum Unicode code point
+    const out = sanitizeText('bad&#1114112;entity');
+    // Must not produce a replacement character or corrupt the text
+    expect(out).toContain('&#1114112;');
+  });
+
+  it('leaves a control character entity unchanged (&#8; — backspace)', () => {
+    const out = sanitizeText('ctrl&#8;char');
+    // 0x08 is below 0x20; should not be decoded to an actual control char
+    expect(out).toContain('&#8;');
+    expect(out).not.toContain('\x08');
+  });
+
+  it('leaves a C1 control entity unchanged (&#128; — 0x80)', () => {
+    const out = sanitizeText('c1&#128;ctrl');
+    // 0x80 is in the C1 control range (0x7F–0x9F)
+    expect(out).toContain('&#128;');
+    expect(out).not.toContain('\x80');
+  });
+
+  it('leaves a surrogate code point entity unchanged (&#55296; — 0xD800)', () => {
+    const out = sanitizeText('surr&#55296;ogate');
+    expect(out).toContain('&#55296;');
+  });
+
+  it('decodes a valid hex entity (&#x41; → A)', () => {
+    const out = sanitizeText('&#x41;BC');
+    expect(out).toContain('ABC');
+  });
+
+  it('leaves an out-of-range hex entity unchanged (&#x110000;)', () => {
+    const out = sanitizeText('over&#x110000;flow');
+    expect(out).toContain('&#x110000;');
+  });
+
+  it('leaves a hex control entity unchanged (&#x7;)', () => {
+    // 0x07 is below 0x20 (BEL control char)
+    const out = sanitizeText('bel&#x7;char');
+    expect(out).toContain('&#x7;');
+    expect(out).not.toContain('\x07');
+  });
+
+  it('existing HTML sanitization tests remain green — script tag stripped', () => {
+    const out = sanitizeText('<script>alert(1)</script>');
+    expect(out).not.toContain('<script>');
+    expect(out).not.toContain('alert');
+  });
+});
+
 // ─── Multi-vector payloads ────────────────────────────────────────────────────
 
 describe('sanitizeText — combined attack vectors', () => {

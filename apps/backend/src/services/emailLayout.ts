@@ -206,8 +206,9 @@ function buildFooterLinks(preferencesUrl: string | undefined, isEssential: boole
   }
 
   if (preferencesUrl) {
-    const prefsLink = `<a href="${escapeHtml(preferencesUrl)}" style="color:${MUTED_COLOR};text-decoration:underline;">Manage preferences</a>`;
-    const unsubLink = `<a href="${escapeHtml(preferencesUrl)}&unsubscribe=1" style="color:${MUTED_COLOR};text-decoration:underline;">Unsubscribe</a>`;
+    const absoluteUrl = preferencesUrl.startsWith('http') ? preferencesUrl : `${FRONTEND_URL}${preferencesUrl}`;
+    const prefsLink = `<a href="${escapeHtmlAttribute(absoluteUrl)}" style="color:${MUTED_COLOR};text-decoration:underline;">Manage preferences</a>`;
+    const unsubLink = `<a href="${escapeHtmlAttribute(absoluteUrl)}&unsubscribe=1" style="color:${MUTED_COLOR};text-decoration:underline;">Unsubscribe</a>`;
     return `${supportLink} &middot; ${prefsLink} &middot; ${unsubLink}`;
   }
 
@@ -224,13 +225,24 @@ export function escapeHtml(str: string): string {
     .replace(/'/g, '&#x27;');
 }
 
+/** Escape strings for use in HTML attributes (double-quoted). */
+function escapeHtmlAttribute(str: string): string {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
 /** Strip HTML tags for plaintext generation. */
 function stripHtml(html: string): string {
   return html
     .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/p>/gi, '\n')
+    .replace(/<\/(h[1-6]|p|div|section|article|blockquote)>/gi, '\n')
     .replace(/<\/li>/gi, '\n')
     .replace(/<\/tr>/gi, '\n')
+    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
+    .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, '')
     .replace(/<[^>]+>/g, '')
     .replace(/&amp;/g, '&')
     .replace(/&lt;/g, '<')

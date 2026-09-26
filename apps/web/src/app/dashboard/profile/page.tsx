@@ -39,11 +39,9 @@ export default function ProfilePage() {
   };
 
   const handlePropertyEdit = (property: any) => {
-    console.log('Edit property:', property);
   };
 
   const handlePropertyDelete = (id: string) => {
-    console.log('Delete property:', id);
   };
 
   const handlePropertyAdd = () => {

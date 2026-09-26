@@ -1,0 +1,94 @@
+name: Feature request
+description: Propose a new feature or capability.
+labels: [enhancement, triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Before opening**: search existing issues and the roadmap to avoid duplicates.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Search & Discovery
+        - Booking & Availability
+        - Payment & Escrow
+        - Blockchain / Stellar
+        - Authentication / Wallet
+        - Notifications
+        - Reviews
+        - Host Dashboard
+        - Admin
+        - API / Backend
+        - Frontend / UI
+        - Infrastructure / DevOps
+        - i18n / Localization
+        - Analytics
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority (self-assessed)
+      options:
+        - P1 — High (blocks significant user value)
+        - P2 — Medium (meaningful improvement)
+        - P3 — Low (nice to have)
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem this solves
+      description: Describe the user problem or business need — not the solution.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should happen? Include API shape, UI sketches, or pseudocode if helpful.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What other approaches did you evaluate and why did you reject them?
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: How do we know this is done? List specific, testable conditions.
+      placeholder: |
+        - [ ] Given …, when …, then …
+        - [ ] API endpoint returns …
+        - [ ] UI shows …
+    validations:
+      required: true
+
+  - type: input
+    id: estimate
+    attributes:
+      label: Rough effort estimate
+      placeholder: "S (< 1 day) / M (1–3 days) / L (1–2 weeks) / XL (needs breaking down)"
+
+  - type: input
+    id: dependencies
+    attributes:
+      label: Depends on (issue #s or PRs)
+      placeholder: "#123, #456"
+
+  - type: input
+    id: blocks
+    attributes:
+      label: Blocks (issue #s or launch gating)
+      placeholder: "Blocks mainnet launch, blocks #789"

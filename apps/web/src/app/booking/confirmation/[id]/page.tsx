@@ -357,6 +357,9 @@ export default function BookingConfirmationPage() {
               {booking.total_price?.toFixed(2) ?? '—'} USDC
             </span>
           </div>
+          <p className="text-xs text-gray-500 dark:text-gray-400">
+            Currency: USDC · Network: Stellar · Escrow: TrustlessWork
+          </p>
           {booking.escrow_id && (
             <div className="flex justify-between text-xs text-gray-500 dark:text-gray-400">
               <span>Escrow ID</span>
@@ -370,6 +373,35 @@ export default function BookingConfirmationPage() {
             </div>
           )}
         </section>
+
+        {/* ── Accepted terms snapshot ─────────────────────────────────────── */}
+        {(booking as BookingWithProperty & { terms_version?: string; terms_accepted_at?: string }).terms_version && (
+          <section
+            aria-label="Accepted terms"
+            className="rounded-xl border border-gray-200 dark:border-gray-700
+              bg-white dark:bg-gray-900 shadow-sm p-5 space-y-2"
+          >
+            <h2 className="text-sm font-semibold text-gray-900 dark:text-white">Terms accepted</h2>
+            <div className="flex justify-between text-xs text-gray-500 dark:text-gray-400">
+              <span>Policy version</span>
+              <code className="font-mono bg-gray-100 dark:bg-gray-800 px-1.5 py-0.5 rounded">
+                {(booking as BookingWithProperty & { terms_version?: string }).terms_version}
+              </code>
+            </div>
+            {(booking as BookingWithProperty & { terms_accepted_at?: string }).terms_accepted_at && (
+              <div className="flex justify-between text-xs text-gray-500 dark:text-gray-400">
+                <span>Accepted at</span>
+                <span>{formatDate((booking as BookingWithProperty & { terms_accepted_at?: string }).terms_accepted_at!)}</span>
+              </div>
+            )}
+            <p className="text-xs text-gray-400 dark:text-gray-600 pt-1">
+              These terms are locked to this booking and cannot be changed retroactively.{' '}
+              <a href="/terms" className="underline hover:no-underline" target="_blank" rel="noopener noreferrer">
+                View full terms
+              </a>
+            </p>
+          </section>
+        )}
 
         {/* ── Dispute reason (if disputed) ────────────────────────────────── */}
         {status === 'disputed' && booking.dispute_reason && (

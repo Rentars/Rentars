@@ -1,0 +1,91 @@
+name: Engineering task / chore
+description: Refactor, dependency upgrade, technical debt, or internal improvement.
+labels: [chore, triage]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Search & Discovery
+        - Booking & Availability
+        - Payment & Escrow
+        - Blockchain / Stellar
+        - Authentication / Wallet
+        - Notifications
+        - Reviews
+        - Host Dashboard
+        - Admin
+        - API / Backend
+        - Frontend / UI
+        - Infrastructure / DevOps
+        - i18n / Localization
+        - Analytics
+        - Testing
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options:
+        - P1 — High (security fix, CI broken, launch blocker)
+        - P2 — Medium (performance, reliability, DX)
+        - P3 — Low (cosmetic, nice to have)
+    validations:
+      required: true
+
+  - type: input
+    id: owner
+    attributes:
+      label: Owner (GitHub handle)
+      placeholder: "@username"
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Background & motivation
+      description: Why does this work need to happen? What is the current state and why is it insufficient?
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope of work
+      description: What exactly will be done? What is explicitly out of scope?
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Done when
+      description: Specific conditions that confirm the task is complete.
+    validations:
+      required: true
+
+  - type: input
+    id: estimate
+    attributes:
+      label: Effort estimate
+      placeholder: "S / M / L / XL"
+
+  - type: input
+    id: dependencies
+    attributes:
+      label: Depends on
+      placeholder: "#123"
+
+  - type: checkboxes
+    id: launch_blocker
+    attributes:
+      label: Launch impact
+      options:
+        - label: This is a launch blocker — release cannot proceed without it
+        - label: This is a launch risk — release can proceed but risk is documented

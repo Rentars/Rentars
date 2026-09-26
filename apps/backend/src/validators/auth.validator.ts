@@ -68,6 +68,12 @@ export const confirmPasswordResetSchema = z.object({
     .regex(/[^A-Za-z0-9]/, 'password must contain at least one special character'),
 });
 
+// ─── Email verification schema ────────────────────────────────────────────────
+
+export const verifyEmailSchema = z.object({
+  token: z.string({ required_error: 'token is required' }).min(1, 'token is required'),
+});
+
 // ─── Wallet Challenge schema ──────────────────────────────────────────────────
 
 export const walletChallengeSchema = z.object({

@@ -7,9 +7,11 @@ import {
   verifyWalletChallenge,
   requestPasswordReset,
   confirmPasswordReset,
+  verifyEmail,
 } from '@/services/auth.service.js';
-import { consumeRefreshToken, revokeRefreshToken } from '@/services/refreshToken.service.js';
+import { consumeRefreshToken, revokeRefreshToken, revokeAllUserRefreshTokens } from '@/services/refreshToken.service.js';
 import { securityLogger } from '@/services/logging.service.js';
+import { auditLogger } from '@/services/auditLogger.service.js';
 import { env } from '@/config/env.js';
 import { AuthError } from '@/types/errors.js';
 
@@ -65,6 +67,19 @@ export async function walletVerify(req: Request, res: Response): Promise<void> {
   }
 }
 
+export async function verifyEmailHandler(req: Request, res: Response): Promise<void> {
+  try {
+    const { token } = req.body;
+    await verifyEmail(token);
+    res.json({ message: 'Email verified successfully.' });
+  } catch (err) {
+    if (err instanceof AuthError) {
+      throw err;
+    }
+    throw err;
+  }
+}
+
 export async function requestReset(req: Request, res: Response): Promise<void> {
   const { email } = req.body;
   await requestPasswordReset(email);
@@ -111,22 +126,72 @@ export async function refreshAccessToken(req: Request, res: Response): Promise<v
 export async function logout(req: Request, res: Response): Promise<void> {
   const { refreshToken } = req.body as { refreshToken?: string };
 
-  if (refreshToken) {
-    await revokeRefreshToken(refreshToken);
-  }
+  let userId: string | undefined;
 
-  // Log the logout event if user is identified via access token header
+  // Extract user ID from access token header for audit logging
   const authHeader = req.headers.authorization;
   if (authHeader?.startsWith('Bearer ')) {
     try {
       const decoded = jwt.verify(authHeader.split(' ')[1], env.JWT_SECRET) as { userId?: string };
-      if (decoded.userId) {
-        await securityLogger.logAuthEvent('logout', decoded.userId);
-      }
+      userId = decoded.userId;
     } catch {
       // token may be expired — still allow logout
     }
   }
 
+  if (refreshToken) {
+    await revokeRefreshToken(refreshToken);
+  }
+
+  if (userId) {
+    await securityLogger.logAuthEvent('logout', userId);
+    await auditLogger.log({
+      actorId: userId,
+      action: 'auth.logout',
+      resourceType: 'auth',
+      ip: req.ip,
+    });
+  }
+
   res.json({ message: 'Logged out successfully.' });
+}
+
+/**
+ * POST /api/v1/auth/logout-all-devices
+ * Revokes all refresh tokens for the authenticated user across all devices.
+ * Used when password is reset or compromise is suspected.
+ */
+export async function logoutAllDevices(req: Request, res: Response): Promise<void> {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader?.startsWith('Bearer ')) {
+    res.status(401).json({ error: { code: 'MISSING_TOKEN', message: 'Authorization required' } });
+    return;
+  }
+
+  let userId: string | undefined;
+  try {
+    const decoded = jwt.verify(authHeader.split(' ')[1], env.JWT_SECRET) as { userId?: string };
+    userId = decoded.userId;
+  } catch (err) {
+    res.status(401).json({ error: { code: 'INVALID_TOKEN', message: 'Invalid or expired token' } });
+    return;
+  }
+
+  if (!userId) {
+    res.status(401).json({ error: { code: 'INVALID_TOKEN', message: 'No user ID in token' } });
+    return;
+  }
+
+  await revokeAllUserRefreshTokens(userId);
+
+  await auditLogger.log({
+    actorId: userId,
+    action: 'auth.logout_all_devices',
+    resourceType: 'auth',
+    ip: req.ip,
+    meta: { reason: 'user_initiated' },
+  });
+
+  res.json({ message: 'Logged out from all devices successfully.' });
 }

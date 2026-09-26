@@ -1,5 +1,28 @@
+/**
+ * Admin Routes
+ *
+ * Every route in this file is protected by TWO middleware layers:
+ *
+ *   1. requireAdminRole  — validates a JWT with an admin-family role claim
+ *      (admin | moderator | support | finance).
+ *
+ *   2. requireScope(scope) — verifies the caller's role includes the specific
+ *      capability required by that endpoint.  HIGH-RISK scopes also require
+ *      the X-Approval-Actor header (dual approval).
+ *
+ * See: src/config/adminScopes.ts   — scope definitions and role→scope mapping
+ *      src/middleware/adminScope.middleware.ts — enforcement logic
+ *      docs/admin-runbooks.md       — operational runbooks for each action
+ *
+ * Role capabilities at a glance:
+ *   admin      — all scopes
+ *   moderator  — content, disputes, analytics (no finance)
+ *   support    — read-only lookup (no mutations)
+ *   finance    — refund approval, reconciliation (dual-approval required)
+ */
+
 import { Router } from 'express';
-import { requireAdmin } from '@/middleware/admin.middleware.js';
+import { requireAdminRole, requireScope } from '@/middleware/adminScope.middleware.js';
 import {
   getRateLimitSummary,
   setFeaturedHandler,
@@ -23,204 +46,71 @@ import {
   resolveDispute,
   // Dashboard
   getDashboard,
+  // Audit logs
+  getAuditLogsHandler,
 } from '@/controllers/admin.controller.js';
 
 const router = Router();
 
 /**
- * All routes in this file require an admin JWT.
+ * All routes first verify the actor holds an admin-family role JWT.
+ * Individual routes then check the specific scope required.
  */
-router.use(requireAdmin);
+router.use(requireAdminRole);
 
 // ── Dashboard ─────────────────────────────────────────────────────────────────
-router.get('/dashboard', getDashboard);
+// Scope: admin:dashboard:read
+// Roles: admin, moderator
+router.get('/dashboard', requireScope('admin:dashboard:read'), getDashboard);
 
 // ── User management ───────────────────────────────────────────────────────────
-router.get('/users', listUsers);
-router.get('/users/:id', getUserDetail);
-router.post('/users/:id/suspend', suspendUser);
-router.post('/users/:id/activate', activateUser);
+// Scope: admin:users:read      → admin, moderator, support
+// Scope: admin:users:suspend   → admin only (HIGH-RISK — dual approval required)
+// Scope: admin:users:activate  → admin, moderator
+router.get('/users', requireScope('admin:users:read'), listUsers);
+router.get('/users/:id', requireScope('admin:users:read'), getUserDetail);
+router.post('/users/:id/suspend', requireScope('admin:users:suspend'), suspendUser);
+router.post('/users/:id/activate', requireScope('admin:users:activate'), activateUser);
 
 // ── Property management ───────────────────────────────────────────────────────
-router.get('/properties', listAdminProperties);
-router.post('/properties/:id/suspend', suspendProperty);
-router.post('/properties/:id/activate', activateProperty);
-
-// ── Featured listings ─────────────────────────────────────────────────────────
-router.put('/properties/:id/featured', setFeaturedHandler);
-router.delete('/properties/:id/featured', clearFeaturedHandler);
+// Scope: admin:properties:read     → admin, moderator, support
+// Scope: admin:properties:suspend  → admin, moderator
+// Scope: admin:properties:activate → admin, moderator
+// Scope: admin:properties:feature  → admin, moderator
+router.get('/properties', requireScope('admin:properties:read'), listAdminProperties);
+router.post('/properties/:id/suspend', requireScope('admin:properties:suspend'), suspendProperty);
+router.post('/properties/:id/activate', requireScope('admin:properties:activate'), activateProperty);
+router.put('/properties/:id/featured', requireScope('admin:properties:feature'), setFeaturedHandler);
+router.delete('/properties/:id/featured', requireScope('admin:properties:feature'), clearFeaturedHandler);
 
 // ── Bookings (admin view) ─────────────────────────────────────────────────────
-router.get('/bookings', listAdminBookings);
+// Scope: admin:bookings:read → admin, moderator, support, finance
+router.get('/bookings', requireScope('admin:bookings:read'), listAdminBookings);
 
 // ── Disputes ──────────────────────────────────────────────────────────────────
-router.get('/disputes', listDisputes);
-router.post('/disputes/:id/resolve', resolveDispute);
+// Scope: admin:disputes:read    → admin, moderator, support, finance
+// Scope: admin:disputes:resolve → admin, moderator (HIGH-RISK — dual approval required)
+router.get('/disputes', requireScope('admin:disputes:read'), listDisputes);
+router.post('/disputes/:id/resolve', requireScope('admin:disputes:resolve'), resolveDispute);
 
 // ── Rate-limit summary ────────────────────────────────────────────────────────
-router.get('/rate-limits', getRateLimitSummary);
+// Scope: admin:ratelimits:read → admin, support
+router.get('/rate-limits', requireScope('admin:ratelimits:read'), getRateLimitSummary);
 
-// ── Search analytics dashboard ────────────────────────────────────────────────
-router.get('/analytics/search/top-queries', getTopQueriesHandler);
-router.get('/analytics/search/zero-results', getZeroResultQueriesHandler);
-router.get('/analytics/search/volume', getSearchVolumeHandler);
-
-// ── Featured listings ─────────────────────────────────────────────────────────
-
-/**
- * @openapi
- * /api/v1/admin/properties/{id}/featured:
- *   put:
- *     tags: [Admin]
- *     summary: Mark a property as featured
- *     description: |
- *       Sets the featured window for a property.  The property will appear
- *       prominently in search results and on the homepage until featured_until
- *       passes.  At most FEATURED_CAP (6) listings surface at any time.
- *     security:
- *       - bearerAuth: []
- *     parameters:
- *       - in: path
- *         name: id
- *         required: true
- *         schema: { type: string, format: uuid }
- *         description: Property UUID
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             required: [featured_until]
- *             properties:
- *               featured_until:
- *                 type: string
- *                 format: date-time
- *                 description: ISO 8601 datetime until which the property is featured (must be future)
- *               weight:
- *                 type: integer
- *                 minimum: 0
- *                 maximum: 100
- *                 default: 0
- *                 description: Ordering tiebreaker — higher value appears first
- *     responses:
- *       200:
- *         description: Property updated with new featured window
- *       400:
- *         description: Missing or invalid fields
- *       422:
- *         description: featured_until is not a future date
- *       401:
- *         description: Missing or invalid token
- *       403:
- *         description: Not an admin
- */
-router.put('/properties/:id/featured', setFeaturedHandler);
-
-/**
- * @openapi
- * /api/v1/admin/properties/{id}/featured:
- *   delete:
- *     tags: [Admin]
- *     summary: Remove featured status from a property
- *     description: |
- *       Immediately clears featured_until and featured_weight.
- *       The property will no longer appear in featured listings.
- *     security:
- *       - bearerAuth: []
- *     parameters:
- *       - in: path
- *         name: id
- *         required: true
- *         schema: { type: string, format: uuid }
- *         description: Property UUID
- *     responses:
- *       200:
- *         description: Featured status removed
- *       400:
- *         description: Invalid property ID
- *       401:
- *         description: Missing or invalid token
- *       403:
- *         description: Not an admin
- */
-router.delete('/properties/:id/featured', clearFeaturedHandler);
-
-// ── Rate-limit summary ────────────────────────────────────────────────────────
-
-/**
- * @openapi
- * /api/v1/admin/rate-limits:
- *   get:
- *     tags: [Admin]
- *     summary: Rate-limit rejection summary
- *     description: |
- *       Returns aggregated counts of rate-limit rejections grouped by route,
- *       method, and limiter scope over a configurable time window.
- *       Identities are hashed — no raw IP addresses or user IDs are exposed.
- *     security:
- *       - bearerAuth: []
- *     parameters:
- *       - in: query
- *         name: window
- *         schema:
- *           type: integer
- *           default: 3600
- *         description: Time window in seconds (max 604800 = 7 days)
- *     responses:
- *       200:
- *         description: Summary payload
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 windowSeconds: { type: integer }
- *                 since: { type: string, format: date-time }
- *                 total: { type: integer }
- *                 alert: { type: boolean }
- *                 byRoute:
- *                   type: array
- *                   items:
- *                     type: object
- *                     properties:
- *                       route: { type: string }
- *                       method: { type: string }
- *                       scope: { type: string }
- *                       count: { type: integer }
- *       401:
- *         description: Missing or invalid token
- *       403:
- *         description: Not an admin
- */
-router.get('/rate-limits', getRateLimitSummary);
-
-// ── Search analytics dashboard ────────────────────────────────────────────────
-
-/**
- * GET /api/v1/admin/analytics/search/top-queries
- * Query: start_date, end_date (ISO datetime), limit (1–100, default 20)
- */
-router.get('/analytics/search/top-queries', getTopQueriesHandler);
-
-/**
- * GET /api/v1/admin/analytics/search/zero-results
- * Query: start_date, end_date (ISO datetime), limit (1–100, default 20)
- */
-router.get('/analytics/search/zero-results', getZeroResultQueriesHandler);
-
-/**
- * GET /api/v1/admin/analytics/search/volume
- * Query: start_date, end_date (ISO datetime)
- */
-router.get('/analytics/search/volume', getSearchVolumeHandler);
+// ── Search analytics ──────────────────────────────────────────────────────────
+// Scope: admin:analytics:read → admin, moderator
+router.get('/analytics/search/top-queries', requireScope('admin:analytics:read'), getTopQueriesHandler);
+router.get('/analytics/search/zero-results', requireScope('admin:analytics:read'), getZeroResultQueriesHandler);
+router.get('/analytics/search/volume', requireScope('admin:analytics:read'), getSearchVolumeHandler);
 
 // ── Audit log ─────────────────────────────────────────────────────────────────
+// Scope: admin:audit:read → admin, moderator, support, finance
+router.get('/audit-logs', requireScope('admin:audit:read'), getAuditLogsHandler);
 
-/**
- * GET /api/v1/admin/audit-logs
- * Query: actorId, action, targetType, targetId (optional filters), limit (default 50, max 200)
- */
-router.get('/audit-logs', getAuditLogsHandler);
+// ── Refund approval (finance) ─────────────────────────────────────────────────
+// Scope: admin:refunds:approve → admin, finance (HIGH-RISK — dual approval required)
+// Body: { booking_id: string, refund_amount: number, reason: string }
+import { approveRefundHandler } from '@/controllers/admin.controller.js';
+router.post('/refunds/approve', requireScope('admin:refunds:approve'), approveRefundHandler);
 
 export default router;

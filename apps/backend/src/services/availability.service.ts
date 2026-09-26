@@ -38,9 +38,12 @@ function parseDate(value: string): Date | null {
   return isNaN(d.getTime()) ? null : d;
 }
 
-/** Returns number of nights between two dates */
-function nightsBetween(checkIn: Date, checkOut: Date): number {
-  return Math.round((checkOut.getTime() - checkIn.getTime()) / 86400000);
+/** Returns number of nights between two dates using UTC calendar boundaries, immune to DST offsets. */
+export function nightsBetween(checkIn: Date, checkOut: Date): number {
+  const msPerDay = 86400000;
+  const inDay = Date.UTC(checkIn.getUTCFullYear(), checkIn.getUTCMonth(), checkIn.getUTCDate());
+  const outDay = Date.UTC(checkOut.getUTCFullYear(), checkOut.getUTCMonth(), checkOut.getUTCDate());
+  return (outDay - inDay) / msPerDay;
 }
 
 export async function getAvailabilityRanges(
@@ -148,6 +151,10 @@ export async function isDateRangeAvailable(
   checkIn: string,
   checkOut: string,
 ): Promise<boolean> {
+  const checkInDate = parseDate(checkIn);
+  const checkOutDate = parseDate(checkOut);
+  if (!checkInDate || !checkOutDate || checkOutDate <= checkInDate) return false;
+
   const { data } = await supabase
     .from('availability_ranges')
     .select('id')

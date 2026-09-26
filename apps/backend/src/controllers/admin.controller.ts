@@ -588,3 +588,140 @@ export async function getDashboard(req: AdminRequest, res: Response): Promise<vo
     },
   });
 }
+
+// ─── Audit log handler ────────────────────────────────────────────────────────
+
+import { listAuditLogs } from '@/services/auditLog.service.js';
+
+/**
+ * GET /api/v1/admin/audit-logs
+ *
+ * Returns paginated audit log entries. Supports optional filters:
+ *   actorId, action, targetType, targetId, limit (default 50, max 200)
+ *
+ * Scope required: admin:audit:read
+ */
+export async function getAuditLogsHandler(req: AdminRequest, res: Response): Promise<void> {
+  const limit = Math.min(200, Math.max(1, Number(req.query.limit ?? 50)));
+
+  const filters = {
+    actorId: typeof req.query.actorId === 'string' ? req.query.actorId : undefined,
+    action: typeof req.query.action === 'string' ? req.query.action : undefined,
+    targetType: typeof req.query.targetType === 'string' ? req.query.targetType : undefined,
+    targetId: typeof req.query.targetId === 'string' ? req.query.targetId : undefined,
+    limit,
+  };
+
+  const result = await listAuditLogs(filters);
+  if (!result.success) {
+    res.status(500).json({ error: { code: 'DB_ERROR', message: result.error } });
+    return;
+  }
+
+  res.json({ data: result.data, meta: { limit } });
+}
+
+// ─── Refund approval ─────────────────────────────────────────────────────────
+
+const approveRefundSchema = z.object({
+  booking_id: z.string().uuid('booking_id must be a valid UUID'),
+  refund_amount: z.number().positive('refund_amount must be positive'),
+  reason: z.string().min(10, 'reason must be at least 10 characters').max(2000),
+});
+
+/**
+ * POST /api/v1/admin/refunds/approve
+ *
+ * Approves a manual refund for a booking.  This is a HIGH-RISK financial
+ * action: the X-Approval-Actor header (dual approval) is enforced by the
+ * requireScope middleware before this handler is reached.
+ *
+ * Scope required: admin:refunds:approve (admin, finance)
+ * Dual approval:  X-Approval-Actor header required
+ *
+ * See: docs/admin-runbooks.md — "Manual Refund Approval" runbook
+ */
+export async function approveRefundHandler(req: AdminRequest, res: Response): Promise<void> {
+  const parsed = approveRefundSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: { code: 'VALIDATION_ERROR', details: parsed.error.flatten().fieldErrors } });
+    return;
+  }
+
+  const { booking_id, refund_amount, reason } = parsed.data;
+  const approvalActorId = (req as AdminRequest & { approvalActorId?: string }).approvalActorId;
+
+  // Verify booking exists and is in a refundable state
+  const { data: booking, error: fetchError } = await supabase
+    .from('bookings')
+    .select('id, status, total_price, tenant_id, escrow_id')
+    .eq('id', booking_id)
+    .single();
+
+  if (fetchError || !booking) {
+    res.status(404).json({ error: { code: 'BOOKING_NOT_FOUND', message: 'Booking not found.' } });
+    return;
+  }
+
+  const allowedStatuses = ['Confirmed', 'Completed', 'Disputed', 'dispute_resolved'];
+  if (!allowedStatuses.includes((booking as { status: string }).status)) {
+    res.status(422).json({
+      error: {
+        code: 'INVALID_STATUS',
+        message: `Cannot approve refund for booking in '${(booking as { status: string }).status}' status.`,
+      },
+    });
+    return;
+  }
+
+  const totalPrice = (booking as { total_price: number }).total_price;
+  if (refund_amount > totalPrice) {
+    res.status(422).json({
+      error: {
+        code: 'REFUND_EXCEEDS_TOTAL',
+        message: `Refund amount (${refund_amount}) exceeds booking total (${totalPrice}).`,
+      },
+    });
+    return;
+  }
+
+  // Record refund approval in audit log with both actors
+  await auditLogger.log({
+    actorId: req.adminId,
+    action: 'payment.confirmed',
+    resourceType: 'payment',
+    resourceId: booking_id,
+    ip: req.ip,
+    meta: {
+      booking_id,
+      refund_amount,
+      reason,
+      approval_actor: approvalActorId,
+      dual_approval: true,
+      action: 'manual_refund_approved',
+    },
+  });
+
+  // Update the booking with refund metadata
+  const { error: updateError } = await supabase
+    .from('bookings')
+    .update({
+      refund_amount,
+      refund_tier: 'admin_approved',
+      refund_policy_pct: refund_amount / totalPrice,
+    })
+    .eq('id', booking_id);
+
+  if (updateError) {
+    res.status(500).json({ error: { code: 'DB_ERROR', message: updateError.message } });
+    return;
+  }
+
+  res.json({
+    message: 'Refund approved.',
+    booking_id,
+    refund_amount,
+    approved_by: req.adminId,
+    co_approved_by: approvalActorId,
+  });
+}

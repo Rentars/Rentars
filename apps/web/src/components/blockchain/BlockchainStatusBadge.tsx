@@ -1,6 +1,6 @@
 'use client';
 
-import { CheckCircle, Clock, AlertCircle, XCircle } from 'lucide-react';
+import { CheckCircle, Clock, AlertCircle, XCircle, HelpCircle } from 'lucide-react';
 import type { BlockchainStatus } from '@/services/blockchain';
 
 interface BlockchainStatusBadgeProps {
@@ -8,6 +8,16 @@ interface BlockchainStatusBadgeProps {
 }
 
 export default function BlockchainStatusBadge({ status }: BlockchainStatusBadgeProps) {
+  // Guard against a null/undefined status object arriving at runtime.
+  if (!status || typeof status !== 'object') {
+    return (
+      <div className="flex items-center gap-1 px-2 py-1 bg-gray-100 text-gray-500 rounded-full text-xs font-medium">
+        <HelpCircle size={12} />
+        Unknown
+      </div>
+    );
+  }
+
   if (status.pending) {
     return (
       <div className="flex items-center gap-1 px-2 py-1 bg-yellow-100 text-yellow-700 rounded-full text-xs font-medium">
@@ -35,10 +45,23 @@ export default function BlockchainStatusBadge({ status }: BlockchainStatusBadgeP
     );
   }
 
+  // verified is explicitly false — the property has not been submitted for verification.
+  if (status.verified === false) {
+    return (
+      <div className="flex items-center gap-1 px-2 py-1 bg-gray-100 text-gray-600 rounded-full text-xs font-medium">
+        <AlertCircle size={12} />
+        Unverified
+      </div>
+    );
+  }
+
+  // Fallback for any future or unrecognised status shape where verified is not
+  // a boolean false (e.g. undefined, or a new flag combination). Ensures the
+  // badge is never blank and clearly communicates an unexpected state.
   return (
-    <div className="flex items-center gap-1 px-2 py-1 bg-gray-100 text-gray-600 rounded-full text-xs font-medium">
-      <AlertCircle size={12} />
-      Unverified
+    <div className="flex items-center gap-1 px-2 py-1 bg-gray-100 text-gray-500 rounded-full text-xs font-medium">
+      <HelpCircle size={12} />
+      Unknown
     </div>
   );
 }

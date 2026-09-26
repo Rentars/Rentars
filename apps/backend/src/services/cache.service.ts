@@ -21,7 +21,10 @@ export async function get<T>(key: string): Promise<T | null> {
   try {
     await ensureConnected();
     const value = await redisClient.get(key);
-    if (!value) return null;
+    // Use strict null check: Redis returns null for missing keys.
+    // A stored value of 0, false, or "" serialises to a non-null string and must
+    // not be discarded by JavaScript's falsy coercion.
+    if (value === null || value === undefined) return null;
     return JSON.parse(value) as T;
   } catch {
     return null;
@@ -38,6 +41,13 @@ export async function get<T>(key: string): Promise<T | null> {
  * await cache.set('properties:all', properties, 60);
  */
 export async function set(key: string, value: unknown, ttlSeconds: number): Promise<void> {
+  // Guard: Redis EX requires a finite positive integer. Zero, negative, fractional,
+  // and infinite values would either be rejected by Redis or silently discard data.
+  if (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0 || !Number.isInteger(ttlSeconds)) {
+    throw new Error(
+      `cache.set: ttlSeconds must be a finite positive integer, got ${ttlSeconds}`,
+    );
+  }
   try {
     await ensureConnected();
     await redisClient.set(key, JSON.stringify(value), { EX: ttlSeconds });
@@ -71,7 +81,10 @@ export async function del(key: string): Promise<void> {
 export async function invalidatePattern(pattern: string): Promise<void> {
   try {
     await ensureConnected();
-    const keys = await redisClient.keys(pattern);
+    const rawKeys = await redisClient.keys(pattern);
+    // Normalise to an empty array in case the client returns null/undefined
+    // on a temporary response anomaly, preventing a runtime exception.
+    const keys: string[] = Array.isArray(rawKeys) ? rawKeys : [];
     if (keys.length > 0) {
       await redisClient.del(keys);
     }

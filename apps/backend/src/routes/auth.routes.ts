@@ -1,17 +1,19 @@
 import { Router } from 'express';
-import { login, register, requestReset, confirmReset, refreshAccessToken, logout } from '@/controllers/auth.controller.js';
+import { login, register, requestReset, confirmReset, refreshAccessToken, logout, logoutAllDevices, verifyEmailHandler } from '@/controllers/auth.controller.js';
 import { walletChallenge, walletVerify } from '@/controllers/wallet.controller.js';
 import {
   loginSchema,
   registerSchema,
   requestPasswordResetSchema,
   confirmPasswordResetSchema,
+  verifyEmailSchema,
   walletChallengeSchema,
   walletVerifySchema,
   validateBody,
 } from '@/validators/auth.validator.js';
 import { authRateLimiter } from '@/middleware/rateLimiter.js';
 import { captchaMiddleware } from '@/middleware/captcha.middleware.js';
+import { authMiddleware } from '@/middleware/auth.middleware.js';
 
 const router = Router();
 
@@ -26,6 +28,12 @@ router.post('/refresh', authRateLimiter, refreshAccessToken);
 
 // POST /api/v1/auth/logout — revoke refresh token
 router.post('/logout', logout);
+
+// POST /api/v1/auth/logout-all-devices — revoke all refresh tokens for user
+router.post('/logout-all-devices', authMiddleware, logoutAllDevices);
+
+// POST /api/v1/auth/verify-email — confirm email address with token
+router.post('/verify-email', validateBody(verifyEmailSchema), verifyEmailHandler);
 
 // POST /api/v1/auth/password-reset/request — CAPTCHA required
 router.post('/password-reset/request', authRateLimiter, validateBody(requestPasswordResetSchema), captchaMiddleware, requestReset);

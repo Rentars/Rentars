@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { redisClient } from '@/config/redis.js';
 import { loggingService } from '@/services/logging.service.js';
 import { rateLimitStore } from '@/services/rateLimitStore.service.js';
+import { rateLimitMetrics } from '@/services/rateLimitMetrics.service.js';
 
 export interface AuthRequest extends Request {
   userId?: string;
@@ -76,8 +77,32 @@ export function hashIdentity(value: string): string {
 }
 
 /**
+ * Apply progressive delay based on consecutive failures.
+ * This increases the cost of brute-force attacks over time.
+ */
+async function getProgressiveDelay(
+  storeKey: string,
+): Promise<number> {
+  const failureCountKey = `${storeKey}:failures`;
+  const failureCount = await redisClient.incr(failureCountKey);
+
+  // Set expiry on failure counter if first failure
+  if (failureCount === 1) {
+    await redisClient.expire(failureCountKey, 3600); // 1 hour
+  }
+
+  // Progressive delays: 0ms, 100ms, 500ms, 1s, 2s, 5s, 10s...
+  const delays = [0, 100, 500, 1000, 2000, 5000, 10000];
+  const delayIndex = Math.min(failureCount - 1, delays.length - 1);
+
+  return delays[delayIndex] || 10000; // Cap at 10 seconds
+}
+
+/**
  * Record a rate-limit rejection and send the 429 response.
  * Identity is hashed before storage — raw IPs/user IDs are never persisted.
+ * Applies progressive delays to discourage brute-force attacks.
+ * Records metrics for monitoring and alerting.
  */
 async function handleRejection(
   req: Request,
@@ -92,6 +117,8 @@ async function handleRejection(
 
   // Record the rejection — identity is hashed for privacy
   const hashedIdentity = hashIdentity(rawIdentity);
+  const storeKey = `abuse:${scope}:${hashedIdentity}`;
+
   await rateLimitStore.record({
     route: req.path,
     method: req.method,
@@ -100,19 +127,30 @@ async function handleRejection(
     timestamp: Date.now(),
   });
 
+  // Track abuse metrics
+  await rateLimitMetrics.recordEvent(req.path, req.method, scope, hashedIdentity);
+
+  // Calculate progressive delay
+  const progressiveDelay = await getProgressiveDelay(storeKey);
+
   loggingService.logBlockchainOperation(
     'rate_limit_exceeded',
-    { scope, route: req.path, method: req.method },
+    { scope, route: req.path, method: req.method, progressiveDelay },
     undefined,
     message,
   );
+
+  // Apply progressive delay before sending response
+  if (progressiveDelay > 0) {
+    await new Promise(resolve => setTimeout(resolve, progressiveDelay));
+  }
 
   res.status(429).json({
     error: {
       code: 'RATE_LIMIT_EXCEEDED',
       message,
       details: {
-        retryAfter: Math.ceil(limiterRes.msBeforeNext / 1000),
+        retryAfter: Math.ceil(limiterRes.msBeforeNext / 1000) + Math.ceil(progressiveDelay / 1000),
       },
     },
   });

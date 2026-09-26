@@ -44,11 +44,16 @@ export interface PriceQuote {
   platform_fee: number;
   total: number;
   breakdown: DayPricing[];
+  timezone?: string;
+  currency?: string;
+  version?: string;
+  expires_at?: string;
+  unavailable_intervals?: Array<{ start: string; end: string; reason: string }>;
 }
 
 /**
  * Calculate price for a date range considering seasonal pricing,
- * special events, and base price. All dates normalized to UTC.
+ * special events, bookings, and availability blocks. All dates normalized to UTC.
  */
 export async function calculateRangePrice(
   propertyId: string,
@@ -91,6 +96,24 @@ export async function calculateRangePrice(
     .lte('start_date', checkOut)
     .gte('end_date', checkIn);
 
+  // Fetch bookings that conflict with the date range
+  const { data: bookings } = await supabase
+    .from('bookings')
+    .select('check_in, check_out')
+    .eq('property_id', propertyId)
+    .neq('status', 'Cancelled')
+    .lt('check_in', checkOut)
+    .gt('check_out', checkIn);
+
+  // Fetch availability blocks
+  const { data: blocks } = await supabase
+    .from('availability_ranges')
+    .select('start_date, end_date')
+    .eq('property_id', propertyId)
+    .eq('is_available', false)
+    .lt('start_date', checkOut)
+    .gt('end_date', checkIn);
+
   const breakdown: DayPricing[] = [];
   let total = 0;
 
@@ -108,6 +131,36 @@ export async function calculateRangePrice(
         price: 0,
         is_available: false,
         reason: `Blocked: ${blockedEvent.name}`,
+      });
+      continue;
+    }
+
+    // Check if booked by another guest
+    const isBooked = bookings?.some(
+      (b) => dateStr >= b.check_in && dateStr < b.check_out,
+    );
+
+    if (isBooked) {
+      breakdown.push({
+        date: dateStr,
+        price: 0,
+        is_available: false,
+        reason: 'Already booked',
+      });
+      continue;
+    }
+
+    // Check if host blocked availability
+    const isBlocked = blocks?.some(
+      (b) => dateStr >= b.start_date && dateStr < b.end_date,
+    );
+
+    if (isBlocked) {
+      breakdown.push({
+        date: dateStr,
+        price: 0,
+        is_available: false,
+        reason: 'Host blocked',
       });
       continue;
     }
@@ -334,9 +387,22 @@ export async function getPropertyQuote(
   start: string,
   end: string,
 ): Promise<ServiceResponse<PriceQuote>> {
+  // Validate dates
+  const checkInDate = new Date(start);
+  const checkOutDate = new Date(end);
+
+  if (isNaN(checkInDate.getTime()) || isNaN(checkOutDate.getTime())) {
+    return { success: false, error: 'Invalid date format (use ISO 8601)' };
+  }
+
+  if (checkInDate >= checkOutDate) {
+    return { success: false, error: 'Check-in date must be before check-out date' };
+  }
+
+  // Fetch property details
   const { data: property, error: propError } = await supabase
     .from('properties')
-    .select('base_price_per_night')
+    .select('base_price_per_night, updated_at')
     .eq('id', propertyId)
     .single();
 
@@ -345,7 +411,50 @@ export async function getPropertyQuote(
   }
 
   const baseRate = (property as { base_price_per_night: number }).base_price_per_night;
+  const propertyUpdatedAt = (property as { updated_at: string }).updated_at;
 
+  // Check for booked dates
+  const { data: bookings } = await supabase
+    .from('bookings')
+    .select('check_in, check_out')
+    .eq('property_id', propertyId)
+    .neq('status', 'Cancelled')
+    .lt('check_in', end)
+    .gt('check_out', start);
+
+  // Check for availability blocks
+  const { data: blocks } = await supabase
+    .from('availability_ranges')
+    .select('start_date, end_date')
+    .eq('property_id', propertyId)
+    .eq('is_available', false)
+    .lt('start_date', end)
+    .gt('end_date', start);
+
+  // Build unavailable intervals list
+  const unavailableIntervals: Array<{ start: string; end: string; reason: string }> = [];
+
+  if (bookings && bookings.length > 0) {
+    for (const booking of bookings as { check_in: string; check_out: string }[]) {
+      unavailableIntervals.push({
+        start: booking.check_in,
+        end: booking.check_out,
+        reason: 'Booking conflict',
+      });
+    }
+  }
+
+  if (blocks && blocks.length > 0) {
+    for (const block of blocks as { start_date: string; end_date: string }[]) {
+      unavailableIntervals.push({
+        start: block.start_date,
+        end: block.end_date,
+        reason: 'Host blocked',
+      });
+    }
+  }
+
+  // Calculate pricing
   const rangeResult = await calculateRangePrice(propertyId, start, end);
   if (!rangeResult.success) return { success: false, error: rangeResult.error };
 
@@ -356,6 +465,10 @@ export async function getPropertyQuote(
   const dynamicAdjustments = Math.round((dynamicTotal - subtotal) * 100) / 100;
   const platformFee = Math.round(dynamicTotal * PLATFORM_FEE_PCT * 100) / 100;
   const total = Math.round((dynamicTotal + platformFee) * 100) / 100;
+
+  // Create quote version hash from property state
+  const quoteVersion = Buffer.from(`${propertyId}:${propertyUpdatedAt}`).toString('base64');
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString(); // 15 min TTL
 
   return {
     success: true,
@@ -368,6 +481,11 @@ export async function getPropertyQuote(
       platform_fee: platformFee,
       total,
       breakdown,
+      timezone: 'UTC',
+      currency: 'USD',
+      version: quoteVersion,
+      expires_at: expiresAt,
+      unavailable_intervals: unavailableIntervals.length > 0 ? unavailableIntervals : undefined,
     },
   };
 }

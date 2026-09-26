@@ -29,6 +29,7 @@ import {
   removePushSubscription,
   savePushSubscription,
   sendPushToUser,
+  validatePushSubscription,
 } from '../../src/services/push.service.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -215,6 +216,269 @@ describe('push.service', () => {
 
       const result = await sendPushToUser('u1', { title: 'Test', body: 'Hello' });
       expect(result.success).toBe(false);
+    });
+
+    it('should remove subscription on 404 response', async () => {
+      const endpoint = 'https://push.example.com/1';
+      const deleteCalls: Array<{ endpoint: string; userId: string }> = [];
+
+      mockFrom.mockImplementation((table: string) => {
+        if (table === 'push_subscriptions') {
+          return {
+            select: mock(() => ({
+              eq: mock(async () => ({
+                data: [
+                  {
+                    id: 's1',
+                    user_id: 'u1',
+                    endpoint,
+                    p256dh: 'k1',
+                    auth: 'a1',
+                  },
+                ],
+                error: null,
+              })),
+            })),
+            delete: mock(() => ({
+              eq: mock((field: string, value: string) => ({
+                eq: mock(async (field2: string, value2: string) => {
+                  if (field === 'user_id' && field2 === 'endpoint') {
+                    deleteCalls.push({ userId: value, endpoint: value2 });
+                  }
+                  return { data: null, error: null };
+                }),
+              })),
+            })),
+          };
+        }
+        return { select: mock(), delete: mock() };
+      });
+
+      process.env.VAPID_PUBLIC_KEY = 'mock-public-key';
+      process.env.VAPID_PRIVATE_KEY = 'mock-private-key';
+
+      // Mock fetch to return 404
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = mock(async () => ({
+        status: 404,
+        ok: false,
+      })) as unknown as typeof fetch;
+
+      const result = await sendPushToUser('u1', { title: 'Test', body: 'Hello' });
+
+      globalThis.fetch = originalFetch;
+      delete process.env.VAPID_PUBLIC_KEY;
+      delete process.env.VAPID_PRIVATE_KEY;
+
+      expect(result.success).toBe(true);
+      expect(result.data).toBe(0);
+      expect(deleteCalls.length).toBe(1);
+      expect(deleteCalls[0]).toEqual({ userId: 'u1', endpoint });
+    });
+
+    it('should remove subscription on 410 response', async () => {
+      const endpoint = 'https://push.example.com/1';
+      const deleteCalls: Array<{ endpoint: string; userId: string }> = [];
+
+      mockFrom.mockImplementation((table: string) => {
+        if (table === 'push_subscriptions') {
+          return {
+            select: mock(() => ({
+              eq: mock(async () => ({
+                data: [
+                  {
+                    id: 's1',
+                    user_id: 'u1',
+                    endpoint,
+                    p256dh: 'k1',
+                    auth: 'a1',
+                  },
+                ],
+                error: null,
+              })),
+            })),
+            delete: mock(() => ({
+              eq: mock((field: string, value: string) => ({
+                eq: mock(async (field2: string, value2: string) => {
+                  if (field === 'user_id' && field2 === 'endpoint') {
+                    deleteCalls.push({ userId: value, endpoint: value2 });
+                  }
+                  return { data: null, error: null };
+                }),
+              })),
+            })),
+          };
+        }
+        return { select: mock(), delete: mock() };
+      });
+
+      process.env.VAPID_PUBLIC_KEY = 'mock-public-key';
+      process.env.VAPID_PRIVATE_KEY = 'mock-private-key';
+
+      // Mock fetch to return 410
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = mock(async () => ({
+        status: 410,
+        ok: false,
+      })) as unknown as typeof fetch;
+
+      const result = await sendPushToUser('u1', { title: 'Test', body: 'Hello' });
+
+      globalThis.fetch = originalFetch;
+      delete process.env.VAPID_PUBLIC_KEY;
+      delete process.env.VAPID_PRIVATE_KEY;
+
+      expect(result.success).toBe(true);
+      expect(result.data).toBe(0);
+      expect(deleteCalls.length).toBe(1);
+      expect(deleteCalls[0]).toEqual({ userId: 'u1', endpoint });
+    });
+
+    it('should not remove subscription on transient errors (e.g., 503)', async () => {
+      const endpoint = 'https://push.example.com/1';
+      const deleteCalls: Array<{ endpoint: string; userId: string }> = [];
+
+      mockFrom.mockImplementation((table: string) => {
+        if (table === 'push_subscriptions') {
+          return {
+            select: mock(() => ({
+              eq: mock(async () => ({
+                data: [
+                  {
+                    id: 's1',
+                    user_id: 'u1',
+                    endpoint,
+                    p256dh: 'k1',
+                    auth: 'a1',
+                  },
+                ],
+                error: null,
+              })),
+            })),
+            delete: mock(() => ({
+              eq: mock((field: string, value: string) => ({
+                eq: mock(async (field2: string, value2: string) => {
+                  if (field === 'user_id' && field2 === 'endpoint') {
+                    deleteCalls.push({ userId: value, endpoint: value2 });
+                  }
+                  return { data: null, error: null };
+                }),
+              })),
+            })),
+          };
+        }
+        return { select: mock(), delete: mock() };
+      });
+
+      process.env.VAPID_PUBLIC_KEY = 'mock-public-key';
+      process.env.VAPID_PRIVATE_KEY = 'mock-private-key';
+
+      // Mock fetch to return 503
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = mock(async () => ({
+        status: 503,
+        ok: false,
+      })) as unknown as typeof fetch;
+
+      const result = await sendPushToUser('u1', { title: 'Test', body: 'Hello' });
+
+      globalThis.fetch = originalFetch;
+      delete process.env.VAPID_PUBLIC_KEY;
+      delete process.env.VAPID_PRIVATE_KEY;
+
+      expect(result.success).toBe(true);
+      expect(result.data).toBe(0);
+      expect(deleteCalls.length).toBe(0);
+    });
+  });
+
+  // ── validatePushSubscription ────────────────────────────────────────────
+
+  describe('validatePushSubscription', () => {
+    it('should accept a valid HTTPS subscription', () => {
+      const result = validatePushSubscription(mockSubscription);
+      expect(result).toBeNull();
+    });
+
+    it('should reject a subscription with blank endpoint', () => {
+      const result = validatePushSubscription({
+        endpoint: '   ',
+        keys: {
+          p256dh: 'base64-p256dh-key',
+          auth: 'base64-auth-secret',
+        },
+      });
+      expect(result).toBe('endpoint cannot be blank');
+    });
+
+    it('should reject a subscription with HTTP endpoint', () => {
+      const result = validatePushSubscription({
+        endpoint: 'http://push.example.com/subscription/abc',
+        keys: {
+          p256dh: 'base64-p256dh-key',
+          auth: 'base64-auth-secret',
+        },
+      });
+      expect(result).toBe('endpoint must use HTTPS protocol');
+    });
+
+    it('should reject a subscription with missing endpoint', () => {
+      const result = validatePushSubscription({
+        keys: {
+          p256dh: 'base64-p256dh-key',
+          auth: 'base64-auth-secret',
+        },
+      });
+      expect(result).toBe('endpoint is required and must be a string');
+    });
+
+    it('should reject a subscription with empty string endpoint', () => {
+      const result = validatePushSubscription({
+        endpoint: '',
+        keys: {
+          p256dh: 'base64-p256dh-key',
+          auth: 'base64-auth-secret',
+        },
+      });
+      expect(result).toBe('endpoint is required and must be a string');
+    });
+
+    it('should reject a subscription with non-URL endpoint string', () => {
+      const result = validatePushSubscription({
+        endpoint: 'not-a-url',
+        keys: {
+          p256dh: 'base64-p256dh-key',
+          auth: 'base64-auth-secret',
+        },
+      });
+      expect(result).toBe('endpoint must be a valid HTTPS URL');
+    });
+
+    it('should reject a subscription with missing keys', () => {
+      const result = validatePushSubscription({
+        endpoint: 'https://push.example.com/subscription/abc',
+      });
+      expect(result).toBe('keys object is required');
+    });
+
+    it('should reject a subscription with missing p256dh key', () => {
+      const result = validatePushSubscription({
+        endpoint: 'https://push.example.com/subscription/abc',
+        keys: {
+          auth: 'base64-auth-secret',
+        },
+      });
+      expect(result).toBe('keys.p256dh is required and must be a string');
+    });
+
+    it('should reject a subscription with missing auth key', () => {
+      const result = validatePushSubscription({
+        endpoint: 'https://push.example.com/subscription/abc',
+        keys: {
+          p256dh: 'base64-p256dh-key',
+        },
+      });
+      expect(result).toBe('keys.auth is required and must be a string');
     });
   });
 });

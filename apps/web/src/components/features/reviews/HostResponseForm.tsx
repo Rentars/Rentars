@@ -17,11 +17,12 @@ export default function HostResponseForm({ reviewId, onSuccess }: HostResponseFo
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!response.trim()) {
+    const trimmed = response.trim();
+    if (!trimmed) {
       setError('Response cannot be empty');
       return;
     }
-    if (response.trim().length > 1000) {
+    if (trimmed.length > 1000) {
       setError('Response must be at most 1000 characters');
       return;
     }
@@ -33,7 +34,7 @@ export default function HostResponseForm({ reviewId, onSuccess }: HostResponseFo
       const res = await fetch(`${API_URL}/api/v1/reviews/${reviewId}/response`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ response: response.trim() }),
+        body: JSON.stringify({ response: trimmed }),
       });
 
       if (!res.ok) {
@@ -42,7 +43,7 @@ export default function HostResponseForm({ reviewId, onSuccess }: HostResponseFo
       }
 
       const saved = await res.json();
-      onSuccess?.(saved.host_response ?? response.trim());
+      onSuccess?.(saved.host_response ?? trimmed);
       setResponse('');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to submit response');

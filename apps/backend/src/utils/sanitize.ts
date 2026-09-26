@@ -30,8 +30,37 @@ function stripTags(input: string): string {
     .replace(/&amp;/gi, '&')
     .replace(/&quot;/gi, '"')
     .replace(/&#x27;/gi, "'")
-    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
-    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+    .replace(/&#(\d+);/g, (match, code) => {
+      const codePoint = Number(code);
+      // Reject out-of-range values: valid Unicode is 0x000000–0x10FFFF.
+      // Also reject C0/C1 control characters (0x00–0x1F, 0x7F–0x9F) that
+      // have no legitimate use in user-visible text and can inject
+      // malformed bytes or evade subsequent tag-stripping (issue #481).
+      if (
+        !Number.isInteger(codePoint) ||
+        codePoint < 0x20 ||        // below space: control chars
+        (codePoint >= 0x7F && codePoint <= 0x9F) || // DEL + C1 controls
+        codePoint > 0x10FFFF ||    // beyond Unicode range
+        (codePoint >= 0xD800 && codePoint <= 0xDFFF) // surrogate range
+      ) {
+        return match; // leave the entity as-is
+      }
+      return String.fromCodePoint(codePoint);
+    })
+    .replace(/&#x([0-9a-f]+);/gi, (match, hex) => {
+      const codePoint = parseInt(hex, 16);
+      // Apply the same validity checks as the decimal entity handler.
+      if (
+        !Number.isInteger(codePoint) ||
+        codePoint < 0x20 ||
+        (codePoint >= 0x7F && codePoint <= 0x9F) ||
+        codePoint > 0x10FFFF ||
+        (codePoint >= 0xD800 && codePoint <= 0xDFFF)
+      ) {
+        return match; // leave the entity as-is
+      }
+      return String.fromCodePoint(codePoint);
+    });
 
   // Remove everything that looks like a tag (including multi-line tags)
   // eslint-disable-next-line no-control-regex

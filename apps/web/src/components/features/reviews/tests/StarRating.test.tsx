@@ -56,6 +56,21 @@ describe('StarRating', () => {
     expect(onChange).toHaveBeenCalledWith(5);
   });
 
+  it('clamps ratings below zero to no filled stars', () => {
+    const { container } = render(<StarRating rating={-1} max={5} />);
+    expect(container.querySelectorAll('svg.fill-yellow-400')).toHaveLength(0);
+  });
+
+  it('clamps ratings above max to the maximum number of filled stars', () => {
+    const { container } = render(<StarRating rating={8} max={5} />);
+    expect(container.querySelectorAll('svg.fill-yellow-400')).toHaveLength(5);
+  });
+
+  it('preserves valid ratings within the configured range', () => {
+    const { container } = render(<StarRating rating={3} max={5} />);
+    expect(container.querySelectorAll('svg.fill-yellow-400')).toHaveLength(3);
+  });
+
   it('applies filled styling to stars below or equal to rating', () => {
     const { container } = render(<StarRating rating={3} />);
     // Stars 1-3 should be filled (yellow), 4-5 should be empty (gray)

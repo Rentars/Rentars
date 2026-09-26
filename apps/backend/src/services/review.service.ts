@@ -2,6 +2,8 @@ import { supabase } from '../config/supabase.js';
 import * as cache from './cache.service.js';
 import type { ServiceResponse } from './index.js';
 import { sanitizeLongText, sanitizeResponse } from '../utils/sanitize.js';
+import type { PaginatedResult } from '../types/pagination.js';
+import { executePaginatedQuery } from '../utils/pagination.js';
 
 export type ModerationStatus = 'pending' | 'approved' | 'rejected';
 
@@ -17,6 +19,7 @@ export interface Review {
   host_response?: string;
   host_response_at?: string;
   is_flagged?: boolean;
+  flag_reason?: string;
   is_approved?: boolean;
   moderation_status?: ModerationStatus;
   moderation_reason?: string;
@@ -35,8 +38,14 @@ export async function submitReview(
     return { success: false, error: 'Rating must be between 1 and 5' };
   }
 
-  // Sanitize user-supplied text; enforce max 2000 chars for review comments
+  // Sanitize user-supplied text; enforce max 2000 chars for review comments.
+  // Trim happens inside sanitizeLongText, so validate length on the cleaned
+  // value — a whitespace-only comment must be rejected here, not stored as
+  // an empty string after the DB round-trip.
   const cleanComment = sanitizeLongText(comment, 2_000);
+  if (cleanComment.length === 0) {
+    return { success: false, error: 'Comment is required' };
+  }
 
   // Verify booking belongs to reviewer
   const { data: booking, error: bookingError } = await supabase
@@ -104,28 +113,30 @@ export async function submitReview(
   return { success: true, data: data as Review };
 }
 
-export async function getReviewsForProperty(propertyId: string): Promise<ServiceResponse<Review[]>> {
-  const { data, error } = await supabase
+export async function getReviewsForProperty(propertyId: string, page = 1, pageSize = 20): Promise<ServiceResponse<PaginatedResult<Review>>> {
+  const query = supabase
     .from('reviews')
-    .select('*')
+    .select('*', { count: 'exact' })
     .eq('property_id', propertyId)
     .eq('moderation_status', 'approved')
     .order('created_at', { ascending: false });
 
-  if (error) return { success: false, error: error.message };
-  return { success: true, data: (data ?? []) as Review[] };
+  const response = await executePaginatedQuery(query, page, pageSize);
+  if (response.error) return { success: false, error: response.error };
+  return { success: true, data: response.result };
 }
 
-export async function getReviewsForUser(userId: string): Promise<ServiceResponse<Review[]>> {
-  const { data, error } = await supabase
+export async function getReviewsForUser(userId: string, page = 1, pageSize = 20): Promise<ServiceResponse<PaginatedResult<Review>>> {
+  const query = supabase
     .from('reviews')
-    .select('*')
+    .select('*', { count: 'exact' })
     .eq('target_id', userId)
     .eq('moderation_status', 'approved')
     .order('created_at', { ascending: false });
 
-  if (error) return { success: false, error: error.message };
-  return { success: true, data: (data ?? []) as Review[] };
+  const response = await executePaginatedQuery(query, page, pageSize);
+  if (response.error) return { success: false, error: response.error };
+  return { success: true, data: response.result };
 }
 
 export async function getAverageRating(userId: string): Promise<ServiceResponse<number>> {
@@ -136,9 +147,12 @@ export async function getAverageRating(userId: string): Promise<ServiceResponse<
     .eq('is_approved', true);
 
   if (error) return { success: false, error: error.message };
+  // Return zero for both null responses and empty arrays so callers always
+  // receive a valid numeric zero rather than NaN for unrated properties.
   if (!data || data.length === 0) return { success: true, data: 0 };
 
-  const avg = (data as { rating: number }[]).reduce((sum, r) => sum + r.rating, 0) / data.length;
+  const rows = data as { rating: number }[];
+  const avg = rows.reduce((sum, r) => sum + r.rating, 0) / rows.length;
   return { success: true, data: Math.round(avg * 10) / 10 };
 }
 
@@ -158,7 +172,7 @@ export async function addHostResponse(
 
   const { data: review, error: reviewError } = await supabase
     .from('reviews')
-    .select('id, target_id, property_id')
+    .select('id, target_id, property_id, host_response')
     .eq('id', reviewId)
     .single();
 
@@ -166,7 +180,16 @@ export async function addHostResponse(
     return { success: false, error: 'Review not found' };
   }
 
-  const r = review as { id: string; target_id: string; property_id: string | null };
+  const r = review as {
+    id: string;
+    target_id: string;
+    property_id: string | null;
+    host_response: string | null;
+  };
+
+  if (r.host_response) {
+    return { success: false, error: 'This review already has a host response' };
+  }
 
   // Verify host owns the reviewed property; fall back to target_id check when no property
   if (r.property_id) {
@@ -193,10 +216,14 @@ export async function addHostResponse(
     .from('reviews')
     .update({ host_response: cleanResponse, host_response_at: new Date().toISOString() })
     .eq('id', reviewId)
+    .is('host_response', null)
     .select()
     .single();
 
   if (error) return { success: false, error: error.message };
+  if (!data) {
+    return { success: false, error: 'This review already has a host response' };
+  }
 
   // Notify the reviewer that the host has responded
   try {
@@ -218,10 +245,16 @@ export async function addHostResponse(
 export async function flagReview(
   reviewId: string,
   reporterId: string,
+  reason: string,
 ): Promise<ServiceResponse<void>> {
+  const trimmedReason = reason?.trim();
+  if (!trimmedReason) {
+    return { success: false, error: 'Flag reason is required' };
+  }
+
   const { error } = await supabase
     .from('reviews')
-    .update({ is_flagged: true })
+    .update({ is_flagged: true, flag_reason: trimmedReason })
     .eq('id', reviewId);
 
   if (error) return { success: false, error: error.message };

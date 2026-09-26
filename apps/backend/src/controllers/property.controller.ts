@@ -12,6 +12,8 @@ import {
   getFeaturedProperties,
   setFeatured,
   clearFeatured,
+  getPropertyVersionHistory,
+  rollbackToVersion,
   FEATURED_CAP,
   type AdvancedSearchFilters,
   type Property,
@@ -35,21 +37,31 @@ import type { AuthRequest } from '@/middleware/auth.middleware.js';
  *  1. The property's owner/host
  *  2. A tenant with a Confirmed booking on the property
  */
+/**
+ * Determine the location precision tier for a viewer.
+ *
+ * - host   : property owner or platform admin — full exact coordinates
+ * - booking: tenant with a Pending or Confirmed booking — exact coordinates
+ *            so they can navigate to the property for their upcoming/active stay
+ * - public : everyone else — approximate coordinates only
+ */
 async function viewerHasExactLocationAccess(
   propertyId: string,
   ownerId: string | undefined,
   viewerUserId: string | undefined,
 ): Promise<boolean> {
   if (!viewerUserId) return false;
+  // Host tier: property owner always sees exact coordinates.
   if (ownerId && viewerUserId === ownerId) return true;
 
-  // Check for a confirmed booking
+  // Booking tier: tenants with an active or upcoming booking see exact coords.
+  // Pending is included so tenants can navigate before host confirmation.
   const { data } = await supabase
     .from('bookings')
     .select('id')
     .eq('property_id', propertyId)
     .eq('tenant_id', viewerUserId)
-    .eq('status', 'Confirmed')
+    .in('status', ['Pending', 'Confirmed'])
     .limit(1);
 
   return Array.isArray(data) && data.length > 0;
@@ -90,18 +102,42 @@ function applyLocationPrivacyToList(properties: Property[]): Record<string, unkn
 
 export async function getProperties(req: Request, res: Response): Promise<void> {
   const { city, country, min_price, max_price, bedrooms, min_bathrooms, property_type, status } = req.query;
+  const pagination = (req as Request & { parsedPagination?: { page: number; pageSize: number } }).parsedPagination;
   const hasFilters = city || country || min_price || max_price || bedrooms || min_bathrooms || property_type || status;
 
   if (hasFilters) {
+    // Parse and validate price bounds (#420)
+    const parsedMinPrice = min_price !== undefined ? Number(min_price) : undefined;
+    const parsedMaxPrice = max_price !== undefined ? Number(max_price) : undefined;
+
+    if (parsedMinPrice !== undefined && (!Number.isFinite(parsedMinPrice) || parsedMinPrice < 0)) {
+      res.status(400).json({ error: 'min_price must be a non-negative number' });
+      return;
+    }
+    if (parsedMaxPrice !== undefined && (!Number.isFinite(parsedMaxPrice) || parsedMaxPrice < 0)) {
+      res.status(400).json({ error: 'max_price must be a non-negative number' });
+      return;
+    }
+    if (
+      parsedMinPrice !== undefined &&
+      parsedMaxPrice !== undefined &&
+      parsedMinPrice > parsedMaxPrice
+    ) {
+      res.status(400).json({ error: 'min_price must be less than or equal to max_price' });
+      return;
+    }
+
     const result = await searchProperties({
       city: city as string | undefined,
       country: country as string | undefined,
-      min_price: min_price ? Number(min_price) : undefined,
-      max_price: max_price ? Number(max_price) : undefined,
+      min_price: parsedMinPrice,
+      max_price: parsedMaxPrice,
       bedrooms: bedrooms ? Number(bedrooms) : undefined,
       min_bathrooms: min_bathrooms ? Number(min_bathrooms) : undefined,
       property_type: property_type as string | undefined,
       status: status as string | undefined,
+      page: pagination?.page ?? 1,
+      pageSize: pagination?.pageSize ?? 20,
     });
 
     if (!result.success) {
@@ -109,17 +145,17 @@ export async function getProperties(req: Request, res: Response): Promise<void> 
       return;
     }
 
-    res.json(applyLocationPrivacyToList(result.data));
+    res.json({ ...result.data, data: applyLocationPrivacyToList(result.data.data) });
     return;
   }
 
-  const result = await getAllProperties();
+  const result = await getAllProperties(pagination?.page ?? 1, pagination?.pageSize ?? 20);
   if (!result.success) {
     res.status(500).json({ error: result.error });
     return;
   }
 
-  res.json(applyLocationPrivacyToList(result.data));
+  res.json({ ...result.data, data: applyLocationPrivacyToList(result.data.data) });
 }
 
 // ─── Featured ─────────────────────────────────────────────────────────────────
@@ -188,7 +224,7 @@ export async function createPropertyHandler(req: AuthRequest, res: Response): Pr
 }
 
 export async function updatePropertyHandler(req: AuthRequest, res: Response): Promise<void> {
-  const result = await updateProperty(req.params.id, req.body);
+  const result = await updateProperty(req.params.id, req.body, req.userId);
   if (!result.success) {
     res.status(400).json({ error: result.error });
     return;
@@ -203,6 +239,57 @@ export async function deletePropertyHandler(req: Request, res: Response): Promis
     return;
   }
   res.status(204).send();
+}
+
+// ─── Bounds Search ───────────────────────────────────────────────────────────
+
+/**
+ * GET /api/v1/properties/search/bounds
+ *
+ * Returns properties whose coordinates fall within a map viewport bounding box.
+ * Used by the map view to populate markers as the user pans or zooms.
+ *
+ * Query params: north, south, east, west (all required, decimal degrees)
+ * Coordinates in the response are always redacted — map markers must use the
+ * approximate_latitude / approximate_longitude fields from the privacy layer.
+ */
+export async function boundsSearchHandler(req: Request, res: Response): Promise<void> {
+  const { north, south, east, west } = req.query;
+
+  const parsedNorth = Number(north);
+  const parsedSouth = Number(south);
+  const parsedEast  = Number(east);
+  const parsedWest  = Number(west);
+
+  if (
+    !Number.isFinite(parsedNorth) || !Number.isFinite(parsedSouth) ||
+    !Number.isFinite(parsedEast)  || !Number.isFinite(parsedWest)
+  ) {
+    res.status(400).json({ error: 'north, south, east, and west query params are required and must be numbers' });
+    return;
+  }
+
+  if (parsedSouth >= parsedNorth) {
+    res.status(400).json({ error: 'south must be less than north' });
+    return;
+  }
+
+  const result = await advancedSearch({
+    bounds: { north: parsedNorth, south: parsedSouth, east: parsedEast, west: parsedWest },
+    limit: 200,
+  });
+
+  if (!result.success || !result.data) {
+    res.status(500).json({ error: result.error ?? 'Search failed' });
+    return;
+  }
+
+  // Map markers are public — always redact exact coordinates.
+  const redacted = result.data.data.map((p) =>
+    redactExactCoordinates(p as { id: string; latitude?: number; longitude?: number }) as unknown as Record<string, unknown>,
+  );
+
+  res.json({ data: redacted, count: redacted.length });
 }
 
 // ─── Advanced Search ──────────────────────────────────────────────────────────
@@ -512,6 +599,137 @@ export async function getOccupancyHeatmapHandler(req: Request, res: Response): P
   if (!result.success) {
     const status = result.error?.includes('required') || result.error?.includes('Invalid') ? 422 : 500;
     res.status(status).json({ error: result.error });
+    return;
+  }
+
+  res.json(result.data);
+}
+
+// ─── Draft Management ─────────────────────────────────────────────────────────
+
+export async function createDraftHandler(req: AuthRequest, res: Response): Promise<void> {
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const { title } = req.body;
+  if (!title || typeof title !== 'string') {
+    res.status(400).json({ error: 'Title is required' });
+    return;
+  }
+
+  const { createDraftProperty } = await import('../services/property.service.js');
+  const result = await createDraftProperty(userId, title);
+
+  if (!result.success) {
+    res.status(400).json({ error: result.error });
+    return;
+  }
+
+  res.status(201).json(result.data);
+}
+
+export async function getHostDraftsHandler(req: AuthRequest, res: Response): Promise<void> {
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const { getHostDrafts, getDraftCompletionStatus } = await import('../services/property.service.js');
+  const result = await getHostDrafts(userId);
+
+  if (!result.success) {
+    res.status(500).json({ error: result.error });
+    return;
+  }
+
+  const draftsWithStatus = result.data.map((draft) => ({
+    ...draft,
+    completion: getDraftCompletionStatus(draft),
+  }));
+
+  res.json(draftsWithStatus);
+}
+
+export async function publishDraftHandler(req: AuthRequest, res: Response): Promise<void> {
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const { publishDraft } = await import('../services/property.service.js');
+  const result = await publishDraft(userId, req.params.id);
+
+  if (!result.success) {
+    res.status(400).json({ error: result.error });
+    return;
+  }
+
+  res.json(result.data);
+}
+
+// ─── Version history ──────────────────────────────────────────────────────────
+
+/**
+ * GET /api/v1/properties/:id/versions
+ *
+ * Returns the version history for a property, newest first.
+ * Only the property owner and platform admins may access this.
+ */
+export async function getPropertyVersionsHandler(req: AuthRequest, res: Response): Promise<void> {
+  const viewerId = req.userId;
+  if (!viewerId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const propertyResult = await getPropertyById(req.params.id);
+  if (!propertyResult.success || !propertyResult.data) {
+    res.status(404).json({ error: propertyResult.error ?? 'Property not found' });
+    return;
+  }
+
+  const isOwner = propertyResult.data.owner_id === viewerId;
+  const isAdmin = ['admin', 'moderator'].includes((req as AuthRequest & { user?: { role?: string } }).user?.role ?? '');
+
+  if (!isOwner && !isAdmin) {
+    res.status(403).json({ error: 'Forbidden: only the property owner or an admin may view version history' });
+    return;
+  }
+
+  const limit = req.query.limit ? Math.min(Number(req.query.limit), 100) : 50;
+  const result = await getPropertyVersionHistory(req.params.id, limit);
+
+  if (!result.success) {
+    res.status(500).json({ error: result.error });
+    return;
+  }
+
+  res.json(result.data);
+}
+
+/**
+ * POST /api/v1/properties/:id/versions/:versionId/rollback
+ *
+ * Restore a property to a prior version.  Creates a new version record rather
+ * than mutating history.  Only the property owner may roll back.
+ */
+export async function rollbackPropertyVersionHandler(req: AuthRequest, res: Response): Promise<void> {
+  const actorId = req.userId;
+  if (!actorId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const result = await rollbackToVersion(req.params.id, req.params.versionId, actorId);
+
+  if (!result.success) {
+    const statusCode = result.statusCode ?? (result.error?.startsWith('Forbidden') ? 403 : 400);
+    res.status(statusCode).json({ error: result.error });
     return;
   }
 

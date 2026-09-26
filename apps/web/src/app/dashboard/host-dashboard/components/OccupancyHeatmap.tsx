@@ -81,21 +81,29 @@ function useHeatmapData(propertyId: string, from: string, to: string) {
   useEffect(() => {
     if (!propertyId || !from || !to) return;
 
+    const controller = new AbortController();
     setLoading(true);
     setError(null);
 
     const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null;
     fetch(
       `${API_URL}/api/v1/properties/${propertyId}/occupancy-heatmap?from=${from}&to=${to}`,
-      { headers: token ? { Authorization: `Bearer ${token}` } : {} },
+      {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        signal: controller.signal,
+      },
     )
       .then((r) => {
         if (!r.ok) throw new Error(`Failed to load occupancy data (${r.status})`);
         return r.json() as Promise<HeatmapData>;
       })
       .then(setData)
-      .catch((e: Error) => setError(e.message))
+      .catch((e: Error) => {
+        if (e.name !== 'AbortError') setError(e.message);
+      })
       .finally(() => setLoading(false));
+
+    return () => controller.abort();
   }, [propertyId, from, to]);
 
   return { data, loading, error };

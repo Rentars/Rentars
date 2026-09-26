@@ -15,3 +15,10 @@ export const createReviewSchema = z.object({
   comment: z.string().max(2000, 'Comment must be at most 2000 characters').optional(),
   propertyId: z.string().uuid('propertyId must be a valid UUID').optional(),
 });
+
+export const flagReviewSchema = z.object({
+  reason: z
+    .string({ required_error: 'reason is required' })
+    .trim()
+    .min(1, 'Flag reason cannot be blank'),
+});

@@ -96,7 +96,7 @@ export default function HostDashboard() {
         {/* Available Balance (kept from existing earnings flow) */}
         <AvailableBalance
           amount={summary?.net_revenue ?? mockHostData.earningsStats.pendingPayout}
-          onWithdraw={() => console.log('Withdraw clicked')}
+          onWithdraw={() => {}}
         />
 
         {/* Booking Stats — use real active count when available */}
@@ -169,7 +169,7 @@ export default function HostDashboard() {
         </div>
 
         {/* Payment Methods */}
-        <PaymentMethods onAddMethod={() => console.log('Add payment method')} />
+        <PaymentMethods onAddMethod={() => {}} />
       </div>
 
       <AddPropertyModal

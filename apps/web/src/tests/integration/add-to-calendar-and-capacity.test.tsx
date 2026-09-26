@@ -93,6 +93,20 @@ describe('AddToCalendar', () => {
     expect(screen.queryByRole('menu')).not.toBeInTheDocument();
   });
 
+  it('preserves the exact end time for datetime Google Calendar values', async () => {
+    render(
+      <AddToCalendar
+        {...defaultProps}
+        checkIn="2027-09-10T15:30:00Z"
+        checkOut="2027-09-15T11:45:00Z"
+      />,
+    );
+    await user.click(screen.getByRole('button', { name: /add to calendar/i }));
+    const gcalLink = screen.getByRole('menuitem', { name: /google calendar/i }) as HTMLAnchorElement;
+    expect(gcalLink.href).toContain('20270910T153000Z');
+    expect(gcalLink.href).toContain('20270915T114500Z');
+  });
+
   it('Google Calendar link has correct prefilled parameters', async () => {
     render(<AddToCalendar {...defaultProps} />);
     await user.click(screen.getByRole('button', { name: /add to calendar/i }));
@@ -311,6 +325,8 @@ describe('BookingForm — guest capacity enforcement', () => {
     );
 
     const guestInput = screen.getByLabelText(/guests/i) as HTMLInputElement;
+    expect(guestInput.min).toBe('1');
+    expect(guestInput.step).toBe('1');
     expect(guestInput.max).toBe('3');
   });
 });

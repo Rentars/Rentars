@@ -44,6 +44,8 @@ export interface ReceiptData {
   total:           number;
   guestCount:      number;
   status:          string;
+  tenantName?:     string;
+  tenantEmail?:    string;
   escrowId?:       string;
   onChainId?:      number;
   createdAt:       string;
@@ -51,12 +53,26 @@ export interface ReceiptData {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-function calcNights(checkIn: string, checkOut: string): number {
+/**
+ * Count the number of nights between two ISO date strings.
+ *
+ * Uses UTC-normalised date-only arithmetic so that DST transitions
+ * (where a wall-clock day can be 23 or 25 hours long) never produce an
+ * off-by-one result. Each "date" is treated as midnight UTC, regardless of
+ * local timezone or DST rules.
+ *
+ * Returns at least 1 to handle same-day edge cases gracefully.
+ */
+export function calcNights(checkIn: string, checkOut: string): number {
+  // Parse only the date portion (YYYY-MM-DD) and interpret it as UTC
+  // midnight so DST offsets cannot inflate or deflate the difference.
+  const parseUTCDate = (iso: string): number => {
+    const [y, m, d] = iso.slice(0, 10).split('-').map(Number);
+    return Date.UTC(y, m - 1, d);
+  };
   const msPerDay = 86_400_000;
-  return Math.max(
-    1,
-    Math.round((new Date(checkOut).getTime() - new Date(checkIn).getTime()) / msPerDay),
-  );
+  const diff = parseUTCDate(checkOut) - parseUTCDate(checkIn);
+  return Math.max(1, Math.round(diff / msPerDay));
 }
 
 function fmtDate(iso: string): string {
@@ -100,6 +116,18 @@ export async function fetchReceiptData(
   const total        = b.total_price ?? subtotal + platformFee;
   const address      = [prop?.address, prop?.city, prop?.country].filter(Boolean).join(', ');
 
+  // Fetch tenant display name and email for participant details on the receipt
+  let tenantName:  string | undefined;
+  let tenantEmail: string | undefined;
+  if (b.tenant_id) {
+    const [profileResult, userResult] = await Promise.all([
+      supabase.from('profiles').select('display_name').eq('user_id', b.tenant_id).maybeSingle(),
+      supabase.from('users').select('email').eq('id', b.tenant_id).maybeSingle(),
+    ]);
+    tenantName  = (profileResult.data as { display_name?: string } | null)?.display_name ?? undefined;
+    tenantEmail = (userResult.data   as { email?: string }         | null)?.email         ?? undefined;
+  }
+
   return {
     success: true,
     data: {
@@ -115,6 +143,8 @@ export async function fetchReceiptData(
       total,
       guestCount:  b.guest_count,
       status:      b.status,
+      tenantName,
+      tenantEmail,
       escrowId:    b.escrow_id,
       onChainId:   b.on_chain_id,
       createdAt:   b.created_at,
@@ -158,6 +188,21 @@ export function generateReceiptPdf(data: ReceiptData): Buffer {
   if (data.propertyAddress) {
     pdf.text(data.propertyAddress, ML, y, { size: 9, colour: MUTED });
     y += 14;
+  }
+  y += 4;
+
+  // ── Tenant info ──────────────────────────────────────────────────────────
+  if (data.tenantName || data.tenantEmail) {
+    pdf.text('Guest', ML, y, { size: 7, colour: MUTED });
+    y += 11;
+    if (data.tenantName) {
+      pdf.text(data.tenantName, ML, y, { size: 10, bold: true, colour: DARK });
+      y += 14;
+    }
+    if (data.tenantEmail) {
+      pdf.text(data.tenantEmail, ML, y, { size: 8, colour: MUTED });
+      y += 12;
+    }
   }
   y += 8;
 

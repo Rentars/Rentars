@@ -17,6 +17,7 @@ import {
   blockAvailabilityRange,
   deleteAvailabilityRange,
   isDateRangeAvailable,
+  nightsBetween,
 } from '../../src/services/availability.service.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -400,5 +401,46 @@ describe('availability.service', () => {
       const available = await isDateRangeAvailable('prop-1', '2026-10-01', '2026-10-10');
       expect(available).toBe(false);
     });
+  });
+});
+
+// ── nightsBetween — DST boundary (#414) ────────────────────────────────────
+
+describe('nightsBetween', () => {
+  it('adjacent calendar dates always produce 1 night', () => {
+    expect(nightsBetween(new Date('2026-03-08'), new Date('2026-03-09'))).toBe(1);
+  });
+
+  it('returns 1 night even when time components cross a DST offset', () => {
+    // Spring-forward day: local midnight UTC-5 → UTC-4; difference is 23 h in wall-clock time.
+    // UTC floor ensures we count calendar days, not elapsed hours.
+    const checkIn = new Date('2026-03-08T05:00:00Z');  // midnight US/Eastern before spring forward
+    const checkOut = new Date('2026-03-09T04:00:00Z'); // midnight US/Eastern after spring forward
+    expect(nightsBetween(checkIn, checkOut)).toBe(1);
+  });
+
+  it('returns 1 night even when the interval is 25 h (fall-back day)', () => {
+    // Fall-back day: local midnight UTC-4 → UTC-5; difference is 25 h in wall-clock time.
+    const checkIn = new Date('2026-11-01T04:00:00Z');  // midnight US/Eastern before fall back
+    const checkOut = new Date('2026-11-02T05:00:00Z'); // midnight US/Eastern after fall back
+    expect(nightsBetween(checkIn, checkOut)).toBe(1);
+  });
+
+  it('returns the correct count for a multi-night range', () => {
+    expect(nightsBetween(new Date('2026-06-01'), new Date('2026-06-08'))).toBe(7);
+  });
+});
+
+// ── isDateRangeAvailable — ordering guard (#413) ────────────────────────────
+
+describe('isDateRangeAvailable — ordering guard', () => {
+  it('returns false for equal check-in and check-out without querying the DB', async () => {
+    const available = await isDateRangeAvailable('prop-1', '2026-09-01', '2026-09-01');
+    expect(available).toBe(false);
+  });
+
+  it('returns false for reversed dates (check-out before check-in) without querying the DB', async () => {
+    const available = await isDateRangeAvailable('prop-1', '2026-09-10', '2026-09-01');
+    expect(available).toBe(false);
   });
 });

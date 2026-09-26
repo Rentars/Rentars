@@ -125,6 +125,36 @@ describe('emailLayout', () => {
       });
       expect(html).toContain('Support');
     });
+
+    it('converts relative preference URLs to absolute', () => {
+      const relativeUrl = '/preferences/manage?token=xyz789';
+      const { html } = renderEmail({
+        title: 'Booking',
+        body: '<p>hi</p>',
+        preferencesUrl: relativeUrl,
+      });
+      expect(html).toContain('https://rentars.app/preferences/manage?token=xyz789');
+    });
+
+    it('leaves absolute preference URLs unchanged', () => {
+      const absoluteUrl = 'https://rentars.app/preferences/manage?token=abc123';
+      const { html } = renderEmail({
+        title: 'Booking',
+        body: '<p>hi</p>',
+        preferencesUrl: absoluteUrl,
+      });
+      expect(html).toContain(absoluteUrl);
+    });
+
+    it('omits preference links when preferencesUrl is undefined', () => {
+      const { html } = renderEmail({
+        title: 'Booking',
+        body: '<p>hi</p>',
+        preferencesUrl: undefined,
+      });
+      expect(html).not.toContain('Manage preferences');
+      expect(html).not.toContain('Unsubscribe');
+    });
   });
 
   // ── renderEmail — essential emails ────────────────────────────────────────
@@ -214,6 +244,32 @@ describe('emailLayout', () => {
       const text = renderPlaintext({ title: 'T', body: 'Line one<br />Line two' });
       expect(text).toContain('Line one');
       expect(text).toContain('Line two');
+    });
+
+    it('converts heading closing tags to newlines', () => {
+      const text = renderPlaintext({ title: 'T', body: '<h1>Heading</h1><p>Content</p>' });
+      const lines = text.split('\n');
+      expect(lines.some(line => line.includes('Heading'))).toBe(true);
+      expect(lines.some(line => line.includes('Content'))).toBe(true);
+    });
+
+    it('converts paragraph closing tags to newlines', () => {
+      const text = renderPlaintext({ title: 'T', body: '<p>Para 1</p><p>Para 2</p>' });
+      expect(text).toContain('Para 1');
+      expect(text).toContain('Para 2');
+      const parts = text.split('\n').filter(line => line.trim().length > 0);
+      expect(parts.length).toBeGreaterThanOrEqual(2);
+    });
+
+    it('removes script and style tags', () => {
+      const text = renderPlaintext({
+        title: 'T',
+        body: '<p>Content</p><script>alert("xss")</script><p>More</p>',
+      });
+      expect(text).not.toContain('alert');
+      expect(text).not.toContain('script');
+      expect(text).toContain('Content');
+      expect(text).toContain('More');
     });
   });
 
