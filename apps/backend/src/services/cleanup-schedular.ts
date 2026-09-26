@@ -1,11 +1,13 @@
 import { syncAllBookings, syncAllProperties, reconcileAllPendingEscrows } from './sync.service.js';
 import { purgeExpired as purgeExpiredIdempotencyKeys } from './idempotency.service.js';
-import { runRetentionJobs, type RetentionRunSummary } from './retention.service.js';
-import { env } from '@/config/env.js';
+import { BookingService } from './booking.service.js';
+
+const bookingService = new BookingService();
 
 const SYNC_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const RECONCILIATION_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const IDEMPOTENCY_CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+const BOOKING_EXPIRY_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
 const MAX_CONCURRENT_RECONCILIATIONS = 5;
 const INITIAL_BACKOFF_MS = 1000; // 1 second
 const MAX_BACKOFF_MS = 30000; // 30 seconds
@@ -98,11 +100,19 @@ export function startSyncScheduler(): void {
     runIdempotencyCleanup().catch((err) => console.error('[idempotency] Cleanup error:', err));
   }, IDEMPOTENCY_CLEANUP_INTERVAL_MS);
 
-  // Run an initial idempotency cleanup shortly after startup so stale keys
-  // don't linger across a server restart that happened more than 24 h ago.
+  // Booking expiry cleanup — runs every 10 minutes, expires stale Pending bookings.
+  setInterval(() => {
+    runBookingExpiryCleanup().catch((err) => console.error('[expiry] Scheduler error:', err));
+  }, BOOKING_EXPIRY_INTERVAL_MS);
+
+  // Run an initial cleanup shortly after startup so stale keys don't linger
+  // across a server restart that happens to be more than 24 h after creation.
   setTimeout(() => {
     runIdempotencyCleanup().catch((err) =>
       console.error('[idempotency] Initial cleanup error:', err),
+    );
+    runBookingExpiryCleanup().catch((err) =>
+      console.error('[expiry] Initial cleanup error:', err),
     );
   }, 30_000); // 30 seconds after startup
 
@@ -140,7 +150,7 @@ export function startSyncScheduler(): void {
     `[sync] Scheduler started — sync interval: ${SYNC_INTERVAL_MS / 1000}s, ` +
     `reconciliation interval: ${RECONCILIATION_INTERVAL_MS / 1000}s, ` +
     `idempotency cleanup interval: ${IDEMPOTENCY_CLEANUP_INTERVAL_MS / 1000}s, ` +
-    `retention cleanup interval: ${RETENTION_INTERVAL_MS / 1000}s`,
+    `booking expiry interval: ${BOOKING_EXPIRY_INTERVAL_MS / 1000}s`,
   );
 }
 
@@ -155,61 +165,14 @@ async function runIdempotencyCleanup(): Promise<void> {
   }
 }
 
-// ── Data-retention runner ─────────────────────────────────────────────────────
-
-interface RetentionRunOptions {
-  dryRun?: boolean;
-  /** Human-readable label for log context (e.g. 'scheduled', 'startup-preview'). */
-  label?: string;
-}
-
-/**
- * Execute the full data-retention sweep.
- *
- * Guards against concurrent runs: if a run is already in progress it logs a
- * skip notice and returns early rather than accumulating overlapping jobs.
- */
-async function runDataRetention(options: RetentionRunOptions = {}): Promise<void> {
-  if (retentionRunning) {
-    console.log('[retention] Skipping — a run is already in progress');
-    return;
-  }
-
-  retentionRunning = true;
-  const label = options.label ?? 'scheduled';
-  const dryRun = options.dryRun ?? false;
-
-  console.log(
-    `[retention] Starting ${dryRun ? 'dry-run preview' : 'cleanup run'} (${label})`,
-  );
-
-  try {
-    const summary: RetentionRunSummary = await runRetentionJobs({
-      dryRun,
-      batchSize: env.RETENTION_BATCH_SIZE,
-    });
-
-    if (dryRun) {
-      console.log(
-        `[retention] Dry-run complete (${label}) — ` +
-        `eligible: ${summary.total_eligible}, ` +
-        `held/skipped: ${summary.total_held_skipped}, ` +
-        `elapsed: ${summary.elapsed_ms}ms`,
-      );
-    } else {
-      console.log(
-        `[retention] Run complete (${label}) — ` +
-        `deleted: ${summary.total_deleted}/${summary.total_eligible}, ` +
-        `held/skipped: ${summary.total_held_skipped}, ` +
-        `elapsed: ${summary.elapsed_ms}ms` +
-        (summary.failed_classes.length > 0
-          ? `, FAILED classes: ${summary.failed_classes.join(', ')}`
-          : ''),
-      );
+async function runBookingExpiryCleanup(): Promise<void> {
+  const result = await bookingService.expireStaleBookings();
+  if (result.success) {
+    const { expired, failed } = result.data ?? { expired: 0, failed: 0 };
+    if (expired > 0 || failed > 0) {
+      console.log(`[expiry] Expired ${expired} booking(s), ${failed} failure(s)`);
     }
-  } catch (err) {
-    console.error(`[retention] Unexpected error during ${label} run:`, err);
-  } finally {
-    retentionRunning = false;
+  } else {
+    console.error(`[expiry] Cleanup failed: ${result.error}`);
   }
 }

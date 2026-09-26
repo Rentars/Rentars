@@ -345,6 +345,76 @@ export const clientErrorsTotal = createCounter(
   'Total number of client-side errors reported by the browser, labelled by context.',
 );
 
+// ── Synthetic monitoring probes ─────────────────────────────────────────────────
+
+/**
+ * Total number of probe suite executions.
+ * Labels: suite (frontend_load|api_health|auth_journey|booking_read_journey|booking_write_probe),
+ *         outcome (success|failure|error)
+ */
+export const probeRunsTotal = createCounter(
+  'probe_runs_total',
+  'Total number of probe suite executions, labelled by suite and outcome.',
+);
+
+/**
+ * Total number of individual probe target executions.
+ * Labels: suite, target, outcome (success|failure)
+ */
+export const probeTargetTotal = createCounter(
+  'probe_target_total',
+  'Total number of individual probe target executions, labelled by suite, target, and outcome.',
+);
+
+/**
+ * Probe target execution latency in seconds.
+ * Labels: suite, target
+ */
+export const probeDurationSeconds = createHistogram(
+  'probe_duration_seconds',
+  'Probe target execution latency in seconds, labelled by suite and target.',
+  [0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30],
+);
+
+/**
+ * Total number of probe alert threshold breaches.
+ * Labels: suite, location
+ */
+export const probeAlertsTotal = createCounter(
+  'probe_alerts_total',
+  'Total number of probe alert threshold breaches, labelled by suite and location.',
+);
+
+// ── Distributed tracing ────────────────────────────────────────────────────────
+
+/**
+ * Total number of spans exported.
+ * Labels: service, span_kind, status (ok|error)
+ */
+export const tracesExportedTotal = createCounter(
+  'traces_exported_total',
+  'Total number of spans exported, labelled by service, span kind, and status.',
+);
+
+/**
+ * Span duration in seconds.
+ * Labels: service, span_name, span_kind
+ */
+export const traceSpanDurationSeconds = createHistogram(
+  'trace_span_duration_seconds',
+  'Span duration in seconds, labelled by service, span name, and span kind.',
+  [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+);
+
+/**
+ * Active spans gauge.
+ * Labels: service
+ */
+export const traceActiveSpans = createCounter(
+  'trace_active_spans',
+  'Number of currently active spans (approximate), labelled by service.',
+);
+
 // ── Route-template normaliser ─────────────────────────────────────────────────
 
 /**

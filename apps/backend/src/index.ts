@@ -6,17 +6,18 @@
  * missing or invalid, env.ts calls process.exit(1) with a full error report.
  *
  * Middleware order is intentional:
- *   1. securityMiddleware  — Helmet headers on every response, including errors
- *   2. corsMiddleware      — CORS preflight resolved before any auth/body parsing
- *   3. requestIdMiddleware — injects X-Request-Id before any logging happens
- *   4. body parsers        — JSON / multipart
- *   5. rateLimiter         — reject abusive traffic before heavy processing
- *   6. timeoutMiddleware   — bound long-running handlers
- *   7. requestLoggingMiddleware — structured per-request log on response finish
- *   8. metricsMiddleware   — record latency / counts on response finish
- *   9. metricsRouter       — /metrics scrape endpoint (before app routes)
- *  10. routes              — application routes
- *  11. errorMiddleware     — structured error logging + error responses
+ *   1. securityMiddleware      — Helmet headers on every response, including errors
+ *   2. corsMiddleware          — CORS preflight resolved before any auth/body parsing
+ *   3. requestIdMiddleware     — injects X-Request-Id before any logging happens
+ *   4. tracingMiddleware       — extracts/injects W3C trace context
+ *   5. body parsers            — JSON / multipart
+ *   6. rateLimiter             — reject abusive traffic before heavy processing
+ *   7. timeoutMiddleware       — bound long-running handlers
+ *   8. requestLoggingMiddleware — structured per-request log on response finish
+ *   9. metricsMiddleware       — record latency / counts on response finish
+ *  10. metricsRouter           — /metrics scrape endpoint (before app routes)
+ *  11. routes                  — application routes
+ *  12. errorMiddleware         — structured error logging + error responses
  */
 
 import 'dotenv/config'; // must be first import
@@ -35,6 +36,7 @@ import {
 } from './middleware/logging.middleware.js';
 import { metricsMiddleware, metricsRouter } from './middleware/metrics.middleware.js';
 import { errorMiddleware } from './middleware/error.middleware.js';
+import { tracingMiddleware } from './middleware/tracing.middleware.js';
 
 // ── Core middleware ───────────────────────────────────────────────────────────
 import { rateLimiter } from './middleware/rateLimiter.js';
@@ -46,6 +48,7 @@ import { setupOpenApiRoutes } from './config/swagger.js';
 import { validateBlockchainConfig } from './blockchain/config.js';
 import { startSyncScheduler } from './services/cleanup-schedular.js';
 import { startRateRefreshLoop } from './services/exchangeRate.service.js';
+import { startProbeScheduler, stopProbeScheduler } from './services/probe-scheduler.js';
 
 // ── Validate blockchain config early (before the server binds) ────────────────
 const configErrors = validateBlockchainConfig();
@@ -133,7 +136,8 @@ async function startServer(): Promise<void> {
       logLevel: env.LOG_LEVEL,
     });
     startSyncScheduler();
-    startRateRefreshLoop(); // pre-warm exchange-rate cache and keep it fresh
+    startRateRefreshLoop();
+    startProbeScheduler();
   });
 
   // ── Graceful shutdown ─────────────────────────────────────────────────────
@@ -145,6 +149,8 @@ async function startServer(): Promise<void> {
       timestamp: new Date().toISOString(),
       signal,
     });
+
+    stopProbeScheduler();
 
     server.close(() => {
       structuredLog({

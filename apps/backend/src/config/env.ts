@@ -100,6 +100,22 @@ const envSchema = z.object({
       return n;
     }),
 
+  // ── Booking expiry ────────────────────────────────────────────────────────
+  // Hours before a Pending booking automatically expires (default: 24 h).
+  PENDING_BOOKING_EXPIRY_HOURS: z
+    .string()
+    .default('24')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isFinite(n) || n <= 0) throw new Error('PENDING_BOOKING_EXPIRY_HOURS must be positive');
+      return n;
+    }),
+
+  // ── Calendar feed ─────────────────────────────────────────────────────────
+  // HMAC secret used to sign calendar feed subscription URLs.
+  // Falls back to JWT_SECRET in code when unset.
+  CALENDAR_FEED_SECRET: z.string().optional(),
+
   // ── Body size limits ───────────────────────────────────────────────────────
   // Maximum size for JSON request bodies (Express body-parser format: "1mb", "512kb", etc.)
   // Upload routes (multipart/form-data) are governed by multer limits, not this value.
@@ -133,6 +149,32 @@ const envSchema = z.object({
   // Bearer token required to scrape /metrics.
   // When unset the endpoint is restricted to localhost only.
   METRICS_TOKEN: z.string().optional(),
+
+  // Distributed tracing sample rate (0.0 to 1.0). Default: 0.1 (10%)
+  TRACE_SAMPLE_RATE: z
+    .string()
+    .default('0.1')
+    .transform((v) => {
+      const n = Number(v);
+      if (isNaN(n) || n < 0 || n > 1) throw new Error('TRACE_SAMPLE_RATE must be between 0 and 1');
+      return n;
+    }),
+
+  // Deployment version for trace tagging
+  DEPLOYMENT_VERSION: z.string().optional(),
+
+  // Probe configuration
+  PROBES_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  PROBE_LOCATION: z.string().optional(),
+  FRONTEND_URL: z.string().url().optional(),
+  API_URL: z.string().url().optional(),
+  PROBE_TEST_EMAIL: z.string().email().optional(),
+  PROBE_TEST_PASSWORD: z.string().optional(),
+  PROBE_BOOKING_EMAIL: z.string().email().optional(),
+  PROBE_BOOKING_PASSWORD: z.string().optional(),
 
   // ── Security headers ──────────────────────────────────────────────────────
   // Set to "true" to force-enable HSTS even outside NODE_ENV=production.
