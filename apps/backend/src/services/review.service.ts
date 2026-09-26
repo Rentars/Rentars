@@ -4,6 +4,7 @@ import type { ServiceResponse } from './index.js';
 import { sanitizeLongText, sanitizeResponse } from '../utils/sanitize.js';
 import type { PaginatedResult } from '../types/pagination.js';
 import { executePaginatedQuery } from '../utils/pagination.js';
+import { checkReviewEligibility } from './reviewEligibility.service.js';
 
 export type ModerationStatus = 'pending' | 'approved' | 'rejected';
 
@@ -26,6 +27,18 @@ export interface Review {
   created_at?: string;
 }
 
+/**
+ * Submit a review from either the tenant (reviewing the host/property) or
+ * the host (reviewing the tenant).
+ *
+ * Eligibility is validated against the immutable `review_eligibility_snapshot`
+ * that was written when the booking completed.  This keeps eligibility
+ * decisions explainable even if booking or modification records change later.
+ *
+ * Both perspectives are supported:
+ *   - Tenant  → reviews the host (propertyId should be provided)
+ *   - Host    → reviews the tenant (propertyId is ignored / null)
+ */
 export async function submitReview(
   bookingId: string,
   reviewerId: string,
@@ -47,40 +60,29 @@ export async function submitReview(
     return { success: false, error: 'Comment is required' };
   }
 
-  // Verify booking belongs to reviewer
-  const { data: booking, error: bookingError } = await supabase
-    .from('bookings')
-    .select('id, status, check_out')
-    .eq('id', bookingId)
-    .eq('tenant_id', reviewerId)
-    .single();
-
-  if (bookingError || !booking) {
-    return { success: false, error: 'Booking not found or not owned by reviewer' };
+  // ── Eligibility gate ──────────────────────────────────────────────────────
+  // Consults the immutable eligibility snapshot written at booking completion.
+  // This is the authoritative check — no re-evaluation of live booking state.
+  const eligibilityResult = await checkReviewEligibility(bookingId, reviewerId, targetId);
+  if (!eligibilityResult.success) {
+    return { success: false, error: eligibilityResult.error };
   }
 
-  const b = booking as { id: string; status: string; check_out: string };
+  // Resolve propertyId from snapshot when the reviewer is the tenant so
+  // hosts submitting tenant-reviews are not required to pass propertyId.
+  const snap = eligibilityResult.data!.snapshot;
+  const resolvedPropertyId =
+    propertyId ??
+    (snap.tenant_id === reviewerId ? snap.property_id : undefined);
 
-  if (b.status === 'Cancelled') {
-    return { success: false, error: 'Cannot review a cancelled booking' };
-  }
-  if (b.status === 'Disputed') {
-    return { success: false, error: 'Cannot review a disputed booking' };
-  }
-  if (b.status !== 'Completed') {
-    return { success: false, error: 'Can only review after the stay is completed' };
-  }
-  if (new Date(b.check_out) >= new Date()) {
-    return { success: false, error: 'Cannot review before the checkout date has passed' };
-  }
-
+  // ── Insert review ─────────────────────────────────────────────────────────
   const { data, error } = await supabase
     .from('reviews')
     .insert({
       booking_id: bookingId,
       reviewer_id: reviewerId,
       target_id: targetId,
-      property_id: propertyId,
+      property_id: resolvedPropertyId ?? null,
       rating,
       comment: cleanComment,
     })
@@ -88,29 +90,74 @@ export async function submitReview(
     .single();
 
   if (error) {
+    // Unique constraint violation — race-condition duplicate submission
+    if (error.code === '23505') {
+      return { success: false, error: 'You have already submitted a review for this booking.' };
+    }
     return { success: false, error: error.message };
   }
 
   // Invalidate the property detail cache so the updated rating aggregate is reflected.
-  if (propertyId) {
-    await cache.del(`property:${propertyId}`);
+  if (resolvedPropertyId) {
+    await cache.del(`property:${resolvedPropertyId}`);
   }
 
-  // Notify the host that a new review was submitted
+  // Notify the target that a new review was submitted
   try {
     const { createNotification } = await import('./notification.service.js');
+    const isTenantReview = snap.tenant_id === reviewerId;
     await createNotification(targetId, 'review_submitted', {
       reviewId: (data as Review).id,
       reviewerId,
-      propertyId: propertyId ?? null,
+      propertyId: resolvedPropertyId ?? null,
       rating,
-      message: `A guest left you a ${rating}-star review.`,
+      perspective: isTenantReview ? 'tenant_reviewed_host' : 'host_reviewed_tenant',
+      message: isTenantReview
+        ? `A guest left you a ${rating}-star review.`
+        : `The host left you a ${rating}-star review.`,
     });
   } catch {
     // Notification failure must never block the review submission
   }
 
+  // ── Trust risk: review pattern signal ─────────────────────────────────────
+  // Run a full signal pass for the reviewer fire-and-forget.
+  // Catches suspicious patterns (volume in 24 h, all-1-star bursts).
+  runReviewerRiskEval(reviewerId, (data as Review).id).catch(() => {});
+
   return { success: true, data: data as Review };
+}
+
+/**
+ * Evaluate trust risk signals for a reviewer after they submit a review.
+ * Non-fatal — called fire-and-forget.
+ */
+async function runReviewerRiskEval(reviewerId: string, reviewId: string): Promise<void> {
+  try {
+    const { runRiskEvaluation } = await import('./trustRisk.service.js');
+    const result = await runRiskEvaluation(reviewerId);
+    if (result.success && result.data) {
+      // Enqueue a mandatory trust_case_action notification so the user is
+      // informed of the automated action through their preferred channel.
+      const { enqueue } = await import('./notificationOutbox.service.js');
+      await enqueue({
+        userId:         reviewerId,
+        type:           'trust_case_action',
+        idempotencyKey: `trust_case_action:${result.data.id}:${reviewerId}`,
+        channels:       ['in_app', 'email'],
+        sourceEvent:    'review_submitted',
+        sourceId:       reviewId,
+        data: {
+          caseId:    result.data.id,
+          riskLevel: result.data.risk_level,
+          action:    result.data.automated_action,
+          message:   `Your account is under review. Our trust team will be in touch if any action is required.`,
+        },
+      });
+    }
+  } catch {
+    // Signal evaluation must never surface errors to the review submission caller
+  }
 }
 
 export async function getReviewsForProperty(propertyId: string, page = 1, pageSize = 20): Promise<ServiceResponse<PaginatedResult<Review>>> {

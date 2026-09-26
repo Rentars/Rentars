@@ -12,6 +12,7 @@ import {
   listPendingReviews,
   approveReviewHandler,
   rejectReviewHandler,
+  getEligibilityExplanationHandler,
 } from '../controllers/review.controller.js';
 import { validateBody } from '../validators/booking.validator.js';
 import { createReviewSchema, flagReviewSchema } from '../validators/review.validator.js';
@@ -51,5 +52,13 @@ router.post('/:id/approve', authenticate, requireRole('admin'), approveReviewHan
 
 // POST /api/reviews/:id/reject — reject a review with reason (admin)
 router.post('/:id/reject', authenticate, requireRole('admin'), rejectReviewHandler);
+
+// GET /api/reviews/eligibility/:bookingId — explain eligibility for support (admin/moderator)
+router.get(
+  '/eligibility/:bookingId',
+  authenticate,
+  requireRole('admin', 'moderator', 'support'),
+  getEligibilityExplanationHandler,
+);
 
 export default router;

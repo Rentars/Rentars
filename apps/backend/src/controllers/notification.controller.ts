@@ -118,16 +118,29 @@ export async function updateNotificationPreferences(
     return;
   }
 
-  const { email_notifications, push_notifications, notification_types } = req.body as {
-    email_notifications?: boolean;
-    push_notifications?: boolean;
-    notification_types?: Record<string, boolean>;
-  };
+  const { email_notifications, push_notifications, notification_types, mandatory_channel } =
+    req.body as {
+      email_notifications?: boolean;
+      push_notifications?: boolean;
+      notification_types?: Record<string, boolean>;
+      // Users may switch their mandatory channel between 'in_app' and 'email'.
+      // They cannot disable mandatory notifications entirely.
+      mandatory_channel?: 'in_app' | 'email';
+    };
+
+  if (
+    mandatory_channel !== undefined &&
+    !['in_app', 'email'].includes(mandatory_channel)
+  ) {
+    res.status(400).json({ error: "mandatory_channel must be 'in_app' or 'email'" });
+    return;
+  }
 
   const result = await updatePreferences(userId, {
     ...(email_notifications !== undefined && { email_notifications }),
-    ...(push_notifications !== undefined && { push_notifications }),
-    ...(notification_types !== undefined && { notification_types }),
+    ...(push_notifications  !== undefined && { push_notifications }),
+    ...(notification_types  !== undefined && { notification_types }),
+    ...(mandatory_channel   !== undefined && { mandatory_channel }),
   });
 
   if (!result.success) {

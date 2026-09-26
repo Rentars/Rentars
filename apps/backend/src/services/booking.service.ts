@@ -1143,6 +1143,31 @@ export class BookingService {
     );
     if (!transitionResult.success) return transitionResult;
 
+    // ── Snapshot review eligibility ────────────────────────────────────────
+    // Capture eligibility at completion time so the review service and support
+    // can reference an immutable record.  Non-fatal — a snapshot failure must
+    // never prevent the booking from completing.
+    this.snapshotReviewEligibilityForBooking(booking, userId).catch((err) =>
+      console.warn('[BookingService] Eligibility snapshot failed:', err),
+    );
+
+    // ── Trust risk signal evaluation ───────────────────────────────────────
+    // Run a full signal pass for the tenant after completion.  A booking
+    // completing normally carries no negative signals but may clear open
+    // cases (edge case where prior signals have since subsided).  Non-fatal.
+    if (booking.tenant_id) {
+      this.runPostCompletionRiskEval(booking).catch((err) =>
+        console.warn('[BookingService] Post-completion risk eval failed:', err),
+      );
+    }
+
+    // ── Outbox: review request notifications ──────────────────────────────
+    // Enqueue review-request notifications for both participants via the
+    // outbox so they survive a server restart between completion and delivery.
+    this.enqueueReviewRequestNotifications(booking).catch((err) =>
+      console.warn('[BookingService] Review-request outbox enqueue failed:', err),
+    );
+
     if (booking.tenant_id) {
       createNotification(booking.tenant_id, 'booking_completed', { booking_id: bookingId }).catch(
         () => {},
@@ -1252,12 +1277,204 @@ export class BookingService {
       createNotification(booking.tenant_id, 'booking_disputed', { booking_id: bookingId }).catch(
         () => {},
       );
+
+      // ── Trust risk: dispute signal ─────────────────────────────────────
+      // Each dispute is a signal against the tenant.  Run evaluation
+      // fire-and-forget so it never blocks the dispute response.
+      this.runDisputeSignalEval(booking.tenant_id, bookingId).catch((err) =>
+        console.warn('[BookingService] Dispute risk eval failed:', err),
+      );
+
+      // ── Outbox: mandatory dispute notification ─────────────────────────
+      // Enqueue a mandatory dispute_initiated notification for the tenant
+      // so they receive it regardless of their email/push preferences.
+      this.enqueueDisputeNotification(booking, bookingId).catch((err) =>
+        console.warn('[BookingService] Dispute outbox enqueue failed:', err),
+      );
     }
 
     return { success: true, data: transitionResult.data! };
   }
 
   // ── Update / Delete ────────────────────────────────────────────────────────
+
+  /**
+   * Snapshot review eligibility at the moment a booking completes.
+   *
+   * Gathers all context the eligibility service needs from the booking and its
+   * history, then delegates to snapshotEligibility().  Called fire-and-forget
+   * from completeBooking so failures are logged but never surfaced to callers.
+   */
+  private async snapshotReviewEligibilityForBooking(
+    booking: Booking,
+    actorId: string,
+  ): Promise<void> {
+    const bookingId  = booking.id;
+    const tenantId   = booking.tenant_id;
+    const propertyId = booking.property_id;
+
+    if (!tenantId || !propertyId) return;
+
+    // Fetch host id from the property
+    const { data: prop } = await supabase
+      .from('properties')
+      .select('owner_id')
+      .eq('id', propertyId)
+      .single();
+    const hostId = (prop as { owner_id?: string } | null)?.owner_id;
+    if (!hostId) return;
+
+    // Check if there was ever a dispute in the booking's history
+    const { data: history } = await supabase
+      .from('booking_status_history')
+      .select('status')
+      .eq('booking_id', bookingId);
+
+    const hadDispute = (history ?? []).some(
+      (h: { status: string }) => h.status === 'Disputed',
+    );
+
+    // Check for any accepted booking modifications
+    const { data: mods } = await supabase
+      .from('booking_modifications')
+      .select('id, status, requested_end')
+      .eq('booking_id', bookingId)
+      .eq('status', 'accepted')
+      .order('created_at', { ascending: false });
+
+    const wasModified = (mods?.length ?? 0) > 0;
+
+    // Effective checkout — use the latest accepted modification's end date if present
+    const latestMod = mods?.[0] as { requested_end?: string } | undefined;
+    const effectiveCheckOut = latestMod?.requested_end ?? booking.check_out ?? new Date().toISOString().slice(0, 10);
+
+    // Full refund: tier 'full' on the booking indicates no real stay happened
+    const fullRefundIssued = booking.refund_tier === 'full';
+
+    const { snapshotEligibility } = await import('./reviewEligibility.service.js');
+    await snapshotEligibility({
+      bookingId,
+      tenantId,
+      hostId,
+      propertyId,
+      priorStatus: booking.status ?? 'Confirmed',
+      effectiveCheckOut,
+      hadDispute,
+      fullRefundIssued,
+      wasModified,
+    });
+  }
+
+  // ── Trust signal helpers ──────────────────────────────────────────────────
+
+  /**
+   * Run full risk evaluation for the tenant after booking completion.
+   * Non-fatal — called fire-and-forget.
+   */
+  private async runPostCompletionRiskEval(booking: Booking): Promise<void> {
+    if (!booking.tenant_id) return;
+    const { runRiskEvaluation } = await import('./trustRisk.service.js');
+    const result = await runRiskEvaluation(booking.tenant_id);
+    if (result.success && result.data) {
+      console.log(
+        `[BookingService] Trust case created/updated for tenant ${booking.tenant_id} ` +
+        `after booking ${booking.id} completion — level: ${result.data.risk_level}`,
+      );
+    }
+  }
+
+  /**
+   * Evaluate dispute-specific risk signals for a tenant.
+   * A new dispute adds a direct signal rather than the full collected-signals pass.
+   */
+  private async runDisputeSignalEval(tenantId: string, bookingId: string): Promise<void> {
+    // The collected-signals pass already captures dispute history.
+    // Running a full pass here picks up any _other_ signals that may have
+    // crossed the threshold now that a dispute has been added to the record.
+    const { runRiskEvaluation } = await import('./trustRisk.service.js');
+    await runRiskEvaluation(tenantId);
+  }
+
+  /**
+   * Enqueue outbox notifications asking both the tenant and host to leave
+   * a review after booking completion.
+   *
+   * Idempotency keys are booking-scoped so restarts don't duplicate the asks.
+   */
+  private async enqueueReviewRequestNotifications(booking: Booking): Promise<void> {
+    if (!booking.tenant_id || !booking.property_id) return;
+
+    // Fetch host id
+    const { data: prop } = await supabase
+      .from('properties')
+      .select('owner_id')
+      .eq('id', booking.property_id)
+      .single();
+    const hostId = (prop as { owner_id?: string } | null)?.owner_id;
+
+    const { enqueue } = await import('./notificationOutbox.service.js');
+
+    // Tenant → asked to review the host
+    await enqueue({
+      userId:         booking.tenant_id,
+      type:           'review_requested',
+      idempotencyKey: `review_request:${booking.id}:${booking.tenant_id}`,
+      channels:       ['in_app', 'email'],
+      sourceEvent:    'booking_completed',
+      sourceId:       booking.id,
+      data: {
+        bookingId:  booking.id,
+        propertyId: booking.property_id,
+        message:    'Your stay is complete! Leave a review to help future guests.',
+      },
+    });
+
+    // Host → asked to review the tenant (if we found a host)
+    if (hostId) {
+      await enqueue({
+        userId:         hostId,
+        type:           'review_requested',
+        idempotencyKey: `review_request:${booking.id}:${hostId}`,
+        channels:       ['in_app'],
+        sourceEvent:    'booking_completed',
+        sourceId:       booking.id,
+        data: {
+          bookingId:  booking.id,
+          propertyId: booking.property_id,
+          tenantId:   booking.tenant_id,
+          message:    'Your guest has checked out. Leave a review to build trust on the platform.',
+        },
+      });
+    }
+  }
+
+  /**
+   * Enqueue a mandatory dispute_initiated outbox notification for the tenant.
+   * Uses the outbox so the notification survives a server restart.
+   */
+  private async enqueueDisputeNotification(
+    booking: Booking,
+    bookingId: string,
+  ): Promise<void> {
+    if (!booking.tenant_id) return;
+    const { enqueue } = await import('./notificationOutbox.service.js');
+    await enqueue({
+      userId:         booking.tenant_id,
+      type:           'dispute_initiated',
+      idempotencyKey: `dispute_initiated:${bookingId}:${booking.tenant_id}`,
+      channels:       ['in_app', 'email'],
+      sourceEvent:    'booking_disputed',
+      sourceId:       bookingId,
+      data: {
+        bookingId,
+        propertyId: booking.property_id ?? null,
+        message:
+          'A dispute has been opened on your booking. ' +
+          'A moderator will review the case and contact you shortly. ' +
+          'Please do not release any escrow until the dispute is resolved.',
+      },
+    });
+  }
 
   /**
    * Update mutable fields of an existing booking.

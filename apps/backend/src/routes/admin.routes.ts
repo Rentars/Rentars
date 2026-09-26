@@ -113,4 +113,19 @@ router.get('/audit-logs', requireScope('admin:audit:read'), getAuditLogsHandler)
 import { approveRefundHandler } from '@/controllers/admin.controller.js';
 router.post('/refunds/approve', requireScope('admin:refunds:approve'), approveRefundHandler);
 
+// ── Notification outbox administration ───────────────────────────────────────
+// Scope: admin:audit:read → list stats + dead-letters (admin, moderator, support, finance)
+// Scope: admin:users:suspend → retry / discard (admin only — HIGH-RISK)
+import {
+  outboxStats,
+  listDeadLetterRows,
+  retryDeadLetterRow,
+  discardDeadLetterRow,
+} from '@/controllers/outbox.controller.js';
+
+router.get('/outbox/stats',          requireScope('admin:audit:read'),     outboxStats);
+router.get('/outbox/dead-letters',   requireScope('admin:audit:read'),     listDeadLetterRows);
+router.post('/outbox/:id/retry',     requireScope('admin:users:suspend'),  retryDeadLetterRow);
+router.delete('/outbox/:id',         requireScope('admin:users:suspend'),  discardDeadLetterRow);
+
 export default router;

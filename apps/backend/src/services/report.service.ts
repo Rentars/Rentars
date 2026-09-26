@@ -89,6 +89,13 @@ export async function submitReport(
 
   await notifyModerators(data as Report);
 
+  // ── Trust risk: report signal ────────────────────────────────────────────
+  // Run a full signal evaluation for the reported user fire-and-forget.
+  // If this report pushes them over a threshold, a risk case is opened.
+  runReportSignalEval(targetId).catch((err) =>
+    console.warn('[ReportService] Post-report risk eval failed:', err),
+  );
+
   return { success: true, data: data as Report };
 }
 
@@ -145,6 +152,14 @@ export async function resolveReport(
 
   const { record } = await import('./auditLog.service.js');
   await record(resolverId, `report.${status}`, 'report', reportId, { resolutionNote });
+
+  // ── Outbox: notify the target user of the resolution ─────────────────────
+  // The resolved report may relate to a property (owner) or a review (author).
+  // We notify whichever user was the target of the report so they know the
+  // outcome.  This is a mandatory dispute_update notification.
+  enqueueReportResolutionNotification(data as Report, status).catch((err) =>
+    console.warn('[ReportService] Resolution outbox enqueue failed:', err),
+  );
 
   return { success: true, data: data as Report };
 }
@@ -465,4 +480,84 @@ export async function getReportImpact(
       unique_reporters: uniqueReporters,
     },
   };
+}
+
+// ─── Internal: trust risk signal evaluation ───────────────────────────────────
+
+/**
+ * Run a full risk evaluation for the target user after a new report is filed.
+ * Called fire-and-forget — must never block the report submission response.
+ */
+async function runReportSignalEval(targetUserId: string): Promise<void> {
+  try {
+    const { runRiskEvaluation } = await import('./trustRisk.service.js');
+    const result = await runRiskEvaluation(targetUserId);
+    if (result.success && result.data) {
+      console.log(
+        `[ReportService] Trust case created/updated for user ${targetUserId} ` +
+        `after new report — level: ${result.data.risk_level}`,
+      );
+    }
+  } catch (err) {
+    console.warn('[ReportService] Trust risk eval error:', err);
+  }
+}
+
+// ─── Internal: outbox helpers ─────────────────────────────────────────────────
+
+/**
+ * Enqueue a mandatory dispute_update notification for the user whose content
+ * was the subject of the resolved report.
+ *
+ * For property reports the target is the property owner.
+ * For review reports the target is the review author.
+ */
+async function enqueueReportResolutionNotification(
+  report: Report,
+  resolution: 'resolved' | 'dismissed',
+): Promise<void> {
+  try {
+    // Resolve the user to notify.
+    let recipientId: string | null = null;
+
+    if (report.target_type === 'property') {
+      const { data: prop } = await supabase
+        .from('properties')
+        .select('owner_id')
+        .eq('id', report.target_id)
+        .maybeSingle();
+      recipientId = (prop as { owner_id?: string } | null)?.owner_id ?? null;
+    } else if (report.target_type === 'review') {
+      const { data: rev } = await supabase
+        .from('reviews')
+        .select('reviewer_id')
+        .eq('id', report.target_id)
+        .maybeSingle();
+      recipientId = (rev as { reviewer_id?: string } | null)?.reviewer_id ?? null;
+    }
+
+    if (!recipientId) return;
+
+    const outcomeMessage =
+      resolution === 'resolved'
+        ? 'A report concerning your content has been reviewed and actioned by our trust team.'
+        : 'A report concerning your content was reviewed and dismissed — no action has been taken.';
+
+    const { enqueue } = await import('./notificationOutbox.service.js');
+    await enqueue({
+      userId:         recipientId,
+      type:           'dispute_update',
+      idempotencyKey: `report_resolution:${report.id}:${recipientId}`,
+      channels:       ['in_app', 'email'],
+      sourceEvent:    `report.${resolution}`,
+      sourceId:       report.id,
+      data: {
+        reportId:   report.id,
+        resolution,
+        message:    outcomeMessage,
+      },
+    });
+  } catch (err) {
+    console.warn('[ReportService] enqueueReportResolutionNotification error:', err);
+  }
 }
