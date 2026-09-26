@@ -1,0 +1,69 @@
+name: Smoke Tests
+
+# Triggered manually (post-deploy hook) or via workflow_dispatch.
+# For automatic post-deploy runs, call this workflow from your deployment
+# pipeline with:
+#   uses: ./.github/workflows/smoke-tests.yml
+#   with:
+#     api_url: https://api.your-env.example.com
+#     frontend_url: https://your-env.example.com
+on:
+  workflow_dispatch:
+    inputs:
+      api_url:
+        description: 'Backend API base URL'
+        required: true
+        default: 'http://localhost:3000'
+      frontend_url:
+        description: 'Frontend base URL'
+        required: true
+        default: 'http://localhost:3001'
+  workflow_call:
+    inputs:
+      api_url:
+        type: string
+        required: true
+      frontend_url:
+        type: string
+        required: true
+
+jobs:
+  smoke:
+    name: Post-deploy Smoke Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: yarn
+          cache-dependency-path: apps/web/yarn.lock
+
+      - name: Install web dependencies
+        working-directory: apps/web
+        run: yarn install --frozen-lockfile
+
+      - name: Install Playwright browsers
+        working-directory: apps/web
+        run: yarn playwright install --with-deps chromium
+
+      - name: Run smoke tests
+        working-directory: apps/web
+        env:
+          CI: true
+          SMOKE_API_URL: ${{ inputs.api_url }}
+          SMOKE_FRONTEND_URL: ${{ inputs.frontend_url }}
+          PLAYWRIGHT_BASE_URL: ${{ inputs.frontend_url }}
+        run: yarn playwright test --project=chromium e2e/smoke.spec.ts
+
+      - name: Upload smoke test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-report
+          path: apps/web/playwright-report/
+          retention-days: 7

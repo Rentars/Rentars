@@ -18,6 +18,8 @@ import {
   createDraftHandler,
   getHostDraftsHandler,
   publishDraftHandler,
+  getPropertyVersionsHandler,
+  rollbackPropertyVersionHandler,
 } from '@/controllers/property.controller.js';
 import { searchPropertiesEndpoint, searchNearbyEndpoint } from '@/controllers/propertySearch.controller.js';
 import {
@@ -111,6 +113,14 @@ router.put('/:id', authenticate, updatePropertyHandler);
 
 // DELETE /api/v1/properties/:id
 router.delete('/:id', authenticate, deletePropertyHandler);
+
+// ── Version history ────────────────────────────────────────────────────────────
+
+// GET /api/v1/properties/:id/versions  (host or admin only)
+router.get('/:id/versions', authenticate, getPropertyVersionsHandler);
+
+// POST /api/v1/properties/:id/versions/:versionId/rollback  (host only)
+router.post('/:id/versions/:versionId/rollback', authenticate, requireEmailVerified, rollbackPropertyVersionHandler);
 
 // ── Image management ───────────────────────────────────────────────────────────
 

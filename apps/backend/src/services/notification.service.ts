@@ -15,6 +15,9 @@ export type NotificationType =
   | 'booking_created'
   | 'booking_confirmed'
   | 'booking_cancelled'
+  | 'booking_completed'
+  | 'booking_disputed'
+  | 'booking_expired'
   | 'booking_modification_requested'
   | 'booking_modification_accepted'
   | 'booking_modification_declined'
@@ -44,6 +47,12 @@ export interface NotificationPreferences {
   email_notifications: boolean;
   push_notifications: boolean;
   notification_types: Partial<Record<NotificationType, boolean>>;
+  /** Wall-clock start of the quiet window, e.g. '22:00'. Null = no quiet window. */
+  quiet_hours_start?: string | null;
+  /** Wall-clock end of the quiet window, e.g. '08:00'. May wrap past midnight. */
+  quiet_hours_end?: string | null;
+  /** IANA timezone used when evaluating the quiet window. Defaults to UTC. */
+  quiet_hours_timezone?: string | null;
   updated_at?: string;
 }
 
@@ -244,6 +253,9 @@ export async function getPreferences(
       email_notifications: true,
       push_notifications: true,
       notification_types: {},
+      quiet_hours_start: null,
+      quiet_hours_end: null,
+      quiet_hours_timezone: null,
     };
     return { success: true, data: defaults };
   }
