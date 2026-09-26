@@ -32,6 +32,8 @@
 
 import { supabase } from '@/config/supabase.js';
 import crypto from 'crypto';
+import { structuredLog } from '@/middleware/logging.middleware.js';
+import { getRequestContext } from '@/services/logging.service.js';
 
 export type AuditAction =
   // Auth
@@ -149,7 +151,8 @@ class AuditLogger {
    * Log an audit event with optional correlation ID for request tracing.
    */
   async log(entry: AuditLogEntry): Promise<void> {
-    const correlationId = entry.correlationId || crypto.randomUUID();
+    const context = getRequestContext();
+    const correlationId = entry.correlationId ?? context?.requestId ?? crypto.randomUUID();
     const timestamp = new Date().toISOString();
 
     const record = {
@@ -167,13 +170,27 @@ class AuditLogger {
     };
 
     // Always emit to stdout as structured JSON for log aggregation
-    console.log(JSON.stringify({ audit: true, ...record }));
+    structuredLog({
+      level: record.success ? 'info' : 'warn',
+      message: `audit:${record.action}`,
+      timestamp: record.timestamp,
+      service: 'audit',
+      audit: true,
+      ...record,
+    });
 
     // Persist to Supabase (best-effort — never throws)
     try {
       await supabase.from('audit_logs').insert(record);
     } catch (err) {
-      console.error('[AuditLogger] Failed to persist audit log entry:', err);
+      structuredLog({
+        level: 'warn',
+        message: '[AuditLogger] Failed to persist audit log entry',
+        timestamp: new Date().toISOString(),
+        service: 'audit',
+        error: err instanceof Error ? err.message : String(err),
+        action: entry.action,
+      });
     }
   }
 

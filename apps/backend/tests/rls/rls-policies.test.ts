@@ -394,3 +394,390 @@ describe('RLS — unauthenticated access blocked', () => {
     expect(blocked).toBe(true);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #664 — Additional RLS coverage tests
+// Tables: reviews, wallet_challenges, idempotency_keys, messages,
+//         blockchain_logs, reports, booking_modifications, search_analytics
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─── reviews ──────────────────────────────────────────────────────────────────
+
+describe('RLS — reviews', () => {
+  let reviewId: string;
+
+  it('authenticated user can read reviews (public reputation)', async () => {
+    // Insert via service role first
+    const { data, error } = await adminClient
+      .from('reviews')
+      .insert({
+        booking_id: bookingAId,
+        reviewer_id: userAId,
+        target_id: ownerUserId,
+        property_id: propertyId,
+        rating: 5,
+        comment: 'Great place',
+      })
+      .select('id')
+      .single();
+    expect(error).toBeNull();
+    reviewId = data!.id;
+
+    // User B (unrelated) should be able to read it
+    const { data: d2, error: e2 } = await clientB
+      .from('reviews')
+      .select('id')
+      .eq('id', reviewId)
+      .single();
+    expect(e2).toBeNull();
+    expect(d2?.id).toBe(reviewId);
+  });
+
+  it('user cannot insert a review where reviewer_id !== auth.uid()', async () => {
+    const { data, error } = await clientB
+      .from('reviews')
+      .insert({
+        booking_id: bookingAId,
+        reviewer_id: userAId,   // spoofed — not clientB
+        target_id: ownerUserId,
+        property_id: propertyId,
+        rating: 1,
+        comment: 'Spoofed',
+      })
+      .select('id')
+      .single();
+    expect(error).not.toBeNull();
+    expect(data).toBeNull();
+  });
+
+  // Cleanup
+  afterAll(async () => {
+    if (reviewId) await adminClient.from('reviews').delete().eq('id', reviewId);
+  });
+});
+
+// ─── wallet_challenges ────────────────────────────────────────────────────────
+
+describe('RLS — wallet_challenges (service-only)', () => {
+  it('authenticated user cannot read wallet_challenges', async () => {
+    const { data, error } = await clientA.from('wallet_challenges').select('*');
+    // RLS blocks all client reads — expect zero rows or an error
+    const blocked = error !== null || (data ?? []).length === 0;
+    expect(blocked).toBe(true);
+  });
+
+  it('authenticated user cannot insert wallet_challenges', async () => {
+    const { data, error } = await clientA
+      .from('wallet_challenges')
+      .insert({
+        stellar_address: 'GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGGJHPN5K5O1X7UAIGVTVB',
+        challenge: 'test-challenge-string',
+      })
+      .select('id')
+      .single();
+    expect(error).not.toBeNull();
+    expect(data).toBeNull();
+  });
+});
+
+// ─── idempotency_keys ─────────────────────────────────────────────────────────
+
+describe('RLS — idempotency_keys (own-user only)', () => {
+  let keyId: string;
+
+  beforeAll(async () => {
+    const { data } = await adminClient
+      .from('idempotency_keys')
+      .insert({
+        key: 'rls-test-idem-key-001',
+        user_id: userAId,
+        request_hash: 'abc123def456abc123def456abc123def456abc123def456abc123def456abc1',
+        response_body: { ok: true },
+        status_code: 200,
+      })
+      .select('id')
+      .single();
+    keyId = data?.id;
+  });
+
+  it("user A can read their own idempotency key", async () => {
+    const { data, error } = await clientA
+      .from('idempotency_keys')
+      .select('id')
+      .eq('id', keyId)
+      .single();
+    expect(error).toBeNull();
+    expect(data?.id).toBe(keyId);
+  });
+
+  it("user B cannot read user A's idempotency key", async () => {
+    const { data, error } = await clientB
+      .from('idempotency_keys')
+      .select('id')
+      .eq('id', keyId)
+      .single();
+    const blocked = !data || error !== null;
+    expect(blocked).toBe(true);
+  });
+
+  afterAll(async () => {
+    if (keyId) await adminClient.from('idempotency_keys').delete().eq('id', keyId);
+  });
+});
+
+// ─── messages ─────────────────────────────────────────────────────────────────
+
+describe('RLS — messages (sender + recipient only)', () => {
+  let msgId: string;
+
+  beforeAll(async () => {
+    const { data } = await adminClient
+      .from('messages')
+      .insert({
+        property_id: propertyId,
+        sender_id: userAId,
+        recipient_id: ownerUserId,
+        body: 'Is the property available?',
+      })
+      .select('id')
+      .single();
+    msgId = data?.id;
+  });
+
+  it('sender (userA) can read the message', async () => {
+    const { data, error } = await clientA
+      .from('messages')
+      .select('id')
+      .eq('id', msgId)
+      .single();
+    expect(error).toBeNull();
+    expect(data?.id).toBe(msgId);
+  });
+
+  it('recipient (owner) can read the message', async () => {
+    const { data, error } = await clientOwner
+      .from('messages')
+      .select('id')
+      .eq('id', msgId)
+      .single();
+    expect(error).toBeNull();
+    expect(data?.id).toBe(msgId);
+  });
+
+  it('unrelated user B cannot read the message', async () => {
+    const { data, error } = await clientB
+      .from('messages')
+      .select('id')
+      .eq('id', msgId)
+      .single();
+    const blocked = !data || error !== null;
+    expect(blocked).toBe(true);
+  });
+
+  it('sender cannot spoof a different sender_id on insert', async () => {
+    const { data, error } = await clientA
+      .from('messages')
+      .insert({
+        property_id: propertyId,
+        sender_id: ownerUserId,    // spoofed
+        recipient_id: userBId,
+        body: 'Spoofed message',
+      })
+      .select('id')
+      .single();
+    expect(error).not.toBeNull();
+    expect(data).toBeNull();
+  });
+
+  afterAll(async () => {
+    if (msgId) await adminClient.from('messages').delete().eq('id', msgId);
+  });
+});
+
+// ─── blockchain_logs ──────────────────────────────────────────────────────────
+
+describe('RLS — blockchain_logs (service-only)', () => {
+  it('authenticated user cannot read blockchain_logs', async () => {
+    const { data, error } = await clientA.from('blockchain_logs').select('*');
+    const blocked = error !== null || (data ?? []).length === 0;
+    expect(blocked).toBe(true);
+  });
+
+  it('authenticated user cannot insert into blockchain_logs', async () => {
+    const { data, error } = await clientA
+      .from('blockchain_logs')
+      .insert({ operation: 'rls_test', input_json: {} })
+      .select('id')
+      .single();
+    expect(error).not.toBeNull();
+    expect(data).toBeNull();
+  });
+});
+
+// ─── reports ─────────────────────────────────────────────────────────────────
+
+describe('RLS — reports (reporter reads own, service reads all)', () => {
+  let reportId: string;
+
+  it('user A can file a report', async () => {
+    const { data, error } = await clientA
+      .from('reports')
+      .insert({
+        target_type: 'property',
+        target_id: propertyId,
+        reporter_id: userAId,
+        reason: 'spam',
+      })
+      .select('id')
+      .single();
+    expect(error).toBeNull();
+    expect(data?.id).toBeTruthy();
+    reportId = data!.id;
+  });
+
+  it('user A can read their own report', async () => {
+    const { data, error } = await clientA
+      .from('reports')
+      .select('id')
+      .eq('id', reportId)
+      .single();
+    expect(error).toBeNull();
+    expect(data?.id).toBe(reportId);
+  });
+
+  it('user B cannot read user A\'s report', async () => {
+    const { data, error } = await clientB
+      .from('reports')
+      .select('id')
+      .eq('id', reportId)
+      .single();
+    const blocked = !data || error !== null;
+    expect(blocked).toBe(true);
+  });
+
+  it('user cannot spoof a different reporter_id', async () => {
+    const { data, error } = await clientB
+      .from('reports')
+      .insert({
+        target_type: 'property',
+        target_id: propertyId,
+        reporter_id: userAId,   // spoofed
+        reason: 'fraud',
+      })
+      .select('id')
+      .single();
+    expect(error).not.toBeNull();
+    expect(data).toBeNull();
+  });
+
+  afterAll(async () => {
+    if (reportId) await adminClient.from('reports').delete().eq('id', reportId);
+  });
+});
+
+// ─── booking_modifications ───────────────────────────────────────────────────
+
+describe('RLS — booking_modifications (tenant + owner read; tenant inserts)', () => {
+  let modId: string;
+
+  beforeAll(async () => {
+    const { data } = await adminClient
+      .from('booking_modifications')
+      .insert({
+        booking_id: bookingAId,
+        requested_by: userAId,
+        requested_start: '2099-01-12',
+        requested_end: '2099-01-17',
+        original_start: '2099-01-10',
+        original_end: '2099-01-15',
+        status: 'pending',
+      })
+      .select('id')
+      .single();
+    modId = data?.id;
+  });
+
+  it('tenant (userA) can read modification for their booking', async () => {
+    const { data, error } = await clientA
+      .from('booking_modifications')
+      .select('id')
+      .eq('id', modId)
+      .single();
+    expect(error).toBeNull();
+    expect(data?.id).toBe(modId);
+  });
+
+  it('property owner can read modification for their property booking', async () => {
+    const { data, error } = await clientOwner
+      .from('booking_modifications')
+      .select('id')
+      .eq('id', modId)
+      .single();
+    expect(error).toBeNull();
+    expect(data?.id).toBe(modId);
+  });
+
+  it('unrelated user B cannot read the modification', async () => {
+    const { data, error } = await clientB
+      .from('booking_modifications')
+      .select('id')
+      .eq('id', modId)
+      .single();
+    const blocked = !data || error !== null;
+    expect(blocked).toBe(true);
+  });
+
+  afterAll(async () => {
+    if (modId) await adminClient.from('booking_modifications').delete().eq('id', modId);
+  });
+});
+
+// ─── search_analytics ────────────────────────────────────────────────────────
+
+describe('RLS — search_analytics (own-user read; service inserts)', () => {
+  let analyticsId: string;
+
+  beforeAll(async () => {
+    const { data } = await adminClient
+      .from('search_analytics')
+      .insert({ query: 'rls-test-query', user_id: userAId, result_count: 3 })
+      .select('id')
+      .single();
+    analyticsId = data?.id;
+  });
+
+  it('user A can read their own search analytics row', async () => {
+    const { data, error } = await clientA
+      .from('search_analytics')
+      .select('id')
+      .eq('id', analyticsId)
+      .single();
+    expect(error).toBeNull();
+    expect(data?.id).toBe(analyticsId);
+  });
+
+  it('user B cannot read user A\'s search analytics', async () => {
+    const { data, error } = await clientB
+      .from('search_analytics')
+      .select('id')
+      .eq('id', analyticsId)
+      .single();
+    const blocked = !data || error !== null;
+    expect(blocked).toBe(true);
+  });
+
+  it('client cannot directly insert into search_analytics', async () => {
+    const { data, error } = await clientA
+      .from('search_analytics')
+      .insert({ query: 'client-direct-insert', user_id: userAId, result_count: 1 })
+      .select('id')
+      .single();
+    // Service role handles inserts; direct client inserts should be blocked
+    expect(error).not.toBeNull();
+    expect(data).toBeNull();
+  });
+
+  afterAll(async () => {
+    if (analyticsId) await adminClient.from('search_analytics').delete().eq('id', analyticsId);
+  });
+});
