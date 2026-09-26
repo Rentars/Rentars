@@ -225,7 +225,54 @@ jobs:
           path: apps/web/playwright-report/
           retention-days: 14
 
-  # ─── Job 6: Documentation link check ────────────────────────────────────────
+  # ─── Job 6: Frontend performance budgets ────────────────────────────────────
+  # Runs Lighthouse CI against a production Next.js build to enforce the
+  # budgets documented in apps/web/PERFORMANCE_BUDGETS.md and lighthouserc.js.
+  # Warn findings annotate the PR. Error findings block merge.
+  performance-budgets:
+    name: Frontend Performance Budgets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install web dependencies
+        working-directory: apps/web
+        run: npm ci
+
+      - name: Build Next.js production bundle
+        working-directory: apps/web
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:3000
+          NEXT_PUBLIC_STELLAR_NETWORK: testnet
+          NEXT_PUBLIC_HORIZON_URL: https://horizon-testnet.stellar.org
+          NEXT_PUBLIC_SOROBAN_RPC_URL: https://soroban-testnet.stellar.org
+          NEXT_PUBLIC_PASSKEY_RP_ID: localhost
+          NEXT_PUBLIC_PASSKEY_RP_NAME: Rentars
+          NEXT_PUBLIC_PASSKEY_ORIGIN: http://localhost:3000
+        run: npm run build
+
+      - name: Run Lighthouse CI
+        working-directory: apps/web
+        run: npx @lhci/cli@latest autorun
+        env:
+          LHCI_GITHUB_APP_TOKEN: ${{ secrets.LHCI_GITHUB_APP_TOKEN }}
+
+      - name: Upload Lighthouse reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lighthouse-reports
+          path: apps/web/.lighthouseci/
+          retention-days: 14
+
+  # ─── Job 7: Documentation link check ────────────────────────────────────────
   # Verifies that all relative file paths referenced in Markdown docs exist in
   # the repository. Broken links (e.g. after a file rename) fail this job.
   docs-link-check:
