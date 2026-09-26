@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { supabase } from '@/config/supabase.js';
+import { structuredLog, redactLogPayload } from '@/middleware/logging.middleware.js';
 
 // ─── Request correlation context ──────────────────────────────────────────────
 
@@ -43,6 +44,8 @@ export function setRequestContextUserId(userId: string): void {
   if (store) store.userId = userId;
 }
 
+// ─── Blockchain operation logger ──────────────────────────────────────────────
+
 export interface BlockchainOperationLog {
   operation: string;
   userId?: string;
@@ -55,6 +58,15 @@ export interface BlockchainOperationLog {
 }
 
 class LoggingService {
+  /**
+   * Record a Stellar/Soroban blockchain operation.
+   *
+   * Persists to the blockchain_logs table (best-effort) and emits a
+   * structured JSON log entry via structuredLog so the record is always
+   * captured by the aggregation pipeline even when the DB write fails.
+   *
+   * Sensitive fields are redacted before emission.
+   */
   async logBlockchainOperation(
     operation: string,
     input: Record<string, unknown>,
@@ -63,36 +75,56 @@ class LoggingService {
   ): Promise<void> {
     const context = getRequestContext();
 
+    // Persist to Supabase (best-effort — never throws)
     try {
       const { error: dbError } = await supabase
         .from('blockchain_logs')
         .insert({
           operation,
           input_json: input,
-          result_json: result || null,
-          error_message: error || null,
+          result_json: result ?? null,
+          error_message: error ?? null,
         });
 
       if (dbError) {
-        console.error(`Failed to log blockchain operation ${operation}:`, dbError);
+        structuredLog({
+          level: 'warn',
+          message: `Failed to persist blockchain operation log: ${operation}`,
+          timestamp: new Date().toISOString(),
+          service: 'blockchain',
+          dbError: dbError.message,
+          requestId: context?.requestId,
+        });
       }
     } catch (err) {
-      console.error(`Error logging blockchain operation ${operation}:`, err);
+      structuredLog({
+        level: 'warn',
+        message: `Exception persisting blockchain operation log: ${operation}`,
+        timestamp: new Date().toISOString(),
+        service: 'blockchain',
+        error: err instanceof Error ? err.message : String(err),
+        requestId: context?.requestId,
+      });
     }
 
-    const { error: errorMsg, ...rest } = { error, ...input };
-    const entry = {
-      ...rest,
+    // Always emit a structured entry to stdout regardless of DB outcome.
+    // redactLogPayload handles secret fields (private keys, tx signatures, etc.)
+    const safeInput = redactLogPayload(input) as Record<string, unknown>;
+    const safeResult = result ? (redactLogPayload(result) as Record<string, unknown>) : undefined;
+
+    structuredLog({
+      level: error ? 'error' : 'info',
+      message: `blockchain:${operation}`,
+      timestamp: new Date().toISOString(),
+      service: 'blockchain',
       requestId: context?.requestId,
+      userId: context?.userId,
       method: context?.method,
       path: context?.path,
-      userId: context?.userId,
-    };
-    if (error) {
-      console.error(`[Blockchain:${operation}] ERROR:`, errorMsg, JSON.stringify(entry));
-    } else {
-      console.log(`[Blockchain:${operation}]`, JSON.stringify(entry));
-    }
+      input: safeInput,
+      ...(safeResult ? { result: safeResult } : {}),
+      ...(error ? { error } : {}),
+    });
   }
 }
 
@@ -110,38 +142,44 @@ type SecurityEvent =
   | 'rate_limit_exceeded';
 
 class SecurityLogger {
+  /**
+   * Record an authentication / security event.
+   *
+   * Emits via structuredLog so entries have the same shape and redaction
+   * guarantees as all other log lines. Persists to security_logs (best-effort).
+   */
   async logAuthEvent(
     event: SecurityEvent,
     userId?: string,
     meta?: Record<string, unknown>,
   ): Promise<void> {
     const context = getRequestContext();
-    const entry = {
+
+    const isFailure = event === 'login_failure' || event === 'unauthorized_access';
+
+    structuredLog({
+      level: isFailure ? 'warn' : 'info',
+      message: `security:${event}`,
+      timestamp: new Date().toISOString(),
+      service: 'api',
       event,
       userId: userId ?? context?.userId,
       requestId: context?.requestId,
       method: context?.method,
       path: context?.path,
-      timestamp: new Date().toISOString(),
-      ...meta,
-    };
+      // redactLogPayload is applied inside structuredLog so meta is safe
+      ...(meta ? { meta } : {}),
+    });
 
-    // Console output always
-    if (event === 'login_failure' || event === 'unauthorized_access') {
-      console.warn(`[Security:${event}]`, JSON.stringify(entry));
-    } else {
-      console.log(`[Security:${event}]`, JSON.stringify(entry));
-    }
-
-    // Persist to Supabase (best-effort)
+    // Persist to Supabase (best-effort — DB table may not exist yet in dev)
     try {
       await supabase.from('security_logs').insert({
         event,
-        user_id: userId || null,
-        meta_json: meta || null,
+        user_id: userId ?? null,
+        meta_json: meta ?? null,
       });
     } catch {
-      // non-fatal — DB table may not exist yet
+      // Non-fatal: missing table or transient error must not break auth flows.
     }
   }
 }

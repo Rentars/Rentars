@@ -140,6 +140,30 @@ const envSchema = z.object({
       return n;
     }),
 
+  // ── Database safeguards (Issue #663) ──────────────────────────────────────
+  // Per-query HTTP fetch timeout in ms. Any Supabase call that exceeds this
+  // duration is aborted via AbortController. Default: 25 000 ms (25 s).
+  DB_QUERY_TIMEOUT_MS: z
+    .string()
+    .default('25000')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isFinite(n) || n < 1) throw new Error('DB_QUERY_TIMEOUT_MS must be a positive number');
+      return n;
+    }),
+
+  // Queries slower than this threshold emit a structured WARN log with enough
+  // context to identify the table, operation, and owning request.
+  // Default: 2 000 ms (2 s).
+  DB_SLOW_QUERY_THRESHOLD_MS: z
+    .string()
+    .default('2000')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isFinite(n) || n < 1) throw new Error('DB_SLOW_QUERY_THRESHOLD_MS must be a positive number');
+      return n;
+    }),
+
   // ── Observability ─────────────────────────────────────────────────────────
   // Minimum log level: debug | info | warn | error  (default: info)
   LOG_LEVEL: z
