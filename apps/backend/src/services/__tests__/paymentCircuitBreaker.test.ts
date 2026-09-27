@@ -2,21 +2,36 @@
  * #618 — Payment circuit breakers and attempt limits.
  */
 
-import { describe, it, expect, beforeEach } from 'bun:test';
-import {
+import { describe, it, expect, beforeEach, mock } from 'bun:test';
+
+const mockFrom = mock(() => ({
+  select: () => ({
+    eq: () => ({
+      maybeSingle: async () => ({ data: null, error: null }),
+    }),
+  }),
+  upsert: async () => ({ error: null }),
+}));
+
+mock.module('../../config/supabase.js', () => ({
+  supabase: { from: mockFrom },
+}));
+
+const {
   allowPaymentCall,
   recordProviderFailure,
   recordProviderSuccess,
   resetCircuit,
   listCircuits,
   _resetMemoryCircuitsForTests,
-} from '../../src/services/paymentCircuitBreaker.service.js';
-import {
+} = await import('../paymentCircuitBreaker.service.js');
+
+const {
   gatePaymentAttempt,
   enqueuePaymentWork,
   getPaymentQueueStats,
   _resetAttemptCountersForTests,
-} from '../../src/services/paymentAttemptLimiter.service.js';
+} = await import('../paymentAttemptLimiter.service.js');
 
 describe('paymentCircuitBreaker (#618)', () => {
   beforeEach(() => {
@@ -64,7 +79,6 @@ describe('paymentCircuitBreaker (#618)', () => {
   it('closes from half-open after enough successes', async () => {
     const config = { failureThreshold: 1, openCooldownMs: 0, halfOpenSuccesses: 2 };
     await recordProviderFailure('stellar_horizon', 'down', config);
-    // cooldown 0 → next allow moves to half_open
     const probe = await allowPaymentCall('stellar_horizon', config);
     expect(probe.allowed).toBe(true);
     expect(probe.circuit.state).toBe('half_open');
