@@ -77,3 +77,47 @@
     outline-offset: 2px;
   }
 }
+
+/* ── Map pin keyboard focus styles (Issue 649) ────────────────────────────── */
+/*
+ * Leaflet DivIcon elements are not standard interactive elements, so the
+ * browser's native :focus-visible outline cannot be guaranteed.
+ * We apply focus rings via JS class toggling (see PropertyMapPin / PriceMarker)
+ * and via the :focus-visible selector as a belt-and-suspenders fallback.
+ */
+
+/* Pin icon (star dot) */
+.rentars-pin [role="button"]:focus-visible .rentars-pin__dot,
+.rentars-pin [role="button"].rentars-pin--focused .rentars-pin__dot {
+  box-shadow: 0 0 0 3px #ffffff, 0 0 0 5px #2563eb, 0 8px 20px rgba(0,0,0,.25);
+  transform: scale(1.12);
+}
+
+/* Price bubble */
+.rentars-price-marker:focus-visible,
+.rentars-price-marker.rentars-price-marker--focused {
+  box-shadow: 0 0 0 3px #ffffff, 0 0 0 5px #2563eb, 0 2px 8px rgba(0,0,0,0.3);
+  transform: scale(1.2) !important;
+}
+
+/* Ensure the DivIcon container itself never clips the outline ring */
+.leaflet-marker-icon {
+  overflow: visible !important;
+}
+
+/* ── Mobile bottom-sheet slide-up animation (Issue 651) ───────────────────── */
+@keyframes slide-up {
+  from { transform: translateY(100%); }
+  to   { transform: translateY(0); }
+}
+
+.animate-slide-up {
+  animation: slide-up 0.28s cubic-bezier(0.32, 0.72, 0, 1) both;
+}
+
+/* On sm+ the dialog is centred — override so animation doesn't fight translate */
+@media (min-width: 640px) {
+  .animate-slide-up {
+    animation: none;
+  }
+}

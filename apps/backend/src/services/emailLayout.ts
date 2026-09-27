@@ -47,6 +47,19 @@ export interface EmailTemplateOptions {
    * footer copy so recipients understand it cannot be unsubscribed from.
    */
   isEssential?: boolean;
+  /**
+   * BCP-47 locale tag used for the `lang` attribute on the <html> element.
+   * Helps screen readers and translation tools select the correct language.
+   * Defaults to 'en'.
+   */
+  locale?: string;
+  /**
+   * Opaque version string for the template copy that produced this email.
+   * Stored on the notification record so a delivered email can be traced back
+   * to the exact template version used.  Rendered as a hidden HTML comment and
+   * as a plaintext footer line.
+   */
+  templateVersion?: string;
 }
 
 export interface RenderedEmail {
@@ -61,7 +74,12 @@ export interface RenderedEmail {
  * All styles are inlined for maximum email-client compatibility.
  */
 export function renderEmail(options: EmailTemplateOptions): RenderedEmail {
-  const { title, body, preheader, preferencesUrl, isEssential = false } = options;
+  const {
+    title, body, preheader, preferencesUrl,
+    isEssential = false,
+    locale = 'en',
+    templateVersion,
+  } = options;
   const previewText = preheader ?? title;
 
   const footerLinks = buildFooterLinks(preferencesUrl, isEssential);
@@ -72,8 +90,13 @@ export function renderEmail(options: EmailTemplateOptions): RenderedEmail {
        </p>`
     : '';
 
+  // Hidden comment lets us trace which template version produced this email.
+  const versionComment = templateVersion
+    ? `<!-- template-version: ${escapeHtml(templateVersion)} -->\n`
+    : '';
+
   const html = `<!DOCTYPE html>
-<html lang="en">
+<html lang="${escapeHtml(locale)}">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -82,7 +105,7 @@ export function renderEmail(options: EmailTemplateOptions): RenderedEmail {
   <!--[if mso]><noscript><xml><o:OfficeDocumentSettings><o:PixelsPerInch>96</o:PixelsPerInch></o:OfficeDocumentSettings></xml></noscript><![endif]-->
 </head>
 <body style="margin:0;padding:0;background-color:#F3F4F6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
-
+${versionComment}
   <!-- Pre-header hidden preview text -->
   <span style="display:none;max-height:0;overflow:hidden;mso-hide:all;">
     ${escapeHtml(previewText)}&#847;&zwnj;&nbsp;&#847;&zwnj;&nbsp;&#847;&zwnj;&nbsp;&#847;&zwnj;&nbsp;&#847;&zwnj;&nbsp;
@@ -166,7 +189,7 @@ export function renderEmail(options: EmailTemplateOptions): RenderedEmail {
  * Strips HTML tags from `body` and appends footer links.
  */
 export function renderPlaintext(options: EmailTemplateOptions): string {
-  const { title, body, preferencesUrl, isEssential = false } = options;
+  const { title, body, preferencesUrl, isEssential = false, templateVersion } = options;
   const stripped = stripHtml(body);
 
   const lines: string[] = [
@@ -189,6 +212,10 @@ export function renderPlaintext(options: EmailTemplateOptions): string {
     lines.push(
       `This is a required account or security notification — it cannot be unsubscribed from.`,
     );
+  }
+
+  if (templateVersion) {
+    lines.push(`Template version: ${templateVersion}`);
   }
 
   lines.push(``, `© ${new Date().getFullYear()} Rentars — ${FRONTEND_URL}`);

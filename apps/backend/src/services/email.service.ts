@@ -6,10 +6,21 @@
  * All templates use the shared renderEmail() layout for consistent branding.
  * Dynamic content inserted into HTML is always passed through escapeHtml()
  * to prevent HTML injection.
+ *
+ * Issue 645: all public send methods now accept an optional `locale` parameter
+ * (defaults to 'en') and use the emailTemplates i18n system to select the
+ * correct copy.  The `templateVersion` from the i18n index is stamped into
+ * every rendered email so deliveries can be traced.
  */
 import nodemailer from 'nodemailer';
 import { env } from '@/config/env.js';
 import { renderEmail, escapeHtml } from './emailLayout.js';
+import {
+  getEmailTemplates,
+  isValidEmailLocale,
+  TEMPLATE_VERSION,
+} from './emailTemplates/index.js';
+import type { Locale } from './emailTemplates/index.js';
 
 // ─── Data shapes ──────────────────────────────────────────────────────────────
 
@@ -24,6 +35,12 @@ export type BookingEmailData = {
   checkOutTime?: string;
   /** Signed per-recipient URL for preference management (optional). */
   preferencesUrl?: string;
+  /**
+   * BCP-47 locale for this recipient.
+   * Used to select the correct i18n template copy.
+   * Defaults to 'en' when omitted or unrecognised.
+   */
+  locale?: string;
 };
 
 /**
@@ -74,6 +91,11 @@ export interface DetailedBookingEmailData {
 
   /** Signed per-recipient preference management URL. */
   preferencesUrl?: string;
+  /**
+   * BCP-47 locale for this recipient — used to select i18n template copy.
+   * Defaults to 'en'.
+   */
+  locale?: string;
 }
 
 export type PasswordResetEmailData = {
@@ -390,68 +412,89 @@ export const emailService = {
   },
 
   async sendBookingCreated(data: BookingEmailData): Promise<void> {
-    const body = `
-      <p style="margin:0 0 16px;font-size:16px;">Hi ${escapeHtml(data.userName)},</p>
-      <p style="margin:0 0 16px;">
-        Your booking for <strong>${escapeHtml(data.propertyTitle)}</strong> has been received
-        and is pending confirmation from the host.
-      </p>
-      ${bookingDetailsHtml(data)}
-      <p style="margin:16px 0 0;font-size:14px;color:#6B7280;">
-        You'll receive another email once the host confirms your stay.
-      </p>`;
-
-    const { html, text } = renderEmail({
-      title: 'Booking Received — Rentars',
-      preheader: `Your booking at ${data.propertyTitle} is pending confirmation.`,
-      body,
-      preferencesUrl: data.preferencesUrl,
+    const locale: Locale = isValidEmailLocale(data.locale) ? data.locale : 'en';
+    const templates = getEmailTemplates(locale);
+    const tpl = templates.booking_created({
+      userName:      data.userName,
+      propertyTitle: data.propertyTitle,
+      checkIn:       data.checkIn,
+      checkOut:      data.checkOut,
+      totalPrice:    data.totalPrice,
+      bookingId:     '',          // not available on simple BookingEmailData; fallback to ''
     });
 
-    await send(data.to, 'Booking Received — Rentars', html, text);
+    // Convert plaintext body to HTML paragraphs, HTML-escaping each line
+    const htmlBody = tpl.body
+      .split('\n')
+      .map((line) => line.trim() ? `<p style="margin:0 0 12px;">${escapeHtml(line)}</p>` : '')
+      .join('');
+
+    const { html, text } = renderEmail({
+      title:           tpl.subject,
+      preheader:       tpl.preheader,
+      body:            htmlBody,
+      preferencesUrl:  data.preferencesUrl,
+      locale,
+      templateVersion: TEMPLATE_VERSION,
+    });
+    await send(data.to, tpl.subject, html, text);
   },
 
   async sendBookingConfirmed(data: BookingEmailData): Promise<void> {
-    const body = `
-      <p style="margin:0 0 16px;font-size:16px;">Hi ${escapeHtml(data.userName)},</p>
-      <p style="margin:0 0 16px;">
-        Great news — your booking for <strong>${escapeHtml(data.propertyTitle)}</strong>
-        has been <strong style="color:#16A34A;">confirmed</strong> by the host!
-      </p>
-      ${bookingDetailsHtml(data)}
-      <p style="margin:16px 0 0;font-size:14px;color:#6B7280;">Safe travels, and enjoy your stay.</p>`;
-
-    const { html, text } = renderEmail({
-      title: 'Booking Confirmed — Rentars',
-      preheader: `Your stay at ${data.propertyTitle} is confirmed!`,
-      body,
-      preferencesUrl: data.preferencesUrl,
+    const locale: Locale = isValidEmailLocale(data.locale) ? data.locale : 'en';
+    const templates = getEmailTemplates(locale);
+    const tpl = templates.booking_confirmed({
+      userName:      data.userName,
+      propertyTitle: data.propertyTitle,
+      checkIn:       data.checkIn,
+      checkOut:      data.checkOut,
+      totalPrice:    data.totalPrice,
+      bookingId:     '',
+      checkInTime:   data.checkInTime,
     });
 
-    await send(data.to, 'Booking Confirmed by Host — Rentars', html, text);
+    const htmlBody = tpl.body
+      .split('\n')
+      .map((line) => line.trim() ? `<p style="margin:0 0 12px;">${escapeHtml(line)}</p>` : '')
+      .join('');
+
+    const { html, text } = renderEmail({
+      title:           tpl.subject,
+      preheader:       tpl.preheader,
+      body:            htmlBody,
+      preferencesUrl:  data.preferencesUrl,
+      locale,
+      templateVersion: TEMPLATE_VERSION,
+    });
+    await send(data.to, tpl.subject, html, text);
   },
 
   async sendBookingCancelled(data: BookingEmailData): Promise<void> {
-    const supportUrl = `${env.FRONTEND_URL}/support`;
-    const body = `
-      <p style="margin:0 0 16px;font-size:16px;">Hi ${escapeHtml(data.userName)},</p>
-      <p style="margin:0 0 16px;">
-        Your booking for <strong>${escapeHtml(data.propertyTitle)}</strong> has been cancelled.
-      </p>
-      ${bookingDetailsHtml(data)}
-      <p style="margin:16px 0 0;font-size:14px;color:#6B7280;">
-        If you did not request this cancellation or have questions, please
-        <a href="${escapeHtml(supportUrl)}" style="color:#2563EB;">contact support</a>.
-      </p>`;
-
-    const { html, text } = renderEmail({
-      title: 'Booking Cancelled — Rentars',
-      preheader: `Your booking at ${data.propertyTitle} has been cancelled.`,
-      body,
-      preferencesUrl: data.preferencesUrl,
+    const locale: Locale = isValidEmailLocale(data.locale) ? data.locale : 'en';
+    const templates = getEmailTemplates(locale);
+    const tpl = templates.booking_cancelled({
+      userName:      data.userName,
+      propertyTitle: data.propertyTitle,
+      checkIn:       data.checkIn,
+      checkOut:      data.checkOut,
+      totalPrice:    data.totalPrice,
+      bookingId:     '',
     });
 
-    await send(data.to, 'Booking Cancelled — Rentars', html, text);
+    const htmlBody = tpl.body
+      .split('\n')
+      .map((line) => line.trim() ? `<p style="margin:0 0 12px;">${escapeHtml(line)}</p>` : '')
+      .join('');
+
+    const { html, text } = renderEmail({
+      title:           tpl.subject,
+      preheader:       tpl.preheader,
+      body:            htmlBody,
+      preferencesUrl:  data.preferencesUrl,
+      locale,
+      templateVersion: TEMPLATE_VERSION,
+    });
+    await send(data.to, tpl.subject, html, text);
   },
 
   /**
@@ -503,6 +546,8 @@ export const emailService = {
       preheader: `Your stay at ${data.propertyTitle} is confirmed. Check-in: ${data.checkIn}.`,
       body,
       preferencesUrl: data.preferencesUrl,
+      locale: isValidEmailLocale(data.locale) ? data.locale : 'en',
+      templateVersion: TEMPLATE_VERSION,
     });
 
     await send(data.to, `Booking Confirmed: ${data.propertyTitle} — Rentars`, html, text);
@@ -538,6 +583,8 @@ export const emailService = {
       preheader: `New booking from ${data.tenantName} for ${data.propertyTitle}.`,
       body,
       preferencesUrl: data.preferencesUrl,
+      locale: isValidEmailLocale(data.locale) ? data.locale : 'en',
+      templateVersion: TEMPLATE_VERSION,
     });
 
     await send(data.hostEmail, `New Booking: ${data.propertyTitle} — Rentars`, html, text);

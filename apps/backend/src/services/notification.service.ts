@@ -325,6 +325,8 @@ export async function createNotificationWithEmail(
       checkOut: String(data.checkOut ?? ''),
       totalPrice: Number(data.totalPrice ?? 0),
       preferencesUrl,
+      // Thread the recipient's stored locale so emails arrive in their language
+      locale: data.locale ? String(data.locale) : 'en',
     };
 
     const emailPromise =
@@ -378,6 +380,7 @@ export async function createNotificationWithAllChannels(
       checkIn: String(data.checkIn ?? ''),
       checkOut: String(data.checkOut ?? ''),
       totalPrice: Number(data.totalPrice ?? 0),
+      locale: data.locale ? String(data.locale) : 'en',
     };
 
     const emailPromise =

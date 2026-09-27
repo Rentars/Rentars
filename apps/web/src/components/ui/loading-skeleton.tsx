@@ -1,25 +1,36 @@
-import * as React from "react"
-import { cn } from "@/lib/utils"
+import * as React from 'react';
+import { cn } from '@/lib/utils';
 
+/**
+ * Base Skeleton pulse block.
+ * Every skeleton that wraps multiple Skeleton elements should carry
+ * aria-busy="true" and aria-label on its root container so screen readers
+ * announce that content is loading — not each individual block.
+ */
 const Skeleton = React.forwardRef<
   HTMLDivElement,
   React.HTMLAttributes<HTMLDivElement>
 >(({ className, ...props }, ref) => (
   <div
     ref={ref}
-    className={cn("animate-pulse rounded-md bg-muted", className)}
+    className={cn('animate-pulse rounded-md bg-muted', className)}
     {...props}
   />
-))
-Skeleton.displayName = "Skeleton"
+));
+Skeleton.displayName = 'Skeleton';
+
+// ── Property Card ─────────────────────────────────────────────────────────────
 
 interface PropertyCardSkeletonProps {
-  className?: string
+  className?: string;
 }
 
 export function PropertyCardSkeleton({ className }: PropertyCardSkeletonProps) {
   return (
-    <div className={cn("rounded-lg border border-border overflow-hidden", className)}>
+    <div
+      className={cn('rounded-lg border border-border overflow-hidden', className)}
+      aria-hidden="true"   // parent list carries aria-busy; individual cards are decorative
+    >
       <Skeleton className="h-48 w-full" />
       <div className="p-4 space-y-3">
         <Skeleton className="h-4 w-3/4" />
@@ -30,31 +41,43 @@ export function PropertyCardSkeleton({ className }: PropertyCardSkeletonProps) {
         </div>
       </div>
     </div>
-  )
+  );
 }
 
+// ── Property List ─────────────────────────────────────────────────────────────
+
 interface PropertyListSkeletonProps {
-  count?: number
-  className?: string
+  count?: number;
+  className?: string;
 }
 
 export function PropertyListSkeleton({ count = 6, className }: PropertyListSkeletonProps) {
   return (
-    <div className={cn("grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4", className)}>
+    <div
+      aria-busy="true"
+      aria-label="Loading properties"
+      aria-live="polite"
+      className={cn('grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4', className)}
+    >
       {Array.from({ length: count }).map((_, i) => (
         <PropertyCardSkeleton key={i} />
       ))}
     </div>
-  )
+  );
 }
 
+// ── Booking Card ──────────────────────────────────────────────────────────────
+
 interface BookingSkeletonProps {
-  className?: string
+  className?: string;
 }
 
 export function BookingSkeleton({ className }: BookingSkeletonProps) {
   return (
-    <div className={cn("rounded-lg border border-border p-4 space-y-3", className)}>
+    <div
+      aria-hidden="true"
+      className={cn('rounded-lg border border-border p-4 space-y-3', className)}
+    >
       <Skeleton className="h-4 w-1/2" />
       <Skeleton className="h-4 w-3/4" />
       <Skeleton className="h-4 w-1/3" />
@@ -63,10 +86,164 @@ export function BookingSkeleton({ className }: BookingSkeletonProps) {
         <Skeleton className="h-8 w-20" />
       </div>
     </div>
-  )
+  );
 }
 
-// ── Property Detail Skeleton ─────────────────────────────────────────────────
+// ── Booking List ──────────────────────────────────────────────────────────────
+
+interface BookingListSkeletonProps {
+  count?: number;
+  className?: string;
+}
+
+/**
+ * Used on dashboard "My Bookings" and tenant booking list views.
+ * Matches the stable height of a BookingCard so there is no layout shift.
+ */
+export function BookingListSkeleton({ count = 4, className }: BookingListSkeletonProps) {
+  return (
+    <div
+      aria-busy="true"
+      aria-label="Loading bookings"
+      aria-live="polite"
+      className={cn('space-y-3', className)}
+    >
+      {Array.from({ length: count }).map((_, i) => (
+        <BookingSkeleton key={i} />
+      ))}
+    </div>
+  );
+}
+
+// ── Wallet / Escrow ───────────────────────────────────────────────────────────
+
+interface WalletSkeletonProps {
+  className?: string;
+}
+
+/**
+ * Mirrors the shape of WalletConnectionModal and USDCEscrowFlow while
+ * wallet state is being checked on mount (auto-reconnect).
+ */
+export function WalletSkeleton({ className }: WalletSkeletonProps) {
+  return (
+    <div
+      aria-busy="true"
+      aria-label="Loading wallet status"
+      aria-live="polite"
+      className={cn('rounded-lg border border-border p-6 space-y-4', className)}
+    >
+      {/* Header row */}
+      <div className="flex items-center gap-3">
+        <Skeleton className="h-8 w-8 rounded-full" />
+        <Skeleton className="h-5 w-40" />
+      </div>
+      {/* Address line */}
+      <Skeleton className="h-4 w-full" />
+      <Skeleton className="h-4 w-3/4" />
+      {/* Action button */}
+      <Skeleton className="h-10 w-full rounded-lg" />
+      {/* Network badge */}
+      <div className="flex justify-center">
+        <Skeleton className="h-4 w-32 rounded-full" />
+      </div>
+    </div>
+  );
+}
+
+// ── Notification ──────────────────────────────────────────────────────────────
+
+interface NotificationSkeletonProps {
+  count?: number;
+  className?: string;
+}
+
+/**
+ * Used in the notifications dashboard page while the notification list loads.
+ * Stable dimensions prevent layout shift when real items replace the skeleton.
+ */
+export function NotificationSkeleton({ count = 5, className }: NotificationSkeletonProps) {
+  return (
+    <div
+      aria-busy="true"
+      aria-label="Loading notifications"
+      aria-live="polite"
+      className={cn('space-y-2', className)}
+    >
+      {Array.from({ length: count }).map((_, i) => (
+        <div
+          key={i}
+          aria-hidden="true"
+          className="flex items-start gap-3 p-4 rounded-xl border border-border bg-card"
+        >
+          {/* Unread dot placeholder */}
+          <Skeleton className="mt-1.5 w-2 h-2 rounded-full flex-shrink-0" />
+          <div className="flex-1 min-w-0 space-y-2">
+            <Skeleton className="h-4 w-1/3" />
+            <Skeleton className="h-3 w-4/5" />
+            <Skeleton className="h-3 w-1/4" />
+          </div>
+          {/* Remove button placeholder */}
+          <Skeleton className="h-6 w-6 rounded flex-shrink-0" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── Dashboard Overview ────────────────────────────────────────────────────────
+
+interface DashboardSkeletonProps {
+  className?: string;
+}
+
+/**
+ * Skeleton for the host/tenant dashboard overview page.
+ * Matches the stats cards + recent-activity layout without knowing real values,
+ * so the page height is stable during data fetch.
+ */
+export function DashboardSkeleton({ className }: DashboardSkeletonProps) {
+  return (
+    <div
+      aria-busy="true"
+      aria-label="Loading dashboard"
+      aria-live="polite"
+      className={cn('space-y-8', className)}
+    >
+      {/* Stats row */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+        {Array.from({ length: 4 }).map((_, i) => (
+          <div
+            key={i}
+            aria-hidden="true"
+            className="rounded-lg border border-border p-4 space-y-2"
+          >
+            <Skeleton className="h-4 w-24" />
+            <Skeleton className="h-8 w-16" />
+          </div>
+        ))}
+      </div>
+
+      {/* Recent activity section */}
+      <div aria-hidden="true" className="space-y-3">
+        <Skeleton className="h-6 w-40" />
+        <BookingListSkeleton count={3} />
+      </div>
+
+      {/* Properties section (host only placeholder) */}
+      <div aria-hidden="true" className="space-y-3">
+        <Skeleton className="h-6 w-36" />
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          {Array.from({ length: 2 }).map((_, i) => (
+            <PropertyCardSkeleton key={i} />
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Property Detail ───────────────────────────────────────────────────────────
 
 interface PropertyDetailSkeletonProps {
   className?: string;
@@ -76,13 +253,16 @@ interface PropertyDetailSkeletonProps {
  * Layout-matching skeleton for the property detail page.
  * Mirrors the exact grid / spacing / sizing of PropertyDetail so there is
  * no cumulative layout shift when real content swaps in.
- * All colours use CSS custom properties so they automatically follow the
- * active light / dark theme (bg-muted = --muted in shadcn/ui tokens).
  */
 export function PropertyDetailSkeleton({ className }: PropertyDetailSkeletonProps) {
   return (
-    <div className={cn("max-w-6xl mx-auto px-6 py-8", className)} aria-busy="true" aria-label="Loading property details">
-      {/* ── Header ─────────────────────────────────────────────────────────── */}
+    <div
+      className={cn('max-w-6xl mx-auto px-6 py-8', className)}
+      aria-busy="true"
+      aria-label="Loading property details"
+      aria-live="polite"
+    >
+      {/* Header */}
       <div className="flex justify-between items-start mb-6">
         <div className="space-y-2 flex-1 mr-4">
           <Skeleton className="h-10 w-2/3" />
@@ -95,12 +275,11 @@ export function PropertyDetailSkeleton({ className }: PropertyDetailSkeletonProp
       </div>
 
       <div className="grid grid-cols-3 gap-8">
-        {/* ── Main column (col-span-2) ──────────────────────────────────────── */}
+        {/* Main column */}
         <div className="col-span-2 space-y-8">
-          {/* Hero image gallery — fixed h-96 matches PropertyImageGallery */}
-          <div className="space-y-2">
+          {/* Hero gallery */}
+          <div className="space-y-2" aria-hidden="true">
             <Skeleton className="w-full h-96 rounded-lg" />
-            {/* Thumbnail strip */}
             <div className="flex gap-2 overflow-hidden">
               {Array.from({ length: 5 }).map((_, i) => (
                 <Skeleton key={i} className="flex-shrink-0 w-16 h-12 rounded" />
@@ -108,16 +287,16 @@ export function PropertyDetailSkeleton({ className }: PropertyDetailSkeletonProp
             </div>
           </div>
 
-          {/* Description card */}
-          <div className="rounded-lg border border-border p-6 space-y-3">
+          {/* Description */}
+          <div aria-hidden="true" className="rounded-lg border border-border p-6 space-y-3">
             <Skeleton className="h-7 w-32" />
             <Skeleton className="h-4 w-full" />
             <Skeleton className="h-4 w-full" />
             <Skeleton className="h-4 w-4/5" />
           </div>
 
-          {/* Amenities card */}
-          <div className="rounded-lg border border-border p-6 space-y-4">
+          {/* Amenities */}
+          <div aria-hidden="true" className="rounded-lg border border-border p-6 space-y-4">
             <Skeleton className="h-7 w-36" />
             <div className="grid grid-cols-2 gap-4">
               {Array.from({ length: 6 }).map((_, i) => (
@@ -126,14 +305,14 @@ export function PropertyDetailSkeleton({ className }: PropertyDetailSkeletonProp
             </div>
           </div>
 
-          {/* Map section */}
-          <div className="space-y-4">
+          {/* Map */}
+          <div aria-hidden="true" className="space-y-4">
             <Skeleton className="h-7 w-28" />
             <Skeleton className="w-full h-64 rounded-lg" />
           </div>
 
-          {/* Availability calendar section */}
-          <div className="space-y-4">
+          {/* Calendar */}
+          <div aria-hidden="true" className="space-y-4">
             <Skeleton className="h-7 w-40" />
             <div className="rounded-lg border border-border p-4 space-y-3">
               <div className="flex justify-between items-center">
@@ -149,8 +328,8 @@ export function PropertyDetailSkeleton({ className }: PropertyDetailSkeletonProp
             </div>
           </div>
 
-          {/* Reviews section */}
-          <div className="space-y-4">
+          {/* Reviews */}
+          <div aria-hidden="true" className="space-y-4">
             <Skeleton className="h-7 w-24" />
             <div className="rounded-lg border border-border p-6 space-y-4">
               {Array.from({ length: 3 }).map((_, i) => (
@@ -166,8 +345,8 @@ export function PropertyDetailSkeleton({ className }: PropertyDetailSkeletonProp
             </div>
           </div>
 
-          {/* Host card */}
-          <div className="rounded-lg border border-border p-6">
+          {/* Host */}
+          <div aria-hidden="true" className="rounded-lg border border-border p-6">
             <Skeleton className="h-7 w-40 mb-4" />
             <div className="flex items-center gap-4">
               <Skeleton className="h-16 w-16 rounded-full flex-shrink-0" />
@@ -179,17 +358,17 @@ export function PropertyDetailSkeleton({ className }: PropertyDetailSkeletonProp
           </div>
         </div>
 
-        {/* ── Sidebar (col-span-1) ──────────────────────────────────────────── */}
+        {/* Sidebar */}
         <div className="col-span-1">
-          <div className="rounded-lg border border-border p-6 space-y-4 sticky top-8">
-            {/* Price */}
+          <div
+            aria-hidden="true"
+            className="rounded-lg border border-border p-6 space-y-4 sticky top-8"
+          >
             <div className="flex items-baseline gap-2">
               <Skeleton className="h-9 w-28" />
               <Skeleton className="h-4 w-20" />
             </div>
-            {/* Book Now button */}
             <Skeleton className="h-12 w-full rounded-lg" />
-            {/* Fee breakdown */}
             <div className="space-y-3">
               <div className="flex justify-between">
                 <Skeleton className="h-4 w-28" />
@@ -204,7 +383,6 @@ export function PropertyDetailSkeleton({ className }: PropertyDetailSkeletonProp
                 <Skeleton className="h-4 w-16" />
               </div>
             </div>
-            {/* Blockchain note */}
             <Skeleton className="h-20 w-full rounded-lg" />
           </div>
         </div>
@@ -213,4 +391,4 @@ export function PropertyDetailSkeleton({ className }: PropertyDetailSkeletonProp
   );
 }
 
-export { Skeleton }
+export { Skeleton };

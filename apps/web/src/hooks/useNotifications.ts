@@ -38,6 +38,7 @@ export function useNotifications(userId?: string, pageSize = 20) {
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [hasMore, setHasMore] = useState(false);
 
@@ -73,6 +74,7 @@ export function useNotifications(userId?: string, pageSize = 20) {
         }
 
         if (res.ok) {
+          setError(null);
           const body = await res.json();
 
           // Cursor response: { data: [...], nextCursor: string|null }
@@ -96,9 +98,14 @@ export function useNotifications(userId?: string, pageSize = 20) {
             setNextCursor(pageData.nextCursor);
             setHasMore(pageData.nextCursor !== null);
           }
+        } else {
+          const body = await res.json().catch(() => ({}));
+          setError(body?.error?.message ?? `Failed to load notifications (${res.status})`);
         }
-      } catch {
-        // Silently ignore network errors; existing state is preserved
+      } catch (err) {
+        if ((err as Error).name !== 'AbortError') {
+          setError('Network error — could not load notifications');
+        }
       } finally {
         if (isFirst) setIsLoading(false);
         else setIsLoadingMore(false);

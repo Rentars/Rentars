@@ -30,6 +30,54 @@ export interface PropertyMapProps {
   onUserLocation?: (position: GeoPosition, label: string | null) => void;
 }
 
+/**
+ * Keyboard-accessible list fallback for map pins.
+ *
+ * The Leaflet canvas can trap keyboard focus and make individual markers
+ * unreachable on some browsers. This visually-hidden (sr-only) list renders
+ * every property as a focusable button so keyboard-only and screen-reader
+ * users can always reach each property without using the map.
+ *
+ * The list is visually hidden but fully reachable via Tab — it appears
+ * just before the MapContainer in DOM order.
+ */
+function MapPinListFallback({
+  properties,
+  onPropertyClick,
+}: {
+  properties: Array<Property & { lat: number; lng: number }>;
+  onPropertyClick?: (id: string) => void;
+}) {
+  if (properties.length === 0) return null;
+  return (
+    <nav
+      aria-label="Properties on map — keyboard list"
+      className="sr-only focus-within:not-sr-only focus-within:absolute focus-within:z-[1001] focus-within:bg-white focus-within:border focus-within:border-gray-300 focus-within:rounded-lg focus-within:shadow-lg focus-within:p-3 focus-within:max-h-60 focus-within:overflow-y-auto focus-within:top-0 focus-within:left-0 focus-within:w-72"
+    >
+      <p className="text-xs font-semibold text-gray-500 mb-2 uppercase tracking-wide">
+        {properties.length} {properties.length === 1 ? 'property' : 'properties'} on map
+      </p>
+      <ul className="space-y-1">
+        {properties.map((p) => (
+          <li key={p.id}>
+            <button
+              type="button"
+              onClick={() => onPropertyClick?.(p.id)}
+              className="w-full text-left px-3 py-2 text-sm rounded hover:bg-blue-50 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none transition"
+            >
+              <span className="font-medium text-gray-900">{p.title}</span>
+              {p.price_per_night !== undefined && (
+                <span className="ml-2 text-blue-600 font-semibold">${p.price_per_night}/night</span>
+              )}
+              <span className="block text-xs text-gray-500 truncate">{p.location}</span>
+            </button>
+          </li>
+        ))}
+      </ul>
+    </nav>
+  );
+}
+
 export default function PropertyMap({
   properties,
   onPropertyClick,
@@ -82,7 +130,17 @@ export default function PropertyMap({
   };
 
   return (
-    <div className="relative w-full h-[450px] rounded-xl overflow-hidden shadow-md bg-gray-200">
+    <div
+      className="relative w-full h-[450px] rounded-xl overflow-hidden shadow-md bg-gray-200"
+      role="region"
+      aria-label="Property map"
+    >
+      {/* Keyboard list fallback — visible only on focus (sr-only) */}
+      <MapPinListFallback
+        properties={validProperties}
+        onPropertyClick={onPropertyClick}
+      />
+
       {/* Geolocation button */}
       <button
         onClick={locate}
