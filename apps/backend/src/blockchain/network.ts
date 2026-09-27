@@ -131,7 +131,7 @@ function signaturesValidForPassphrase(xdr: string, passphrase: string): boolean 
   const signatures = tx.signatures;
   if (!signatures?.length) return false;
 
-  const signatureBase = tx.signatureBase();
+  const txHash = tx.hash();
 
   const signers = tx instanceof FeeBumpTransaction ? [tx.feeSource] : [tx.source];
 
@@ -139,7 +139,7 @@ function signaturesValidForPassphrase(xdr: string, passphrase: string): boolean 
     try {
       const keypair = Keypair.fromPublicKey(signer);
       for (const sig of signatures) {
-        if (keypair.verify(signatureBase, sig.signature())) {
+        if (keypair.verify(txHash, sig.signature())) {
           return true;
         }
       }
