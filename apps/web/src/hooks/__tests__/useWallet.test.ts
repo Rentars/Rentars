@@ -12,6 +12,10 @@ describe('useWallet', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     localStorage.clear();
+    vi.mocked(freighterUtils.isUnsupportedWalletEnvironment).mockReturnValue(false);
+    vi.mocked(freighterUtils.getUnsupportedEnvironmentMessage).mockReturnValue(
+      'unsupported',
+    );
   });
 
   describe('auto-reconnect', () => {

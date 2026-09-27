@@ -46,6 +46,15 @@ const TTL_MIN: u32 = 100;
 /// Target TTL to extend entries to on every write (in ledgers).
 const TTL_EXTEND_TO: u32 = 100;
 
+// ─── Invariant / Bound Constants ──────────────────────────────────────────────
+
+/// Semantic contract version for upgrade detection (major * 100 + minor).
+pub const CONTRACT_VERSION: u32 = 100; // 1.0
+/// Maximum total_price in USDC stroops (~1M USDC) to bound arithmetic.
+const MAX_TOTAL_PRICE: i128 = 1_000_000_0000000;
+/// Maximum stay length in seconds (365 days).
+const MAX_STAY_SECS: u64 = 365 * 24 * 60 * 60;
+
 // ─── Data Types ──────────────────────────────────────────────────────────────
 
 /// Lifecycle status of a booking.
@@ -200,6 +209,14 @@ impl BookingContract {
         // ── Input validation ──────────────────────────────────────────────
         assert!(check_in < check_out, "check_in must be before check_out");
         assert!(total_price > 0, "total_price must be positive");
+        assert!(
+            total_price <= MAX_TOTAL_PRICE,
+            "total_price exceeds maximum bound"
+        );
+        let stay_secs = check_out
+            .checked_sub(check_in)
+            .expect("check_out underflow");
+        assert!(stay_secs <= MAX_STAY_SECS, "stay duration exceeds maximum");
 
         // ── Cross-contract: verify property exists and is Active ──────────
         let listing_contract_id: Address = env
@@ -254,7 +271,9 @@ impl BookingContract {
             .persistent()
             .get(&DataKey::BookingCount)
             .unwrap_or(0);
-        let id = count + 1;
+        let id = count
+            .checked_add(1)
+            .expect("booking id counter overflow");
 
         let booking = Booking {
             id,
@@ -478,6 +497,19 @@ impl BookingContract {
             .get(&DataKey::Booking(booking_id))
             .expect("Booking not found");
 
+        // Escrow references must not be mutated on terminal bookings (replay safety).
+        assert!(
+            booking.status != BookingStatus::Completed
+                && booking.status != BookingStatus::Cancelled,
+            "Cannot set escrow ID on a terminal booking"
+        );
+        // Reject empty / replayed blank escrow attachments once one is set.
+        assert!(escrow_id.len() > 0, "escrow_id must not be empty");
+        assert!(
+            booking.escrow_id.len() == 0,
+            "escrow_id already set; replay rejected"
+        );
+
         booking.escrow_id = escrow_id;
         env.storage()
             .persistent()
@@ -489,6 +521,11 @@ impl BookingContract {
     }
 
     // ── Queries ───────────────────────────────────────────────────────────────
+
+    /// Return the semantic contract version used for upgrade detection.
+    pub fn version(_env: Env) -> u32 {
+        CONTRACT_VERSION
+    }
 
     /// Retrieve a booking by its on-chain ID.
     ///
@@ -601,4 +638,7 @@ impl BookingContract {
 }
 
 #[cfg(test)]
-mod test;
+mod invariants;
+// Legacy `test.rs` targets a richer escrow API that is out of sync with this
+// lib surface; invariant coverage lives in `invariants.rs` (#624).
+

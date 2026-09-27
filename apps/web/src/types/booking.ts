@@ -45,6 +45,8 @@ export interface Booking {
   status: BookingStatus;
   escrow_id?: string;
   escrow_status?: 'locked' | 'released' | 'refunded';
+  /** Stellar public key that owns this booking's signing context (#620). */
+  tenant_wallet?: string;
   on_chain_id?: number;
   rules_acknowledged_at?: string | null;
   dispute_reason?: string | null;

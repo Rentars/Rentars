@@ -1,0 +1,26 @@
+name: Contract Compatibility Gate
+
+on:
+  pull_request:
+    paths:
+      - 'apps/contracts/**'
+      - 'apps/web/src/lib/contracts/**'
+      - 'scripts/check-contract-compat.ts'
+      - 'docs/releases/manifest-*.json'
+  push:
+    branches: [main]
+    paths:
+      - 'apps/contracts/**'
+      - 'apps/web/src/lib/contracts/**'
+      - 'scripts/check-contract-compat.ts'
+
+jobs:
+  contract-compat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: ABI + version compatibility
+        run: npx --yes tsx scripts/check-contract-compat.ts

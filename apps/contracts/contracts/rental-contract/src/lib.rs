@@ -6,6 +6,17 @@
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String};
 
 // ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Semantic contract version for upgrade detection (major * 100 + minor).
+pub const CONTRACT_VERSION: u32 = 100; // 1.0
+/// Maximum nightly price in USDC stroops.
+const MAX_PRICE_PER_NIGHT: i128 = 100_000_0000000;
+/// Maximum stay length in seconds (365 days).
+const MAX_STAY_SECS: u64 = 365 * 24 * 60 * 60;
+
+// ---------------------------------------------------------------------------
 // Data types
 // ---------------------------------------------------------------------------
 
@@ -82,12 +93,21 @@ impl RentarsContract {
     ) -> u64 {
         owner.require_auth();
 
+        assert!(price_per_night > 0, "price_per_night must be positive");
+        assert!(
+            price_per_night <= MAX_PRICE_PER_NIGHT,
+            "price_per_night exceeds maximum bound"
+        );
+        assert!(title.len() > 0, "title must not be empty");
+
         let count: u64 = env
             .storage()
             .instance()
             .get(&DataKey::PropertyCount)
             .unwrap_or(0);
-        let id = count + 1;
+        let id = count
+            .checked_add(1)
+            .expect("property id counter overflow");
 
         let property = Property {
             id,
@@ -138,15 +158,29 @@ impl RentarsContract {
         assert!(property.available, "Property is not available for booking");
         assert!(check_out > check_in, "check_out must be after check_in");
 
-        let nights = check_out - check_in;
-        let total_amount = property.price_per_night * nights as i128;
+        let stay_secs = check_out
+            .checked_sub(check_in)
+            .expect("check_out underflow");
+        assert!(stay_secs <= MAX_STAY_SECS, "stay duration exceeds maximum");
+
+        // Derive nights with checked arithmetic (assume 86400s day for total).
+        let nights = stay_secs
+            .checked_div(86_400)
+            .unwrap_or(0)
+            .max(1);
+        let total_amount = property
+            .price_per_night
+            .checked_mul(nights as i128)
+            .expect("total_amount overflow");
 
         let count: u64 = env
             .storage()
             .instance()
             .get(&DataKey::BookingCount)
             .unwrap_or(0);
-        let id = count + 1;
+        let id = count
+            .checked_add(1)
+            .expect("booking id counter overflow");
 
         let booking = Booking {
             id,
@@ -329,4 +363,12 @@ impl RentarsContract {
             .get(&DataKey::Booking(id))
             .expect("Booking not found")
     }
+
+    /// Return the semantic contract version used for upgrade detection.
+    pub fn version(_env: Env) -> u32 {
+        CONTRACT_VERSION
+    }
 }
+
+#[cfg(test)]
+mod test;

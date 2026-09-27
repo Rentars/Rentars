@@ -226,6 +226,46 @@ export async function connectFreighterWallet(expectedNetwork?: 'testnet' | 'main
 }
 
 /**
+ * Detect environments where Freighter extension handoff is unsupported (#626).
+ * Mobile browsers without a known wallet deep-link path get a clear non-dead-end message.
+ */
+export function isUnsupportedWalletEnvironment(
+  userAgent = typeof navigator !== 'undefined' ? navigator.userAgent : '',
+): boolean {
+  if (typeof window === 'undefined') return false;
+
+  const ua = userAgent.toLowerCase();
+  const isMobile = /iphone|ipad|ipod|android|mobile/.test(ua);
+  const isInAppBrowser = /fbav|instagram|line\//.test(ua);
+
+  // In-app browsers commonly break extension/wallet handoff.
+  if (isInAppBrowser) return true;
+
+  // iOS Safari / Chrome without Freighter mobile handoff documented as unsupported
+  // when no freighter global and no deep-link bridge is present.
+  if (isMobile) {
+    const hasFreighterGlobal =
+      typeof (window as unknown as { freighter?: unknown }).freighter !== 'undefined';
+    const hasFreighterApi =
+      typeof (window as unknown as { stellar?: unknown }).stellar !== 'undefined';
+    if (!hasFreighterGlobal && !hasFreighterApi) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+export function getUnsupportedEnvironmentMessage(): string {
+  return (
+    'This browser cannot complete Freighter wallet handoff. ' +
+    'On mobile, open Rentars in Safari or Chrome and use Freighter’s supported mobile flow, ' +
+    'or continue on desktop with the Freighter browser extension. ' +
+    'See docs/wallet/DEVICE_MATRIX.md for supported combinations.'
+  );
+}
+
+/**
  * Get wallet status without throwing
  */
 export async function getWalletStatus(expectedNetwork?: 'testnet' | 'mainnet'): Promise<WalletState> {

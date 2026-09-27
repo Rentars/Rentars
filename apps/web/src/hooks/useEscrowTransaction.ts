@@ -3,7 +3,11 @@
 import { useCallback, useState } from 'react';
 import * as StellarSdk from '@stellar/stellar-sdk';
 import { getNetworkPassphrase, STELLAR_NETWORKS, getExplorerUrl } from '@/lib/network-utils';
-import { signWithFreighter, FreighterError } from '@/lib/freighter-utils';
+import {
+  signWithFreighter,
+  FreighterError,
+  getFreighterPublicKey,
+} from '@/lib/freighter-utils';
 import {
   buildEscrowFundingTransaction,
   buildEscrowReleaseTransaction,
@@ -74,6 +78,24 @@ export function useEscrowTransaction(network: 'testnet' | 'mainnet' = 'testnet')
                 ownerPublicKey ?? '',
                 network,
               );
+
+        // Reject signing if Freighter switched away from the booking owner (#620).
+        const expectedSigner =
+          type === 'fund' ? tenantPublicKey : ownerPublicKey;
+        if (expectedSigner) {
+          const live = await getFreighterPublicKey();
+          if (live !== expectedSigner) {
+            setStatus('error');
+            setError(
+              'Wallet account changed. Restart the booking flow with the active account before signing.',
+            );
+            setCanRetry(false);
+            throw new FreighterError(
+              'Wallet account changed during checkout',
+              'USER_REJECTED',
+            );
+          }
+        }
 
         // Sign via Freighter with timeout
         setStatus('waiting_signature');

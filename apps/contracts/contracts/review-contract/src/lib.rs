@@ -3,7 +3,7 @@
 // Handles: on-chain reviews and reputation scoring for tenants and owners
 
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, panic_with_error, Env, String, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, panic_with_error, Address, Env, String, Vec};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -15,6 +15,10 @@ const RATING_MIN: u32 = 1;
 const RATING_MAX: u32 = 5;
 /// Maximum allowed comment length in bytes.
 const COMMENT_MAX_LEN: u32 = 500;
+/// Semantic contract version for upgrade detection (major * 100 + minor).
+pub const CONTRACT_VERSION: u32 = 100; // 1.0
+/// Maximum DID length in bytes.
+const DID_MAX_LEN: u32 = 128;
 
 // ---------------------------------------------------------------------------
 // Error enum
@@ -85,6 +89,7 @@ impl ReviewContract {
     /// Submit a review for a completed booking.
     ///
     /// # Arguments
+    /// * `reviewer`      – Stellar address of the reviewer; must authorise this call.
     /// * `booking_id`    – ID of the booking being reviewed.
     /// * `reviewer_did`  – Decentralised identifier of the reviewer.
     /// * `target_did`    – Decentralised identifier of the user being reviewed.
@@ -97,12 +102,17 @@ impl ReviewContract {
     /// * `ReviewError::DuplicateReview`      – reviewer already reviewed this booking.
     pub fn submit_review(
         env: Env,
+        reviewer: Address,
         booking_id: u64,
         reviewer_did: String,
         target_did: String,
         rating: u32,
         comment: String,
     ) -> u64 {
+        // Caller must authorise — prevents unauthorized/replayed submissions
+        // from unsigned clients injecting arbitrary DIDs.
+        reviewer.require_auth();
+
         // --- Input validation ---
 
         // Rating must be in [1, 5]
@@ -110,8 +120,12 @@ impl ReviewContract {
             panic_with_error!(&env, ReviewError::InvalidRating);
         }
 
-        // DIDs must not be empty
-        if reviewer_did.len() == 0 || target_did.len() == 0 {
+        // DIDs must not be empty and must be bounded
+        if reviewer_did.len() == 0
+            || target_did.len() == 0
+            || reviewer_did.len() > DID_MAX_LEN
+            || target_did.len() > DID_MAX_LEN
+        {
             panic_with_error!(&env, ReviewError::InvalidInput);
         }
 
@@ -125,7 +139,7 @@ impl ReviewContract {
             panic_with_error!(&env, ReviewError::UnauthorizedReviewer);
         }
 
-        // --- Duplicate prevention ---
+        // --- Duplicate / replay prevention ---
         let dedup_key = DataKey::ReviewExists(booking_id, reviewer_did.clone());
         let already_reviewed: bool = env
             .storage()
@@ -143,7 +157,9 @@ impl ReviewContract {
             .instance()
             .get(&DataKey::ReviewCount)
             .unwrap_or(0);
-        let id = count + 1;
+        let id = count
+            .checked_add(1)
+            .expect("review id counter overflow");
 
         let review = Review {
             id,
@@ -252,4 +268,15 @@ impl ReviewContract {
             .get(&DataKey::ReviewCount)
             .unwrap_or(0)
     }
+
+    /// Return the semantic contract version used for upgrade detection.
+    pub fn version(_env: Env) -> u32 {
+        CONTRACT_VERSION
+    }
 }
+
+#[cfg(test)]
+mod invariants;
+// Legacy `test.rs` targets an Address-based review API that is out of sync
+// with the DID-based lib surface; invariant coverage lives in `invariants.rs`.
+

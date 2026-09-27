@@ -46,6 +46,15 @@ const TTL_MIN: u32 = 100;
 /// Target TTL to extend entries to on every write (in ledgers).
 const TTL_EXTEND_TO: u32 = 100;
 
+// ─── Invariant / Bound Constants ──────────────────────────────────────────────
+
+/// Semantic contract version for upgrade detection (major * 100 + minor).
+pub const CONTRACT_VERSION: u32 = 100; // 1.0
+/// Maximum nightly price in USDC stroops (~100k USDC/night).
+const MAX_PRICE_PER_NIGHT: i128 = 100_000_0000000;
+/// Maximum title length in bytes.
+const MAX_TITLE_LEN: u32 = 200;
+
 // ─── Data Types ──────────────────────────────────────────────────────────────
 
 /// Status of a property listing.
@@ -74,6 +83,10 @@ pub struct PropertyListing {
 pub enum DataKey {
     Listing(u64),
     ListingCount,
+    /// Optional address of the booking contract authorised to call `set_rented`.
+    BookingContract,
+    Initialized,
+    Admin,
 }
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
@@ -110,6 +123,23 @@ pub struct PropertyListingContract;
 
 #[contractimpl]
 impl PropertyListingContract {
+    /// One-time initialization: store admin and optional booking-contract authority.
+    ///
+    /// When `booking_contract` is set, only that address may call [`set_rented`].
+    /// Call before production use so unauthorized EOAs cannot flip listings to Rented.
+    pub fn initialize(env: Env, admin: Address, booking_contract: Address) {
+        admin.require_auth();
+        assert!(
+            !env.storage().instance().has(&DataKey::Initialized),
+            "Already initialized"
+        );
+        env.storage().instance().set(&DataKey::Initialized, &true);
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::BookingContract, &booking_contract);
+    }
+
     /// Create a new property listing and persist it to on-chain storage.
     ///
     /// Assigns a monotonically increasing ID, sets status to `Active`, and
@@ -149,7 +179,12 @@ impl PropertyListingContract {
 
         // Validate inputs — fail fast before any storage reads/writes.
         assert!(price_per_night > 0, "price_per_night must be positive");
+        assert!(
+            price_per_night <= MAX_PRICE_PER_NIGHT,
+            "price_per_night exceeds maximum bound"
+        );
         assert!(title.len() > 0, "title must not be empty");
+        assert!(title.len() <= MAX_TITLE_LEN, "title exceeds maximum length");
 
         // Read the current global counter; defaults to 0 for a freshly deployed contract.
         let count: u64 = env
@@ -157,7 +192,9 @@ impl PropertyListingContract {
             .persistent()
             .get(&DataKey::ListingCount)
             .unwrap_or(0);
-        let id = count + 1;
+        let id = count
+            .checked_add(1)
+            .expect("listing id counter overflow");
 
         let listing = PropertyListing {
             id,
@@ -251,7 +288,12 @@ impl PropertyListingContract {
 
         assert!(listing.owner == caller, "Unauthorized");
         assert!(price_per_night > 0, "price_per_night must be positive");
+        assert!(
+            price_per_night <= MAX_PRICE_PER_NIGHT,
+            "price_per_night exceeds maximum bound"
+        );
         assert!(title.len() > 0, "title must not be empty");
+        assert!(title.len() <= MAX_TITLE_LEN, "title exceeds maximum length");
 
         listing.title = title;
         listing.description = description;
@@ -309,10 +351,10 @@ impl PropertyListingContract {
 
     /// Set a listing's status to `Rented` on behalf of the booking contract.
     ///
-    /// This entry point is intended for **cross-contract calls** from the
-    /// booking contract. It does NOT require the property owner's auth —
-    /// instead, Soroban's automatic contract-to-contract authorisation
-    /// applies when the booking contract invokes this function.
+    /// When the property-listing contract has been [`initialize`]d with a
+    /// booking-contract address, that address must authorise the call
+    /// (`booking_contract.require_auth()`). Uninitialized deployments keep
+    /// legacy behaviour for fixtures, but production MUST call `initialize`.
     ///
     /// # Parameters
     ///
@@ -321,15 +363,20 @@ impl PropertyListingContract {
     ///
     /// # Panics
     ///
+    /// - If a booking contract is configured and has not authorised the call.
     /// - If the listing does not exist (`"Listing not found"`).
     /// - If the listing's current status is not `Active`
     ///   (`"Property is not available for booking"`).
-    ///
-    /// # Side Effects
-    ///
-    /// - Changes `Listing(id).status` to `Rented` in persistent storage.
-    /// - Extends TTL on the updated entry.
     pub fn set_rented(env: Env, id: u64) {
+        // Enforce booking-contract auth when configured (mainnet hardening).
+        if let Some(authorized) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::BookingContract)
+        {
+            authorized.require_auth();
+        }
+
         let mut listing: PropertyListing = env
             .storage()
             .persistent()
@@ -368,7 +415,14 @@ impl PropertyListingContract {
             .get(&DataKey::ListingCount)
             .unwrap_or(0)
     }
+
+    /// Return the semantic contract version used for upgrade detection.
+    pub fn version(_env: Env) -> u32 {
+        CONTRACT_VERSION
+    }
 }
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod invariants;
