@@ -45,6 +45,8 @@ export type AdminScope =
   | 'admin:audit:read'
   // Rate limits
   | 'admin:ratelimits:read'
+  | 'admin:payments:circuit:read'
+  | 'admin:payments:circuit:reset'
   // Refund / financial
   | 'admin:refunds:approve'    // HIGH-RISK: financial action, dual-approval required
   | 'admin:reconciliation:read';
@@ -77,6 +79,8 @@ export const ROLE_SCOPES: Record<AdminRole, AdminScope[]> = {
     'admin:disputes:resolve',
     'admin:audit:read',
     'admin:ratelimits:read',
+    'admin:payments:circuit:read',
+    'admin:payments:circuit:reset',
     'admin:refunds:approve',
     'admin:reconciliation:read',
   ],
@@ -99,6 +103,7 @@ export const ROLE_SCOPES: Record<AdminRole, AdminScope[]> = {
     'admin:bookings:read',
     'admin:disputes:read',
     'admin:ratelimits:read',
+    'admin:payments:circuit:read',
     'admin:audit:read',
   ],
   finance: [
@@ -106,6 +111,8 @@ export const ROLE_SCOPES: Record<AdminRole, AdminScope[]> = {
     'admin:disputes:read',
     'admin:refunds:approve',
     'admin:reconciliation:read',
+    'admin:payments:circuit:read',
+    'admin:payments:circuit:reset',
     'admin:audit:read',
   ],
 };

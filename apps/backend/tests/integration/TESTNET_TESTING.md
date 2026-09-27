@@ -86,6 +86,19 @@ The testnet tests cover:
    - Invalid contract addresses
    - Network timeouts
 
+5. **Payment & Escrow Certification Suite (#617 / Issue 049)**
+   - Repeatable certification before mainnet or major payment changes
+   - Steps: provision disposable accounts → fund → booking → USDC transfer →
+     escrow lock → confirmation → cancellation → refund → timeout → reconciliation
+   - Every step emits tagged artifacts: correlation ID, booking ID, payment ID,
+     escrow/contract IDs, explorer tx link, reconciliation record
+   - **Never uses production secrets** — refused if `MAINNET_*` / `PROD_*` env vars are set
+   - Simulated mode runs in CI without network: `bun run test:certification`
+   - Live testnet: `bun run test:testnet` with `.env.testnet` only
+
+   On failure, `formatCertificationFailure(report)` prints the exact transaction,
+   booking, and reconciliation record for the failed step.
+
 ## CI/CD Integration
 
 In CI/CD pipelines, testnet tests are skipped by default. To enable them:

@@ -6,6 +6,12 @@ import { auditLogger } from '@/services/auditLogger.service.js';
 import { supabase } from '@/config/supabase.js';
 import type { AdminRequest } from '@/middleware/admin.middleware.js';
 import { z } from 'zod';
+import {
+  listCircuits,
+  resetCircuit,
+  type PaymentProvider,
+} from '@/services/paymentCircuitBreaker.service.js';
+import { getPaymentQueueStats } from '@/services/paymentAttemptLimiter.service.js';
 
 // ─── Featured listings ────────────────────────────────────────────────────────
 
@@ -724,4 +730,43 @@ export async function approveRefundHandler(req: AdminRequest, res: Response): Pr
     approved_by: req.adminId,
     co_approved_by: approvalActorId,
   });
+}
+
+// ─── Payment circuit breakers (#618) ──────────────────────────────────────────
+
+/**
+ * GET /api/v1/admin/payments/circuits
+ * Operator view of provider circuit state + confirmation queue backpressure.
+ */
+export async function getPaymentCircuitsHandler(_req: Request, res: Response): Promise<void> {
+  const circuits = await listCircuits();
+  res.json({
+    circuits,
+    queue: getPaymentQueueStats(),
+  });
+}
+
+/**
+ * POST /api/v1/admin/payments/circuits/:provider/reset
+ * Safely force a provider circuit closed and clear failure counters.
+ */
+export async function resetPaymentCircuitHandler(req: AdminRequest, res: Response): Promise<void> {
+  const provider = req.params.provider as PaymentProvider | string;
+  const allowed = new Set(['stellar_horizon', 'trustless_work', 'soroban_rpc']);
+  if (!allowed.has(provider)) {
+    res.status(400).json({ error: `Unknown payment provider: ${provider}` });
+    return;
+  }
+
+  const circuit = await resetCircuit(provider);
+
+  await auditLogger.log({
+    actorId: req.adminId,
+    action: 'payment.submit',
+    resourceType: 'payment_circuit',
+    resourceId: provider,
+    meta: { state: circuit.state, event: 'circuit_reset' },
+  });
+
+  res.json({ reset: true, circuit });
 }

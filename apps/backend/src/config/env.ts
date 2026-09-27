@@ -100,6 +100,48 @@ const envSchema = z.object({
       return n;
     }),
 
+  // ── Payment attempt limits & circuit breakers (#618) ───────────────────────
+  PAYMENT_ATTEMPT_WINDOW_MS: z
+    .string()
+    .default('60000')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 1) throw new Error('PAYMENT_ATTEMPT_WINDOW_MS must be a positive integer');
+      return n;
+    }),
+  PAYMENT_ATTEMPT_MAX_PER_USER: z
+    .string()
+    .default('10')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 1) throw new Error('PAYMENT_ATTEMPT_MAX_PER_USER must be a positive integer');
+      return n;
+    }),
+  PAYMENT_ATTEMPT_MAX_PER_BOOKING: z
+    .string()
+    .default('5')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 1) throw new Error('PAYMENT_ATTEMPT_MAX_PER_BOOKING must be a positive integer');
+      return n;
+    }),
+  PAYMENT_CIRCUIT_FAILURE_THRESHOLD: z
+    .string()
+    .default('5')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 1) throw new Error('PAYMENT_CIRCUIT_FAILURE_THRESHOLD must be a positive integer');
+      return n;
+    }),
+  PAYMENT_CIRCUIT_COOLDOWN_MS: z
+    .string()
+    .default('30000')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 1) throw new Error('PAYMENT_CIRCUIT_COOLDOWN_MS must be a positive integer');
+      return n;
+    }),
+
   // ── Booking expiry ────────────────────────────────────────────────────────
   // Hours before a Pending booking automatically expires (default: 24 h).
   PENDING_BOOKING_EXPIRY_HOURS: z

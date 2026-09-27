@@ -1,6 +1,22 @@
 import type { Response } from 'express';
 import type { AuthRequest } from '../middleware/auth.middleware.js';
-import { sendMessage, getConversation, markMessageRead } from '../services/message.service.js';
+import {
+  sendMessageWithParams,
+  getConversation,
+  getConversationById,
+  markMessageRead,
+  retryMessageDelivery,
+  assertCanAttach,
+  messageDeliveryMetrics,
+} from '../services/message.service.js';
+
+function statusForMessageError(error: string | undefined): number {
+  if (!error) return 400;
+  if (error.includes('not found') || error.includes('not found')) return 404;
+  if (error.startsWith('Forbidden') || error.includes('deleted')) return 403;
+  if (error.includes('not allowed') || error.includes('archived')) return 409;
+  return 400;
+}
 
 export async function sendMessageHandler(req: AuthRequest, res: Response): Promise<void> {
   const senderId = req.userId;
@@ -9,11 +25,19 @@ export async function sendMessageHandler(req: AuthRequest, res: Response): Promi
     return;
   }
 
-  const { propertyId, body, recipientId } = req.body;
-  const result = await sendMessage(senderId, propertyId, body, recipientId);
+  const { propertyId, body, recipientId, conversationId, bookingId, clientMessageId } = req.body;
+  const result = await sendMessageWithParams({
+    senderId,
+    propertyId,
+    body,
+    recipientId,
+    conversationId,
+    bookingId,
+    clientMessageId,
+  });
 
   if (!result.success) {
-    res.status(result.error === 'Property not found' ? 404 : 400).json({ error: result.error });
+    res.status(statusForMessageError(result.error)).json({ error: result.error });
     return;
   }
 
@@ -37,7 +61,24 @@ export async function getConversationHandler(req: AuthRequest, res: Response): P
   const result = await getConversation(userId, otherUserId, propertyId);
 
   if (!result.success) {
-    res.status(500).json({ error: result.error });
+    res.status(statusForMessageError(result.error)).json({ error: result.error });
+    return;
+  }
+
+  res.json(result.data);
+}
+
+export async function getConversationByIdHandler(req: AuthRequest, res: Response): Promise<void> {
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const result = await getConversationById(userId, req.params.conversationId);
+
+  if (!result.success) {
+    res.status(statusForMessageError(result.error)).json({ error: result.error });
     return;
   }
 
@@ -54,9 +95,50 @@ export async function markReadHandler(req: AuthRequest, res: Response): Promise<
   const result = await markMessageRead(req.params.id, userId);
 
   if (!result.success) {
-    res.status(result.error === 'Message not found' ? 404 : 400).json({ error: result.error });
+    res.status(statusForMessageError(result.error)).json({ error: result.error });
     return;
   }
 
   res.json(result.data);
+}
+
+export async function retryMessageHandler(req: AuthRequest, res: Response): Promise<void> {
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const result = await retryMessageDelivery(req.params.id, userId);
+
+  if (!result.success) {
+    res.status(statusForMessageError(result.error)).json({ error: result.error });
+    return;
+  }
+
+  res.json(result.data);
+}
+
+/**
+ * Pre-flight authorization for attachment uploads — membership only.
+ * Actual file handling remains in the upload pipeline.
+ */
+export async function authorizeAttachmentHandler(req: AuthRequest, res: Response): Promise<void> {
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const result = await assertCanAttach(req.params.conversationId, userId);
+  if (!result.success) {
+    res.status(statusForMessageError(result.error)).json({ error: result.error });
+    return;
+  }
+
+  res.json({ allowed: true, conversationId: result.data!.id });
+}
+
+export async function messageMetricsHandler(_req: AuthRequest, res: Response): Promise<void> {
+  res.json({ delivery: { ...messageDeliveryMetrics } });
 }

@@ -20,6 +20,8 @@
     "test:property-based": "bun test tests/unit/property-based.test.ts",
     "test:concurrency": "bun test tests/integration/concurrency.test.ts",
     "test:journey": "bun test tests/integration/booking-journey.test.ts",
+    "test:testnet": "RUN_TESTNET_TESTS=true bun test tests/integration/payment-escrow-certification.test.ts tests/integration/blockchain-integration.test.ts",
+    "test:certification": "bun test tests/integration/payment-escrow-certification.test.ts",
     "validate:migrations": "bun run scripts/validate-migrations.ts",
     "db:seed": "bun run database/seed.ts"
   },

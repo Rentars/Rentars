@@ -17,11 +17,18 @@ import { Router } from 'express';
 import type { Request, Response, NextFunction } from 'express';
 import { json } from 'express';
 import { authenticate } from '@/middleware/auth.middleware.js';
-import { bookingRateLimiter } from '@/middleware/rateLimiter.js';
+import { bookingRateLimiter, createUserRateLimiter } from '@/middleware/rateLimiter.js';
 import { submitPayment, getStatus, retryPayment } from '@/controllers/payment.controller.js';
 import { handlePaymentCallback } from '@/controllers/paymentCallback.controller.js';
 
 const router = Router();
+
+/** Per-user payment submit/retry limiter (#618). */
+const paymentUserLimiter = createUserRateLimiter({
+  windowMs: Number(process.env.PAYMENT_ATTEMPT_WINDOW_MS ?? 60_000),
+  max: Number(process.env.PAYMENT_ATTEMPT_MAX_PER_USER ?? 10),
+  keyPrefix: 'rl:user:payment',
+});
 
 // ── Webhook (unauthenticated, raw-body capture) ───────────────────────────────
 
@@ -54,7 +61,7 @@ router.use(authenticate);
  * POST /api/v1/payments/submit
  * Submit a signed XDR to Stellar and create a tracked payment intent.
  */
-router.post('/submit', bookingRateLimiter, submitPayment);
+router.post('/submit', bookingRateLimiter, paymentUserLimiter, submitPayment);
 
 /**
  * GET /api/v1/payments/:id/status
@@ -66,6 +73,6 @@ router.get('/:id/status', getStatus);
  * POST /api/v1/payments/:id/retry
  * Retry a failed or timed-out payment safely (double-spend protected).
  */
-router.post('/:id/retry', bookingRateLimiter, retryPayment);
+router.post('/:id/retry', bookingRateLimiter, paymentUserLimiter, retryPayment);
 
 export default router;

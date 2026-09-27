@@ -9,4 +9,12 @@ export const sendMessageSchema = z.object({
     .min(1, 'body must not be empty')
     .max(2000, 'body must be at most 2000 characters'),
   recipientId: z.string().uuid('recipientId must be a valid UUID').optional(),
+  conversationId: z.string().uuid('conversationId must be a valid UUID').optional(),
+  bookingId: z.string().uuid('bookingId must be a valid UUID').optional(),
+  /** Stable client identity across retries and devices (#640). */
+  clientMessageId: z
+    .string()
+    .min(1)
+    .max(128)
+    .optional(),
 });

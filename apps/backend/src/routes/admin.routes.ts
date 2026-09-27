@@ -48,6 +48,9 @@ import {
   getDashboard,
   // Audit logs
   getAuditLogsHandler,
+  // Payment circuits (#618)
+  getPaymentCircuitsHandler,
+  resetPaymentCircuitHandler,
 } from '@/controllers/admin.controller.js';
 
 const router = Router();
@@ -96,6 +99,16 @@ router.post('/disputes/:id/resolve', requireScope('admin:disputes:resolve'), res
 // ── Rate-limit summary ────────────────────────────────────────────────────────
 // Scope: admin:ratelimits:read → admin, support
 router.get('/rate-limits', requireScope('admin:ratelimits:read'), getRateLimitSummary);
+
+// ── Payment circuit breakers (#618) ───────────────────────────────────────────
+// Scope: admin:payments:circuit:read  → admin, support, finance
+// Scope: admin:payments:circuit:reset → admin, finance
+router.get('/payments/circuits', requireScope('admin:payments:circuit:read'), getPaymentCircuitsHandler);
+router.post(
+  '/payments/circuits/:provider/reset',
+  requireScope('admin:payments:circuit:reset'),
+  resetPaymentCircuitHandler,
+);
 
 // ── Search analytics ──────────────────────────────────────────────────────────
 // Scope: admin:analytics:read → admin, moderator
