@@ -1,3 +1,4 @@
+import { getPublicContractVersions } from '@/blockchain/registry.js';
 import { getRpcHealth } from '@/blockchain/soroban.js';
 import { pingRedis } from '@/config/redis.js';
 import { supabase } from '@/config/supabase.js';
@@ -39,6 +40,16 @@ export function toHealthStatus(result: PromiseSettledResult<boolean | null>): He
  * Each dependency is probed concurrently with a bounded timeout. Returns
  * HTTP 503 with status "degraded" if any configured dependency is down.
  */
+/**
+ * Public contract version metadata (no contract IDs or secrets).
+ */
+router.get('/health/contracts', (_req: Request, res: Response) => {
+  res.status(200).json({
+    timestamp: new Date().toISOString(),
+    contracts: getPublicContractVersions(),
+  });
+});
+
 router.get('/health', async (_req: Request, res: Response) => {
   const [databaseResult, redisResult, blockchainResult] = await Promise.allSettled([
     pingDatabase(),

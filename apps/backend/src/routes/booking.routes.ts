@@ -33,6 +33,7 @@ import {
 } from '@/validators/booking.validator.js';
 import { env } from '@/config/env.js';
 import { validatePagination } from '@/validators/pagination.validator.js';
+import disputeEvidenceRoutes from './disputeEvidence.routes.js';
 
 const router = Router();
 
@@ -101,6 +102,9 @@ router.post('/:id/dispute', authenticate, validateBody(raiseDisputeSchema), rais
 
 // POST /api/v1/bookings/:id/dispute/resolve
 router.post('/:id/dispute/resolve', authenticate, validateBody(resolveDisputeSchema), resolveDispute);
+
+// Dispute evidence (upload, list, signed download)
+router.use('/:id/dispute/evidence', disputeEvidenceRoutes);
 
 // PATCH /api/v1/bookings/:id
 router.patch('/:id', authenticate, validateBody(updateBookingSchema), updateBooking);

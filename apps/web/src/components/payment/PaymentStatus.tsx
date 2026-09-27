@@ -13,7 +13,8 @@ export type PaymentStatusValue =
   | 'submitted'
   | 'confirmed'
   | 'failed'
-  | 'timed_out';
+  | 'timed_out'
+  | 'awaiting_reconciliation';
 
 interface PaymentStatusProps {
   /** Payment ID returned from /api/v1/payments/submit */
@@ -47,7 +48,7 @@ const STATE_CONFIG: Record<
   submitted: {
     icon: '⏳',
     title: 'Payment Submitted',
-    description: 'Your payment is being confirmed on the Stellar network.',
+    description: 'Your payment is on the Stellar network and awaiting ledger confirmation.',
     color: 'text-yellow-600',
   },
   confirmed: {
@@ -64,20 +65,46 @@ const STATE_CONFIG: Record<
   },
   timed_out: {
     icon: '⏱️',
-    title: 'Payment Timed Out',
-    description: 'Stellar confirmation took too long. Your funds have not been charged.',
-    color: 'text-orange-600',
+    title: 'Confirmation Delayed',
+    description: 'We are still verifying your payment on Stellar. This is not a failure.',
+    color: 'text-amber-600',
+  },
+  awaiting_reconciliation: {
+    icon: '🔄',
+    title: 'Pending Reconciliation',
+    description:
+      'Your payment was submitted successfully. Background reconciliation is still confirming it on Stellar.',
+    color: 'text-amber-600',
   },
 };
+
+function mapApiStatus(
+  status: string,
+  confirmationStatus?: string,
+): PaymentStatusValue {
+  if (status === 'timed_out' && confirmationStatus === 'awaiting_reconciliation') {
+    return 'awaiting_reconciliation';
+  }
+  if (status === 'submitted') {
+    return 'submitted';
+  }
+  if (status === 'confirmed') {
+    return 'confirmed';
+  }
+  if (status === 'failed') {
+    return 'failed';
+  }
+  if (status === 'timed_out') {
+    return 'timed_out';
+  }
+  return 'idle';
+}
 
 /**
  * PaymentStatus — displays the current state of a USDC payment with polling.
  *
- * When `paymentId` is provided and status is 'submitted', this component
- * polls GET /api/v1/payments/:id/status every 3 seconds until confirmed,
- * failed, or timed_out.
- *
- * After 15 seconds in 'submitted', shows a delayed-confirmation banner.
+ * Distinguishes submitted (inline poll) vs confirmed vs pending reconciliation
+ * (poll window expired but tx may still land on ledger).
  */
 export function PaymentStatus({
   paymentId,
@@ -95,9 +122,15 @@ export function PaymentStatus({
   const status = controlledStatus ?? internalStatus;
   const config = STATE_CONFIG[status];
 
-  // Poll for status updates while submitted
+  const shouldPoll =
+    Boolean(paymentId) &&
+    (status === 'submitted' ||
+      status === 'awaiting_reconciliation' ||
+      status === 'timed_out');
+
+  // Poll for status updates while submitted or awaiting reconciliation
   useEffect(() => {
-    if (!paymentId || status !== 'submitted') {
+    if (!shouldPoll) {
       if (pollRef.current) clearInterval(pollRef.current);
       return;
     }
@@ -110,12 +143,19 @@ export function PaymentStatus({
           headers: { Authorization: `Bearer ${token ?? ''}` },
         });
         if (!res.ok) return;
-        const json = (await res.json()) as { status: PaymentStatusValue; txHash?: string };
+        const json = (await res.json()) as {
+          status: string;
+          confirmationStatus?: string;
+          txHash?: string;
+        };
         if (json.txHash) setTxHash(json.txHash);
-        if (json.status !== 'submitted') {
-          setInternalStatus(json.status);
+        const next = mapApiStatus(json.status, json.confirmationStatus);
+        if (next === 'confirmed' || next === 'failed') {
+          setInternalStatus(next);
           if (pollRef.current) clearInterval(pollRef.current);
           if (delayTimerRef.current) clearTimeout(delayTimerRef.current);
+        } else if (next !== status) {
+          setInternalStatus(next);
         }
       } catch {
         // network error — keep polling
@@ -123,20 +163,24 @@ export function PaymentStatus({
     };
 
     pollRef.current = setInterval(poll, POLL_INTERVAL_MS);
-    poll(); // immediate first check
+    poll();
 
-    // Show delayed-confirmation banner after 15 seconds
-    delayTimerRef.current = setTimeout(() => setIsDelayed(true), DELAYED_CONFIRMATION_THRESHOLD_MS);
+    if (status === 'submitted') {
+      delayTimerRef.current = setTimeout(
+        () => setIsDelayed(true),
+        DELAYED_CONFIRMATION_THRESHOLD_MS,
+      );
+    }
 
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
       if (delayTimerRef.current) clearTimeout(delayTimerRef.current);
       setIsDelayed(false);
     };
-  }, [paymentId, status]);
+  }, [paymentId, shouldPoll, status]);
 
-  const showRetry = status === 'failed' || status === 'timed_out';
-  const showCancel = status === 'failed' || status === 'timed_out';
+  const showRetry = status === 'failed';
+  const showCancel = status === 'failed';
 
   return (
     <div
@@ -167,7 +211,10 @@ export function PaymentStatus({
       )}
 
       {/* Spinner for in-progress states */}
-      {(status === 'awaiting_wallet_approval' || status === 'submitted') && (
+      {(status === 'awaiting_wallet_approval' ||
+        status === 'submitted' ||
+        status === 'awaiting_reconciliation' ||
+        status === 'timed_out') && (
         <div
           aria-hidden="true"
           className="h-6 w-6 animate-spin rounded-full border-2 border-blue-500 border-t-transparent"

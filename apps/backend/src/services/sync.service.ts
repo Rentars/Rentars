@@ -21,7 +21,14 @@ import { PropertyListingClient } from '@/blockchain/propertyListingClient.js';
 import { getTransactionStatus } from '@/blockchain/transactionUtils.js';
 import { getSorobanServer } from '@/blockchain/soroban.js';
 import { supabase } from '@/config/supabase.js';
+import { Horizon } from '@stellar/stellar-sdk';
 import { createNotification } from './notification.service.js';
+import { updatePaymentStatus } from './payment.service.js';
+import {
+  classifyTxOutcome,
+  horizonFetchLedgerHead,
+  horizonFetchTransaction,
+} from './transactionConfirmation.service.js';
 import type { ServiceResponse } from './index.js';
 import type { Booking as BookingDBRow } from '@/services/booking.service.js';
 
@@ -507,6 +514,105 @@ export async function reconcileAllPendingEscrows(): Promise<ServiceResponse<{ re
       } catch (err) {
         failed++;
         console.error(`[reconcile] Failed to reconcile booking ${booking.id}:`, err);
+      }
+    }
+
+    return { success: true, data: { reconciled, failed } };
+  } catch (err) {
+    return { success: false, error: (err as Error).message };
+  }
+}
+
+// ─── #622 Stellar payment confirmation reconciliation ───────────────────────
+
+function getHorizonServerForNetwork(network: string | null | undefined): Horizon.Server {
+  const net = network === 'mainnet' ? 'mainnet' : 'testnet';
+  const url =
+    net === 'mainnet'
+      ? 'https://horizon.stellar.org'
+      : 'https://horizon-testnet.stellar.org';
+  return new Horizon.Server(url);
+}
+
+interface PaymentReconcileRow {
+  id: string;
+  status: string;
+  stellar_tx_hash: string;
+  stellar_network?: string | null;
+  confirmation_status?: string | null;
+}
+
+/**
+ * Reconcile payments whose inline Horizon poll expired without confirmation.
+ * Does not mark unresolved payments as failed — only promotes confirmed/failed
+ * when Horizon returns a definitive result.
+ */
+export async function reconcilePendingPaymentConfirmations(): Promise<
+  ServiceResponse<{ reconciled: number; failed: number }>
+> {
+  try {
+    const { data: payments, error } = await supabase
+      .from('payments')
+      .select('id, status, stellar_tx_hash, stellar_network, confirmation_status')
+      .not('stellar_tx_hash', 'is', null)
+      .or('status.eq.timed_out,confirmation_status.eq.awaiting_reconciliation');
+
+    if (error) {
+      return { success: false, error: error.message };
+    }
+
+    let reconciled = 0;
+    let failed = 0;
+
+    for (const row of (payments ?? []) as PaymentReconcileRow[]) {
+      if (!row.stellar_tx_hash) continue;
+      if (row.status === 'confirmed' || row.status === 'failed') continue;
+
+      try {
+        const server = getHorizonServerForNetwork(row.stellar_network);
+        const fetchTx = horizonFetchTransaction(server);
+        const lookup = await fetchTx(row.stellar_tx_hash);
+
+        let ledgerHead: number | undefined;
+        if (lookup !== 'not_found' && lookup !== 'error') {
+          try {
+            ledgerHead = await horizonFetchLedgerHead(server)();
+          } catch {
+            ledgerHead = undefined;
+          }
+        }
+
+        const outcome = classifyTxOutcome(lookup, { ledgerHead });
+
+        if (outcome === 'confirmed') {
+          await updatePaymentStatus(row.id, row.stellar_tx_hash, 'confirmed', {
+            stellarNetwork: row.stellar_network ?? undefined,
+            confirmationStatus: 'confirmed',
+          });
+          reconciled++;
+          continue;
+        }
+
+        if (outcome === 'failed') {
+          await updatePaymentStatus(row.id, row.stellar_tx_hash, 'failed', {
+            stellarNetwork: row.stellar_network ?? undefined,
+            confirmationStatus: 'failed',
+          });
+          failed++;
+          continue;
+        }
+
+        // Still not on ledger or transient Horizon error — leave for next sweep.
+        await supabase
+          .from('payments')
+          .update({
+            confirmation_status: 'awaiting_reconciliation',
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', row.id);
+      } catch (err) {
+        failed++;
+        console.error(`[reconcile] Payment confirmation failed for ${row.id}:`, err);
       }
     }
 

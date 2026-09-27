@@ -1,10 +1,22 @@
-import { Networks, StrKey } from '@stellar/stellar-sdk';
+import { StrKey } from '@stellar/stellar-sdk';
+import {
+  getHorizonUrl,
+  getNetworkPassphrase,
+  getStellarNetwork,
+  validateEnvNetworkPassphrase,
+} from './network.js';
+import { validateAgainstRegistry } from './registry.js';
 
 export const STELLAR_RPC_URL =
-  process.env.STELLAR_RPC_URL ?? 'https://soroban-testnet.stellar.org';
+  process.env.STELLAR_RPC_URL ??
+  (getStellarNetwork() === 'mainnet'
+    ? 'https://soroban-mainnet.stellar.org'
+    : 'https://soroban-testnet.stellar.org');
 
 export const NETWORK_PASSPHRASE =
-  process.env.STELLAR_NETWORK_PASSPHRASE ?? Networks.TESTNET;
+  process.env.STELLAR_NETWORK_PASSPHRASE?.trim() || getNetworkPassphrase();
+
+export { getStellarNetwork, getNetworkPassphrase, getHorizonUrl };
 
 export const PROPERTY_LISTING_CONTRACT_ID =
   process.env.PROPERTY_LISTING_CONTRACT_ID ?? '';
@@ -64,6 +76,14 @@ export function validateBlockchainConfig(): ConfigValidationError[] {
     });
   }
 
+  const passphraseMismatch = validateEnvNetworkPassphrase();
+  if (passphraseMismatch) {
+    errors.push({
+      field: 'STELLAR_NETWORK_PASSPHRASE',
+      message: passphraseMismatch,
+    });
+  }
+
   if (BLOCKCHAIN_FEATURES_ENABLED) {
     if (!isValidContractId(PROPERTY_LISTING_CONTRACT_ID)) {
       errors.push({
@@ -92,6 +112,21 @@ export function validateBlockchainConfig(): ConfigValidationError[] {
         message: 'Admin secret key is required when blockchain features are enabled',
       });
     }
+  }
+
+  if (BLOCKCHAIN_FEATURES_ENABLED && errors.length === 0) {
+    errors.push(
+      ...validateAgainstRegistry({
+        blockchainFeaturesEnabled: BLOCKCHAIN_FEATURES_ENABLED,
+        networkPassphrase: NETWORK_PASSPHRASE,
+        stellarNetwork: getStellarNetwork(),
+        contractIds: {
+          'property-listing': PROPERTY_LISTING_CONTRACT_ID,
+          booking: BOOKING_CONTRACT_ID,
+          review: REVIEW_CONTRACT_ID,
+        },
+      }),
+    );
   }
 
   return errors;

@@ -44,3 +44,5 @@ export class EscrowError extends Error {
     this.name = 'EscrowError';
   }
 }
+
+export { NetworkMismatchError } from './network.js';

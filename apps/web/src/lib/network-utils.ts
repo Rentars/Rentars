@@ -22,11 +22,26 @@ export function getNetworkPassphrase(network: 'testnet' | 'mainnet' = 'testnet')
 }
 
 /**
- * Get the expected network from environment configuration
+ * Get the expected network from environment configuration.
+ * Production builds must set NEXT_PUBLIC_STELLAR_NETWORK explicitly.
  */
 export function getExpectedNetwork(): 'testnet' | 'mainnet' {
-  const network = process.env.NEXT_PUBLIC_STELLAR_NETWORK;
-  return network === 'mainnet' ? 'mainnet' : 'testnet';
+  const network = process.env.NEXT_PUBLIC_STELLAR_NETWORK?.trim().toLowerCase();
+  if (network === 'mainnet' || network === 'testnet') {
+    return network;
+  }
+
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error(
+      'NEXT_PUBLIC_STELLAR_NETWORK must be set to "mainnet" or "testnet" in production builds',
+    );
+  }
+
+  return 'testnet';
+}
+
+export function getExpectedNetworkLabel(): string {
+  return getNetworkConfig(getExpectedNetwork()).name;
 }
 
 /**

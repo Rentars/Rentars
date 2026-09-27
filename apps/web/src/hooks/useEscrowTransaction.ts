@@ -2,7 +2,12 @@
 
 import { useCallback, useState } from 'react';
 import * as StellarSdk from '@stellar/stellar-sdk';
-import { getNetworkPassphrase, STELLAR_NETWORKS, getExplorerUrl } from '@/lib/network-utils';
+import {
+  getExpectedNetwork,
+  getNetworkPassphrase,
+  STELLAR_NETWORKS,
+  getExplorerUrl,
+} from '@/lib/network-utils';
 import { signWithFreighter, FreighterError } from '@/lib/freighter-utils';
 import {
   buildEscrowFundingTransaction,
@@ -33,7 +38,7 @@ async function submitXdrToHorizon(xdr: string, network: 'testnet' | 'mainnet') {
   return result.hash;
 }
 
-export function useEscrowTransaction(network: 'testnet' | 'mainnet' = 'testnet') {
+export function useEscrowTransaction(network: 'testnet' | 'mainnet' = getExpectedNetwork()) {
   const [status, setStatus] = useState<EscrowTxStatus>('idle');
   const [error, setError] = useState<string | null>(null);
   const [canRetry, setCanRetry] = useState(false);
@@ -59,6 +64,14 @@ export function useEscrowTransaction(network: 'testnet' | 'mainnet' = 'testnet')
       setStatus('idle');
       setError(null);
       setCanRetry(false);
+
+      const configuredNetwork = getExpectedNetwork();
+      if (network !== configuredNetwork) {
+        const mismatchMessage = `App is configured for ${configuredNetwork} but transaction requested ${network}.`;
+        setError(mismatchMessage);
+        setStatus('error');
+        throw new FreighterError(mismatchMessage, 'NETWORK_MISMATCH');
+      }
 
       try {
         const { xdr } =

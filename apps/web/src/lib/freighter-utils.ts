@@ -1,4 +1,5 @@
 import { isConnected, getAddress, signTransaction, getNetwork } from '@stellar/freighter-api';
+import { getNetworkPassphrase as getConfiguredPassphrase } from '@/lib/network-utils';
 
 export interface WalletState {
   isConnected: boolean;
@@ -63,8 +64,10 @@ export async function getWalletNetwork(): Promise<'testnet' | 'mainnet'> {
     return result.network === 'PUBLIC' ? 'mainnet' : 'testnet';
   } catch (error) {
     if (error instanceof FreighterError) throw error;
-    // Default to testnet if we can't determine
-    return 'testnet';
+    throw new FreighterError(
+      'Unable to read Freighter network. Open Freighter and confirm your network, then try again.',
+      'NETWORK_ERROR',
+    );
   }
 }
 
@@ -178,11 +181,7 @@ export async function signWithFreighter(
  * Get network passphrase for transaction signing
  */
 export function getNetworkPassphrase(network: 'testnet' | 'mainnet'): string {
-  const passphrases = {
-    testnet: 'Test SDF Network ; September 2015',
-    mainnet: 'Public Global Stellar Network ; September 2015',
-  };
-  return passphrases[network];
+  return getConfiguredPassphrase(network);
 }
 
 /**

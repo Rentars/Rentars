@@ -52,6 +52,14 @@ export type PaymentStatus =
   | 'refunded'
   | 'under_review';
 
+/** Horizon polling outcome persisted on the payment row (#622). */
+export type PaymentConfirmationStatus =
+  | 'not_found'
+  | 'pending'
+  | 'failed'
+  | 'confirmed'
+  | 'awaiting_reconciliation';
+
 /**
  * Allowed forward transitions in the payment state machine.
  * Any move not listed here is rejected and quarantined.
@@ -61,7 +69,7 @@ const ALLOWED_TRANSITIONS: Readonly<Record<PaymentStatus, ReadonlyArray<PaymentS
   submitted:    ['confirmed', 'failed', 'timed_out'],
   confirmed:    ['refunded'],
   failed:       [],                         // terminal
-  timed_out:    ['submitted', 'failed'],    // retryable
+  timed_out:    ['submitted', 'failed', 'confirmed'], // retry or #622 reconciliation
   refunded:     [],                         // terminal
   under_review: ['pending', 'failed'],      // admin-only resolution
 };
@@ -92,6 +100,10 @@ export interface Payment {
   /** Supported currency token — currently only USDC. */
   currency: 'USDC';
   stellar_tx_hash: string | null;
+  /** Network (testnet|mainnet) when the Stellar tx was submitted. */
+  stellar_network: string | null;
+  /** Latest Horizon confirmation poll classification (#622). */
+  confirmation_status: PaymentConfirmationStatus | null;
   /** TrustlessWork escrow contract ID, if applicable. */
   escrow_id: string | null;
   /** Quote reference hash signed at intent creation (for amount integrity). */
@@ -237,6 +249,14 @@ export async function transitionPaymentStatus(
     };
   }
 
+  // ── Exactly-once confirmed: ignore duplicate confirmation events ─────────
+  if (payment.status === 'confirmed' && newStatus === 'confirmed') {
+    return {
+      success: true,
+      data: { payment, replayed: true },
+    };
+  }
+
   // ── Validate transition ────────────────────────────────────────────────────
   let targetStatus: PaymentStatus = newStatus;
   let quarantineReason: string | undefined;
@@ -322,10 +342,16 @@ export async function transitionPaymentStatus(
  * Retained for backward-compatibility with stellar.service.ts callers that
  * have not yet been migrated to the new API.
  */
+export interface UpdatePaymentStatusOptions {
+  stellarNetwork?: string | null;
+  confirmationStatus?: PaymentConfirmationStatus | null;
+}
+
 export async function updatePaymentStatus(
   paymentId: string,
   txHash: string | null,
   status: PaymentStatus,
+  options?: UpdatePaymentStatusOptions,
 ): Promise<Payment> {
   const result = await transitionPaymentStatus(
     paymentId,
@@ -338,7 +364,64 @@ export async function updatePaymentStatus(
     throw new Error(result.error ?? 'Failed to update payment status');
   }
 
-  return result.data.payment;
+  let payment = result.data.payment;
+
+  if (
+    options?.stellarNetwork !== undefined ||
+    options?.confirmationStatus !== undefined
+  ) {
+    payment = await persistPaymentStellarContext(paymentId, {
+      stellar_network: options.stellarNetwork,
+      confirmation_status: options.confirmationStatus,
+      stellar_tx_hash: txHash ?? undefined,
+    });
+  }
+
+  return payment;
+}
+
+/**
+ * Persist Stellar tx hash, network, and confirmation poll state without
+ * changing payment.status (used when status transition was a replay).
+ */
+export async function persistPaymentStellarContext(
+  paymentId: string,
+  fields: {
+    stellar_tx_hash?: string | null;
+    stellar_network?: string | null;
+    confirmation_status?: PaymentConfirmationStatus | null;
+  },
+): Promise<Payment> {
+  const payment = await getPaymentStatus(paymentId);
+  if (!payment) {
+    throw new Error('Payment not found');
+  }
+
+  const updatePayload: Record<string, unknown> = {
+    updated_at: new Date().toISOString(),
+  };
+  if (fields.stellar_tx_hash !== undefined) {
+    updatePayload.stellar_tx_hash = fields.stellar_tx_hash;
+  }
+  if (fields.stellar_network !== undefined) {
+    updatePayload.stellar_network = fields.stellar_network;
+  }
+  if (fields.confirmation_status !== undefined) {
+    updatePayload.confirmation_status = fields.confirmation_status;
+  }
+
+  const { data, error } = await supabase
+    .from('payments')
+    .update(updatePayload)
+    .eq('id', paymentId)
+    .select()
+    .single();
+
+  if (error || !data) {
+    throw new Error(`Failed to persist payment Stellar context: ${error?.message ?? 'unknown'}`);
+  }
+
+  return rowToPayment(data);
 }
 
 /**
@@ -379,6 +462,11 @@ function rowToPayment(row: any): Payment {
     amount_stroops:   BigInt(row.amount_stroops ?? row.amount_usdc ?? 0),
     currency:         row.currency ?? 'USDC',
     stellar_tx_hash:  row.stellar_tx_hash ?? null,
+    stellar_network:  row.stellar_network ?? (row.metadata?.stellar_network as string | undefined) ?? null,
+    confirmation_status:
+      (row.confirmation_status as PaymentConfirmationStatus | null) ??
+      (row.metadata?.confirmation_status as PaymentConfirmationStatus | undefined) ??
+      null,
     escrow_id:        row.escrow_id ?? null,
     quote_hash:       row.quote_hash ?? null,
     status:           row.status as PaymentStatus,

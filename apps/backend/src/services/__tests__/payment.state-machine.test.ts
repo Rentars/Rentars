@@ -44,6 +44,10 @@ describe('isAllowedTransition', () => {
     expect(isAllowedTransition('timed_out', 'submitted')).toBe(true);
   });
 
+  it('allows timed_out → confirmed (reconciliation path #622)', () => {
+    expect(isAllowedTransition('timed_out', 'confirmed')).toBe(true);
+  });
+
   it('allows confirmed → refunded', () => {
     expect(isAllowedTransition('confirmed', 'refunded')).toBe(true);
   });

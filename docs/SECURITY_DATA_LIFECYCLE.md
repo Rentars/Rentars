@@ -103,6 +103,14 @@ Data that is **deleted** (no business need):
 - **Payments and escrow**: Stripe/blockchain payments are immutable; only the user's personal data is removed
 - **Dispute records**: If a property dispute is ongoing, audit logs are retained for legal defense
 
+### Dispute evidence (`dispute_evidence`)
+
+- Files are stored in the private Supabase bucket `dispute-evidence` under `bookings/{booking_id}/…` only (no arbitrary paths).
+- Allowed types: `image`, `document`, `payment_proof`, `message_export`; uploads pass magic-byte / image validation before accept.
+- Participants see `participant` visibility items only; `storage_path` is never exposed in list APIs. Moderators see the full case scope.
+- Downloads use short-lived signed URLs; actions `evidence.upload`, `evidence.view`, `evidence.download`, and `evidence.purge` are written to audit logs.
+- Rows carry `retention_until` (default seven years). The retention job anonymizes expired rows and removes storage unless the booking is under a legal hold.
+
 ## Reauthentication
 
 Deletion requests require reauthentication to prevent accidental or malicious deletion:

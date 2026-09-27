@@ -33,6 +33,7 @@
  *   account_deletions      30 days    account_deletions (completed/cancelled)
  *   soft_deleted_props     180 days   properties (deleted_at IS NOT NULL)
  *   payments_failed        90 days    payments (failed/timed_out, no active dispute)
+ *   dispute_evidence       per row    dispute_evidence (retention_until; legal hold on booking)
  *
  * Financial records (confirmed payments, booking records with escrow_id) are
  * NEVER deleted by this service.  Audit logs are NEVER deleted.  Both are
@@ -700,6 +701,43 @@ async function hardDeleteSoftDeletedProperties(
  *
  * Confirmed payments and their bookings are NEVER touched.
  */
+/**
+ * Anonymize dispute evidence past retention_until and delete storage objects.
+ * Skips evidence for bookings under an active legal hold.
+ */
+async function purgeDisputeEvidence(
+  batchSize: number,
+  dryRun: boolean,
+): Promise<RetentionJobResult> {
+  const label = 'dispute_evidence';
+  try {
+    const { purgeExpiredEvidence } = await import('./disputeEvidence.service.js');
+    const preview = await purgeExpiredEvidence(batchSize, true);
+    const eligible = preview.anonymized;
+
+    if (dryRun || eligible === 0) {
+      return {
+        class: label,
+        deleted: 0,
+        eligible,
+        held_skipped: preview.held_skipped,
+        failed: false,
+      };
+    }
+
+    const result = await purgeExpiredEvidence(batchSize, false);
+    return {
+      class: label,
+      deleted: result.anonymized,
+      eligible,
+      held_skipped: result.held_skipped,
+      failed: false,
+    };
+  } catch (err) {
+    return { class: label, deleted: 0, eligible: 0, held_skipped: 0, failed: true, error: String(err) };
+  }
+}
+
 async function purgeFailedPaymentIntents(
   batchSize: number,
   dryRun: boolean,
@@ -815,6 +853,7 @@ export async function runRetentionJobs(
     purgePropertyViews(batchSize, dryRun),
     purgeExpiredDataExports(batchSize, dryRun),
     purgeClosedAccountDeletions(batchSize, dryRun),
+    purgeDisputeEvidence(batchSize, dryRun),
   ]);
 
   // These two must run after the parallel batch above because they

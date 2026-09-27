@@ -1,4 +1,9 @@
-import { syncAllBookings, syncAllProperties, reconcileAllPendingEscrows } from './sync.service.js';
+import {
+  syncAllBookings,
+  syncAllProperties,
+  reconcileAllPendingEscrows,
+  reconcilePendingPaymentConfirmations,
+} from './sync.service.js';
 import { purgeExpired as purgeExpiredIdempotencyKeys } from './idempotency.service.js';
 import { BookingService } from './booking.service.js';
 
@@ -61,14 +66,18 @@ async function runEscrowReconciliation(): Promise<void> {
   concurrentReconciliations++;
 
   try {
-    const result = await reconcileAllPendingEscrows();
-    if (result.success) {
+    const escrowResult = await reconcileAllPendingEscrows();
+    const paymentResult = await reconcilePendingPaymentConfirmations();
+    if (escrowResult.success && paymentResult.success) {
       console.log(
-        `[reconcile] Escrows: ${result.data?.reconciled} reconciled, ${result.data?.failed} failed`,
+        `[reconcile] Escrows: ${escrowResult.data?.reconciled} reconciled, ${escrowResult.data?.failed} failed; ` +
+          `Payments: ${paymentResult.data?.reconciled} confirmed, ${paymentResult.data?.failed} errors`,
       );
       reconciliationBackoffMs = INITIAL_BACKOFF_MS;
     } else {
-      console.error(`[reconcile] Reconciliation failed: ${result.error}`);
+      console.error(
+        `[reconcile] Reconciliation failed: escrow=${escrowResult.error ?? 'ok'} payments=${paymentResult.error ?? 'ok'}`,
+      );
       reconciliationBackoffMs = Math.min(
         reconciliationBackoffMs * 2,
         MAX_BACKOFF_MS,

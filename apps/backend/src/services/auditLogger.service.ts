@@ -70,6 +70,11 @@ export type AuditAction =
   | 'dispute.open'
   | 'dispute.resolve'
   | 'dispute.modify'
+  // Dispute evidence
+  | 'evidence.upload'
+  | 'evidence.view'
+  | 'evidence.download'
+  | 'evidence.purge'
   // Account
   | 'account.email_change'
   | 'account.role_change'

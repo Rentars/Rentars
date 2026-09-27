@@ -1,0 +1,84 @@
+{
+  "schemaVersion": "1",
+  "updatedAt": "2026-09-28T00:00:00.000Z",
+  "contracts": [
+    {
+      "contractKey": "property-listing",
+      "network": "testnet",
+      "contractId": "CDZVXPNK4JGPJD3DYLZX5JBIHGRV5P4SUX7G7MZ7CZTGM7BJS2CZ4P3",
+      "wasmHash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "abiVersion": "0.1.0",
+      "abiFile": "property_listing_abi.json",
+      "abiSha256": "5c49fa9769c370045b9c9f417b513001d9cc2c1ce9d85df9ed3aaa8a33e7d2b5",
+      "initDependencies": [],
+      "compatibleAppVersions": ["0.1.0", "1.0.0"],
+      "allowedUpgradeContractIds": [],
+      "releaseNotes": "Testnet property-listing v0.1.0 (placeholder WASM hash — update after deploy)."
+    },
+    {
+      "contractKey": "booking",
+      "network": "testnet",
+      "contractId": "CA3D5KRYM6CB7OWQ6TWYRRSSZ6CCZ7D3E6K4F7C7LXZ4R5X4OVX5S",
+      "wasmHash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "abiVersion": "0.1.0",
+      "abiFile": "booking_abi.json",
+      "abiSha256": "e0d856040966900e02e04f86d5d16d8f1c2fbdf3dc56fd439041ad3436edc675",
+      "initDependencies": [],
+      "compatibleAppVersions": ["0.1.0", "1.0.0"],
+      "allowedUpgradeContractIds": [],
+      "releaseNotes": "Testnet booking v0.1.0 (placeholder WASM hash — update after deploy)."
+    },
+    {
+      "contractKey": "review",
+      "network": "testnet",
+      "contractId": "CCW67TSZV3SS5YPTS5FG7O2MG6R7WBBNDVQSZRC3Y5ZRBJY3SUKSDZ",
+      "wasmHash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "abiVersion": "0.1.0",
+      "abiFile": "review_abi.json",
+      "abiSha256": "a326c101b093f2f72faea9bedc518997c44e07da58504d636e5337214b30b26b",
+      "initDependencies": ["booking"],
+      "compatibleAppVersions": ["0.1.0", "1.0.0"],
+      "allowedUpgradeContractIds": [],
+      "releaseNotes": "Testnet review v0.1.0 (placeholder WASM hash — update after deploy)."
+    },
+    {
+      "contractKey": "property-listing",
+      "network": "mainnet",
+      "contractId": "CPLACEHOLDERPROPERTYLISTINGMAINNET00000000000000000000000001",
+      "wasmHash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "abiVersion": "0.1.0",
+      "abiFile": "property_listing_abi.json",
+      "abiSha256": "5c49fa9769c370045b9c9f417b513001d9cc2c1ce9d85df9ed3aaa8a33e7d2b5",
+      "initDependencies": [],
+      "compatibleAppVersions": ["0.1.0", "1.0.0"],
+      "allowedUpgradeContractIds": [],
+      "releaseNotes": "Mainnet placeholder — replace contractId and wasmHash after production deploy."
+    },
+    {
+      "contractKey": "booking",
+      "network": "mainnet",
+      "contractId": "CPLACEHOLDERBOOKINGMAINNET000000000000000000000000000001",
+      "wasmHash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "abiVersion": "0.1.0",
+      "abiFile": "booking_abi.json",
+      "abiSha256": "e0d856040966900e02e04f86d5d16d8f1c2fbdf3dc56fd439041ad3436edc675",
+      "initDependencies": [],
+      "compatibleAppVersions": ["0.1.0", "1.0.0"],
+      "allowedUpgradeContractIds": [],
+      "releaseNotes": "Mainnet placeholder — replace contractId and wasmHash after production deploy."
+    },
+    {
+      "contractKey": "review",
+      "network": "mainnet",
+      "contractId": "CPLACEHOLDERREVIEWMAINNET0000000000000000000000000000001",
+      "wasmHash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "abiVersion": "0.1.0",
+      "abiFile": "review_abi.json",
+      "abiSha256": "a326c101b093f2f72faea9bedc518997c44e07da58504d636e5337214b30b26b",
+      "initDependencies": ["booking"],
+      "compatibleAppVersions": ["0.1.0", "1.0.0"],
+      "allowedUpgradeContractIds": [],
+      "releaseNotes": "Mainnet placeholder — replace contractId and wasmHash after production deploy."
+    }
+  ]
+}

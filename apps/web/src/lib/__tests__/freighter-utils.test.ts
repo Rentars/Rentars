@@ -36,13 +36,12 @@ describe('freighter-utils', () => {
       expect(network).toBe('testnet');
     });
 
-    it('should default to testnet on error', async () => {
+    it('should throw when wallet network cannot be read', async () => {
       vi.mocked(freighterApi.getNetwork).mockResolvedValue({
         error: { message: 'Failed' },
       } as any);
 
-      const network = await getWalletNetwork();
-      expect(network).toBe('testnet');
+      await expect(getWalletNetwork()).rejects.toThrow(FreighterError);
     });
   });
 
@@ -102,6 +101,16 @@ describe('freighter-utils', () => {
 
       await expect(signWithFreighter('xdr123', 'testnet')).rejects.toThrow(FreighterError);
       await expect(signWithFreighter('xdr123', 'testnet')).rejects.toThrow(/mainnet.*testnet/);
+    });
+
+    it('should block mainnet signing when wallet is on testnet', async () => {
+      vi.mocked(freighterApi.getNetwork).mockResolvedValue({
+        network: 'TESTNET',
+      } as any);
+
+      await expect(signWithFreighter('xdr123', 'mainnet')).rejects.toMatchObject({
+        code: 'NETWORK_MISMATCH',
+      });
     });
 
     it('should timeout after specified duration', async () => {

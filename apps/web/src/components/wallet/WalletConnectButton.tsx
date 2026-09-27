@@ -3,6 +3,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { useWalletContext } from '@/context/WalletContext';
 import { FreighterError } from '@/lib/freighter-utils';
+import { getExpectedNetwork } from '@/lib/network-utils';
 
 interface WalletConnectButtonProps {
     className?: string;
@@ -89,6 +90,7 @@ export function WalletConnectButton({
     };
 
     const buttonState = getButtonState();
+    const expectedNetwork = getExpectedNetwork();
 
     return (
         <div className={`relative ${className}`} ref={dropdownRef}>
@@ -148,7 +150,9 @@ export function WalletConnectButton({
                             <div className="flex-1 min-w-0">
                                 <p className="text-sm font-medium text-gray-900 truncate">{state.address}</p>
                                 <p className="text-xs text-gray-500">
-                                    Network: <span className="font-medium capitalize">{state.network}</span>
+                                    Wallet: <span className="font-medium capitalize">{state.network}</span>
+                                    {' · '}
+                                    App: <span className="font-medium capitalize">{expectedNetwork}</span>
                                 </p>
                             </div>
                         </div>
@@ -159,7 +163,7 @@ export function WalletConnectButton({
                         {state.networkMismatch && (
                             <div className="px-3 py-2 mb-2 bg-yellow-50 border border-yellow-200 rounded-lg">
                                 <p className="text-xs text-yellow-800">
-                                    ⚠️ Network mismatch. Please switch to {state.network} in Freighter.
+                                    ⚠️ Network mismatch. Switch Freighter to {expectedNetwork} to continue.
                                 </p>
                             </div>
                         )}

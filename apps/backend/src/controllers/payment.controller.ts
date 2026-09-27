@@ -16,6 +16,12 @@ import {
   confirmTransaction,
   retryTransaction,
 } from '@/services/stellar.service.js';
+import {
+  assertNetworkMatch,
+  getStellarNetwork,
+  NetworkMismatchError,
+  parseAndValidateXdr,
+} from '@/blockchain/network.js';
 
 const submitSchema = z.object({
   bookingId: z.string().uuid('bookingId must be a valid UUID'),
@@ -46,18 +52,85 @@ export async function submitPayment(req: AuthRequest, res: Response): Promise<vo
 
   const { bookingId, signedXdr, amountUsdc, metadata } = parsed.data;
   const tenantId = req.userId!;
+  const serverNetwork = getStellarNetwork();
+
+  if (metadata?.network !== undefined) {
+    try {
+      assertNetworkMatch(serverNetwork, String(metadata.network));
+    } catch (err) {
+      if (err instanceof NetworkMismatchError) {
+        res.status(400).json({
+          error: {
+            code: 'NETWORK_MISMATCH',
+            message: err.message,
+            expectedNetwork: err.expectedNetwork,
+            actualNetwork: err.actualNetwork,
+          },
+        });
+        return;
+      }
+      throw err;
+    }
+  }
+
+  try {
+    parseAndValidateXdr(signedXdr);
+  } catch (err) {
+    if (err instanceof NetworkMismatchError) {
+      res.status(400).json({
+        error: {
+          code: 'NETWORK_MISMATCH',
+          message: err.message,
+          expectedNetwork: err.expectedNetwork,
+          actualNetwork: err.actualNetwork,
+        },
+      });
+      return;
+    }
+    res.status(400).json({
+      error: {
+        code: 'INVALID_XDR',
+        message: err instanceof Error ? err.message : 'Invalid signed transaction',
+      },
+    });
+    return;
+  }
+
+  const paymentMetadata = {
+    ...(metadata ?? {}),
+    network: serverNetwork,
+  };
 
   // 1. Create payment intent in 'pending' state
-  const payment = await createPaymentIntent({ bookingId, tenantId, amountUsdc, metadata });
+  const payment = await createPaymentIntent({
+    bookingId,
+    tenantId,
+    amountUsdc,
+    metadata: paymentMetadata,
+  });
 
   // 2. Submit signed XDR to Stellar
   let txHash: string;
   try {
     const result = await submitTransaction(signedXdr);
     txHash = result.txHash;
-    await updatePaymentStatus(payment.id, txHash, 'submitted');
+    await updatePaymentStatus(payment.id, txHash, 'submitted', {
+      stellarNetwork: serverNetwork,
+      confirmationStatus: 'pending',
+    });
   } catch (err) {
     await updatePaymentStatus(payment.id, null, 'failed');
+    if (err instanceof NetworkMismatchError) {
+      res.status(400).json({
+        error: {
+          code: 'NETWORK_MISMATCH',
+          message: err.message,
+          expectedNetwork: err.expectedNetwork,
+          actualNetwork: err.actualNetwork,
+        },
+      });
+      return;
+    }
     res.status(502).json({
       error: {
         code: 'TX_SUBMIT_FAILED',
@@ -100,6 +173,8 @@ export async function getStatus(req: AuthRequest, res: Response): Promise<void> 
     paymentId: payment.id,
     bookingId: payment.booking_id,
     status: payment.status,
+    confirmationStatus: payment.confirmation_status,
+    stellarNetwork: payment.stellar_network,
     txHash: payment.stellar_tx_hash,
     amountUsdc: payment.amount_usdc,
     updatedAt: payment.updated_at,
@@ -134,10 +209,47 @@ export async function retryPayment(req: AuthRequest, res: Response): Promise<voi
     return;
   }
 
+  const { signedXdr } = parsed.data;
+  if (signedXdr) {
+    try {
+      parseAndValidateXdr(signedXdr);
+    } catch (err) {
+      if (err instanceof NetworkMismatchError) {
+        res.status(400).json({
+          error: {
+            code: 'NETWORK_MISMATCH',
+            message: err.message,
+            expectedNetwork: err.expectedNetwork,
+            actualNetwork: err.actualNetwork,
+          },
+        });
+        return;
+      }
+      res.status(400).json({
+        error: {
+          code: 'INVALID_XDR',
+          message: err instanceof Error ? err.message : 'Invalid signed transaction',
+        },
+      });
+      return;
+    }
+  }
+
   try {
-    const result = await retryTransaction(id, parsed.data.signedXdr);
+    const result = await retryTransaction(id, signedXdr);
     res.json({ paymentId: id, txHash: result.txHash, status: result.status });
   } catch (err) {
+    if (err instanceof NetworkMismatchError) {
+      res.status(400).json({
+        error: {
+          code: 'NETWORK_MISMATCH',
+          message: err.message,
+          expectedNetwork: err.expectedNetwork,
+          actualNetwork: err.actualNetwork,
+        },
+      });
+      return;
+    }
     res.status(422).json({
       error: {
         code: 'RETRY_FAILED',

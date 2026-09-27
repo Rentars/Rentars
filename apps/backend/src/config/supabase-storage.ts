@@ -1,6 +1,8 @@
 import { supabase } from './supabase.js';
 
 export const STORAGE_BUCKET = 'property-images';
+/** Private bucket for dispute case evidence (signed URLs only). */
+export const DISPUTE_EVIDENCE_BUCKET = 'dispute-evidence';
 
 interface MulterFile {
   buffer: Buffer;
@@ -137,5 +139,49 @@ export async function deleteImage(imageUrl: string, thumbnailUrl?: string | null
 
   if (error) {
     throw new Error(`Failed to delete image: ${error.message}`);
+  }
+}
+
+/**
+ * Upload a dispute evidence object to the private dispute-evidence bucket.
+ * Path must be scoped under bookings/{bookingId}/.
+ */
+export async function uploadDisputeEvidenceObject(
+  storagePath: string,
+  buffer: Buffer,
+  contentType: string,
+): Promise<{ path: string }> {
+  const { error } = await supabase.storage.from(DISPUTE_EVIDENCE_BUCKET).upload(storagePath, buffer, {
+    contentType,
+    upsert: false,
+  });
+
+  if (error) {
+    throw new Error(`Failed to upload dispute evidence: ${error.message}`);
+  }
+
+  return { path: storagePath };
+}
+
+/** Time-limited signed URL for moderator/participant download. */
+export async function getDisputeEvidenceSignedUrl(
+  storagePath: string,
+  expiresInSeconds: number,
+): Promise<string> {
+  const { data, error } = await supabase.storage
+    .from(DISPUTE_EVIDENCE_BUCKET)
+    .createSignedUrl(storagePath, expiresInSeconds);
+
+  if (error || !data?.signedUrl) {
+    throw new Error(error?.message ?? 'Failed to create signed URL for dispute evidence');
+  }
+
+  return data.signedUrl;
+}
+
+export async function removeDisputeEvidenceObject(storagePath: string): Promise<void> {
+  const { error } = await supabase.storage.from(DISPUTE_EVIDENCE_BUCKET).remove([storagePath]);
+  if (error) {
+    throw new Error(`Failed to delete dispute evidence object: ${error.message}`);
   }
 }

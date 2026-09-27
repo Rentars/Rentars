@@ -5,6 +5,7 @@ import { Loader2, AlertTriangle } from 'lucide-react';
 import { useWallet } from '@/hooks/useWallet';
 import { useEscrowTransaction } from '@/hooks/useEscrowTransaction';
 import { getExpectedNetwork } from '@/lib/network-utils';
+import { StellarNetworkBadge } from '@/components/wallet/StellarNetworkBadge';
 
 type Phase = 'fund' | 'release';
 
@@ -78,9 +79,9 @@ export default function USDCEscrowFlow({
         <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
           Amount: <span className="font-semibold text-gray-900 dark:text-white">{amount} USDC</span>
         </p>
-        <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-          Network: {expectedNetwork}
-        </p>
+        <div className="mt-2">
+          <StellarNetworkBadge walletNetwork={walletState.isConnected ? walletState.network : null} />
+        </div>
       </div>
 
       {!walletState.isConnected && !walletState.isLoading && (
@@ -128,9 +129,19 @@ export default function USDCEscrowFlow({
       {walletState.isConnected && !walletState.networkMismatch && canContinue && !txHash && (
         <>
           {getStatusMessage() && (
-            <div className="text-sm text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-950 border border-blue-200 dark:border-blue-800 rounded-lg p-3 flex items-center gap-2">
-              <Loader2 className="animate-spin" size={16} />
-              {getStatusMessage()}
+            <div className="text-sm text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-950 border border-blue-200 dark:border-blue-800 rounded-lg p-3 space-y-2">
+              <div className="flex items-center gap-2">
+                <Loader2 className="animate-spin" size={16} />
+                {getStatusMessage()}
+              </div>
+              {status === 'waiting_signature' && (
+                <div className="flex flex-col gap-1">
+                  <StellarNetworkBadge walletNetwork={walletState.network} />
+                  <p className="text-[11px] opacity-90">
+                    Confirm Freighter shows <strong>{expectedNetwork}</strong> before you approve.
+                  </p>
+                </div>
+              )}
             </div>
           )}
           

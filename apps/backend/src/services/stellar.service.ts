@@ -15,19 +15,25 @@
  * wallet layer and is fully independent of the auth mechanism.
  */
 
-import { Horizon, Transaction } from '@stellar/stellar-sdk';
-import { updatePaymentStatus, getPaymentStatus } from './payment.service.js';
-
-const CONFIRMATION_TIMEOUT_MS = 60_000; // 60 seconds max wait
-const POLL_INTERVAL_MS = 3_000;         // poll every 3 seconds
+import { Horizon } from '@stellar/stellar-sdk';
+import {
+  getHorizonUrl,
+  getStellarNetwork,
+  parseAndValidateXdr,
+} from '@/blockchain/network.js';
+import {
+  updatePaymentStatus,
+  getPaymentStatus,
+  persistPaymentStellarContext,
+} from './payment.service.js';
+import {
+  pollUntilConfirmed,
+  horizonFetchTransaction,
+  horizonFetchLedgerHead,
+} from './transactionConfirmation.service.js';
 
 function getHorizonServer(): Horizon.Server {
-  const network = process.env.STELLAR_NETWORK ?? 'testnet';
-  const url =
-    network === 'mainnet'
-      ? 'https://horizon.stellar.org'
-      : 'https://horizon-testnet.stellar.org';
-  return new Horizon.Server(url);
+  return new Horizon.Server(getHorizonUrl());
 }
 
 export interface SubmitResult {
@@ -37,57 +43,60 @@ export interface SubmitResult {
 /**
  * Submit a signed transaction XDR to Stellar Horizon.
  * Returns the transaction hash on success. Throws on failure.
+ * Rejects XDR signed for the wrong network before broadcast.
  */
 export async function submitTransaction(signedXdr: string): Promise<SubmitResult> {
+  const tx = parseAndValidateXdr(signedXdr);
   const server = getHorizonServer();
-  const passphrase =
-    (process.env.STELLAR_NETWORK ?? 'testnet') === 'mainnet'
-      ? 'Public Global Stellar Network ; September 2015'
-      : 'Test SDF Network ; September 2015';
-
-  const tx = new Transaction(signedXdr, passphrase);
   const response = await server.submitTransaction(tx);
   return { txHash: response.hash };
 }
 
+export type ConfirmTransactionResult = 'confirmed' | 'timed_out' | 'failed';
+
 /**
- * Poll Horizon until the transaction is confirmed or the 60s timeout is reached.
- * Updates the payment record in the database with the final status.
- *
- * @returns 'confirmed' | 'timed_out'
+ * Poll Horizon until the transaction is confirmed, failed on-chain, or the
+ * bounded poll window expires (handed off to background reconciliation).
  */
 export async function confirmTransaction(
   paymentId: string,
   txHash: string,
-): Promise<'confirmed' | 'timed_out'> {
+): Promise<ConfirmTransactionResult> {
+  const network = getStellarNetwork();
   const server = getHorizonServer();
-  const deadline = Date.now() + CONFIRMATION_TIMEOUT_MS;
 
-  while (Date.now() < deadline) {
-    try {
-      const tx = await server.transactions().transaction(txHash).call();
-      if (tx.successful) {
-        await updatePaymentStatus(paymentId, txHash, 'confirmed');
-        return 'confirmed';
-      }
-      // On-chain but unsuccessful
-      await updatePaymentStatus(paymentId, txHash, 'failed');
-      return 'timed_out';
-    } catch (err: unknown) {
-      const isNotFound =
-        err instanceof Error &&
-        (err.message.includes('404') || err.message.includes('not found'));
-      if (!isNotFound) {
-        await updatePaymentStatus(paymentId, txHash, 'failed');
-        throw err;
-      }
-      // 404 = not yet on ledger, keep polling
-    }
+  await persistPaymentStellarContext(paymentId, {
+    stellar_tx_hash: txHash,
+    stellar_network: network,
+    confirmation_status: 'pending',
+  });
 
-    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+  const result = await pollUntilConfirmed(txHash, {
+    fetchTransaction: horizonFetchTransaction(server),
+    fetchLedgerHead: horizonFetchLedgerHead(server),
+  });
+
+  if (result.status === 'confirmed') {
+    await updatePaymentStatus(paymentId, txHash, 'confirmed', {
+      stellarNetwork: network,
+      confirmationStatus: 'confirmed',
+    });
+    return 'confirmed';
   }
 
-  await updatePaymentStatus(paymentId, txHash, 'timed_out');
+  if (result.status === 'failed') {
+    await updatePaymentStatus(paymentId, txHash, 'failed', {
+      stellarNetwork: network,
+      confirmationStatus: 'failed',
+    });
+    return 'failed';
+  }
+
+  // Deadline without confirmation — not a payment failure; reconciliation continues.
+  await updatePaymentStatus(paymentId, txHash, 'timed_out', {
+    stellarNetwork: network,
+    confirmationStatus: 'awaiting_reconciliation',
+  });
   return 'timed_out';
 }
 
@@ -99,7 +108,7 @@ export async function confirmTransaction(
 export async function retryTransaction(
   paymentId: string,
   signedXdr?: string,
-): Promise<{ txHash: string; status: 'confirmed' | 'timed_out' }> {
+): Promise<{ txHash: string; status: ConfirmTransactionResult }> {
   const payment = await getPaymentStatus(paymentId);
   if (!payment) throw new Error('Payment not found');
 

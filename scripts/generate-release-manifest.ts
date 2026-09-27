@@ -122,3 +122,38 @@ if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true });
 const outPath = resolve(outDir, `manifest-${version}.json`);
 writeFileSync(outPath, JSON.stringify(manifest, null, 2) + '\n');
 console.log(`Release manifest written to: ${outPath.replace(ROOT + '/', '')}`);
+
+// ── Sync ABI metadata into contract registry ─────────────────────────────────
+const registryPath = resolve(ROOT, 'apps/contracts/registry/contract-registry.json');
+if (existsSync(registryPath)) {
+  const registry = JSON.parse(read(registryPath)) as {
+    schemaVersion: string;
+    updatedAt: string;
+    contracts: Array<{
+      abiFile?: string;
+      abiSha256?: string;
+      abiVersion?: string;
+    }>;
+  };
+
+  let registryChanged = false;
+  for (const entry of registry.contracts) {
+    if (!entry.abiFile || !abiHashes[entry.abiFile]) continue;
+    const abiContent = read(`apps/contracts/${entry.abiFile}`);
+    const abiJson = JSON.parse(abiContent) as { version?: string };
+    const nextHash = abiHashes[entry.abiFile];
+    const nextVersion = abiJson.version ?? entry.abiVersion;
+
+    if (entry.abiSha256 !== nextHash || entry.abiVersion !== nextVersion) {
+      entry.abiSha256 = nextHash;
+      entry.abiVersion = nextVersion;
+      registryChanged = true;
+    }
+  }
+
+  if (registryChanged) {
+    registry.updatedAt = new Date().toISOString();
+    writeFileSync(registryPath, JSON.stringify(registry, null, 2) + '\n');
+    console.log(`Contract registry ABI metadata updated: ${registryPath.replace(ROOT + '/', '')}`);
+  }
+}
