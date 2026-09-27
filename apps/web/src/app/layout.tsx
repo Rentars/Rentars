@@ -81,7 +81,12 @@ export default async function RootLayout({ children }: { children: React.ReactNo
             __html: `
               if ('serviceWorker' in navigator) {
                 window.addEventListener('load', function() {
-                  navigator.serviceWorker.register('/sw.js').catch(function(err) {
+                  // The service worker cannot read build-time env vars, so the
+                  // application server key it needs to renew a rotated push
+                  // subscription (pushsubscriptionchange) travels on its URL.
+                  var vapidKey = ${JSON.stringify(process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY ?? '')};
+                  var swUrl = '/sw.js' + (vapidKey ? '?vapidPublicKey=' + encodeURIComponent(vapidKey) : '');
+                  navigator.serviceWorker.register(swUrl).catch(function(err) {
                     console.warn('SW registration failed:', err);
                   });
                 });

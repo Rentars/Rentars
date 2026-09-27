@@ -118,6 +118,11 @@ function windows() {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+// Push endpoints stop being contacted long before they stop existing: a browser
+// that is reinstalled mints a new endpoint, so an endpoint that has not been
+// seen for this long is abandoned.
+const PUSH_SUBSCRIPTION_RETENTION_DAYS = 180;
+
 /** Returns an ISO timestamp `n` days before now. */
 function daysAgo(n: number): string {
   return new Date(Date.now() - n * 24 * 60 * 60 * 1000).toISOString();
@@ -370,6 +375,47 @@ async function purgeNotifications(
       .from('notifications')
       .delete()
       .or(`and(read.eq.true,created_at.lt.${readCutoff}),and(read.eq.false,created_at.lt.${unreadCutoff})`)
+      .limit(batchSize)
+      .select('id');
+
+    if (error) throw new Error(error.message);
+    return { class: label, deleted: data?.length ?? 0, eligible: eligibleCount, held_skipped: 0, failed: false };
+  } catch (err) {
+    return { class: label, deleted: 0, eligible: 0, held_skipped: 0, failed: true, error: String(err) };
+  }
+}
+
+/**
+ * Purge push subscriptions that have not been seen for a long time.
+ * Policy: rows whose `last_seen_at` is older than PUSH_SUBSCRIPTION_RETENTION_DAYS.
+ *
+ * Rationale: a browser that is uninstalled, wiped, or never opened again cannot
+ * tell us its endpoint is dead. Both the failure-based cleanup (permanent
+ * provider rejections) and this time-based sweep are needed, because an
+ * endpoint that is simply never used produces no provider feedback at all.
+ */
+async function purgeStalePushSubscriptions(
+  batchSize: number,
+  dryRun: boolean,
+): Promise<RetentionJobResult> {
+  const label = 'push_subscriptions';
+  try {
+    const cutoff = daysAgo(PUSH_SUBSCRIPTION_RETENTION_DAYS);
+
+    const { count: eligible } = await supabase
+      .from('push_subscriptions')
+      .select('id', { count: 'exact', head: true })
+      .lt('last_seen_at', cutoff);
+
+    const eligibleCount = eligible ?? 0;
+    if (dryRun || eligibleCount === 0) {
+      return { class: label, deleted: 0, eligible: eligibleCount, held_skipped: 0, failed: false };
+    }
+
+    const { data, error } = await supabase
+      .from('push_subscriptions')
+      .delete()
+      .lt('last_seen_at', cutoff)
       .limit(batchSize)
       .select('id');
 
@@ -810,6 +856,7 @@ export async function runRetentionJobs(
     purgeBlockchainLogs(batchSize, dryRun),
     purgeSyncLog(batchSize, dryRun),
     purgeNotifications(batchSize, dryRun),
+    purgeStalePushSubscriptions(batchSize, dryRun),
     purgeSearchAnalytics(batchSize, dryRun),
     purgeFunnelEvents(batchSize, dryRun),
     purgePropertyViews(batchSize, dryRun),

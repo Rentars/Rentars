@@ -14,6 +14,7 @@ import { securityLogger } from '@/services/logging.service.js';
 import { auditLogger } from '@/services/auditLogger.service.js';
 import { env } from '@/config/env.js';
 import { AuthError } from '@/types/errors.js';
+import { removeAllPushSubscriptions, removePushSubscription } from '@/services/push.service.js';
 
 export async function register(req: Request, res: Response): Promise<void> {
   try {
@@ -124,7 +125,7 @@ export async function refreshAccessToken(req: Request, res: Response): Promise<v
  * Revokes the refresh token so it cannot be used again.
  */
 export async function logout(req: Request, res: Response): Promise<void> {
-  const { refreshToken } = req.body as { refreshToken?: string };
+  const { refreshToken, endpoint } = req.body as { refreshToken?: string; endpoint?: string };
 
   let userId: string | undefined;
 
@@ -151,6 +152,11 @@ export async function logout(req: Request, res: Response): Promise<void> {
       resourceType: 'auth',
       ip: req.ip,
     });
+
+    // A signed-out device must not keep receiving pushes for this account. When
+    // the client tells us which endpoint it holds we retire just that device,
+    // otherwise every subscription for the user is removed.
+    await releasePushSubscriptionsForLogout(userId, endpoint);
   }
 
   res.json({ message: 'Logged out successfully.' });
@@ -185,6 +191,8 @@ export async function logoutAllDevices(req: Request, res: Response): Promise<voi
 
   await revokeAllUserRefreshTokens(userId);
 
+  await releasePushSubscriptionsForLogout(userId);
+
   await auditLogger.log({
     actorId: userId,
     action: 'auth.logout_all_devices',
@@ -194,4 +202,26 @@ export async function logoutAllDevices(req: Request, res: Response): Promise<voi
   });
 
   res.json({ message: 'Logged out from all devices successfully.' });
+}
+
+/**
+ * Push cleanup is best effort: a failure to reach the push tables must never
+ * fail a logout that already revoked the refresh token.
+ */
+async function releasePushSubscriptionsForLogout(
+  userId: string,
+  endpoint?: string
+): Promise<void> {
+  try {
+    const result =
+      endpoint && endpoint.trim()
+        ? await removePushSubscription(userId, endpoint)
+        : await removeAllPushSubscriptions(userId);
+
+    if (!result.success) {
+      console.error('[auth] Failed to release push subscriptions on logout:', result.error);
+    }
+  } catch (error) {
+    console.error('[auth] Failed to release push subscriptions on logout:', error);
+  }
 }

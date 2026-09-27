@@ -1,5 +1,6 @@
 import { supabase } from '@/config/supabase.js';
 import { auditLogger } from './auditLogger.service.js';
+import { purgeUserPushSubscriptions } from './push.service.js';
 import jwt from 'jsonwebtoken';
 import { v4 as uuid } from 'uuid';
 
@@ -253,7 +254,9 @@ export async function executeAccountDeletion(userId: string, deletionId: string,
 
   await supabase.from('notifications').delete().eq('user_id', userId);
   await supabase.from('notification_preferences').delete().eq('user_id', userId);
-  await supabase.from('push_subscriptions').delete().eq('user_id', userId);
+  // Push subscriptions are revoked through the push service so the cleanup
+  // path (endpoint ownership, in-memory failure state) stays in one place.
+  await purgeUserPushSubscriptions(userId);
   await supabase.from('refresh_tokens').delete().eq('user_id', userId);
   await supabase.from('saved_searches').delete().eq('user_id', userId);
 
