@@ -3,7 +3,23 @@ import { renderHook, act, waitFor } from '@testing-library/react';
 import { useWallet } from '../useWallet';
 import * as freighterUtils from '@/lib/freighter-utils';
 
-vi.mock('@/lib/freighter-utils');
+vi.mock('@/lib/freighter-utils', async () => {
+  class FreighterError extends Error {
+    code: string;
+    constructor(message: string, code = 'NETWORK_ERROR') {
+      super(message);
+      this.name = 'FreighterError';
+      this.code = code;
+    }
+  }
+  return {
+    connectFreighterWallet: vi.fn(),
+    getWalletStatus: vi.fn(),
+    isUnsupportedWalletEnvironment: vi.fn(() => false),
+    getUnsupportedEnvironmentMessage: vi.fn(() => 'unsupported'),
+    FreighterError,
+  };
+});
 vi.mock('@/lib/network-utils', () => ({
   getExpectedNetwork: () => 'testnet',
 }));
@@ -77,7 +93,7 @@ describe('useWallet account switching (#620)', () => {
     await waitFor(() => expect(result.current.state.isLoading).toBe(false));
 
     await expect(result.current.assertSigningAddress(ADDR_A)).rejects.toThrow(
-      /account changed/i,
+      /Wallet account changed/i,
     );
   });
 

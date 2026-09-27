@@ -232,8 +232,6 @@ export async function connectFreighterWallet(expectedNetwork?: 'testnet' | 'main
 export function isUnsupportedWalletEnvironment(
   userAgent = typeof navigator !== 'undefined' ? navigator.userAgent : '',
 ): boolean {
-  if (typeof window === 'undefined') return false;
-
   const ua = userAgent.toLowerCase();
   const isMobile = /iphone|ipad|ipod|android|mobile/.test(ua);
   const isInAppBrowser = /fbav|instagram|line\//.test(ua);
@@ -244,6 +242,10 @@ export function isUnsupportedWalletEnvironment(
   // iOS Safari / Chrome without Freighter mobile handoff documented as unsupported
   // when no freighter global and no deep-link bridge is present.
   if (isMobile) {
+    if (typeof window === 'undefined') {
+      // No DOM (SSR / unit tests): treat bare mobile UA as unsupported.
+      return true;
+    }
     const hasFreighterGlobal =
       typeof (window as unknown as { freighter?: unknown }).freighter !== 'undefined';
     const hasFreighterApi =

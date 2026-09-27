@@ -39,22 +39,21 @@ vi.mock('../WalletErrorDisplay', () => ({
   WalletErrorDisplay: () => <div data-testid="wallet-error-display" />,
 }));
 
-vi.mock('@/lib/freighter-utils', async () => {
-  const actual = await vi.importActual<typeof import('@/lib/freighter-utils')>(
-    '@/lib/freighter-utils',
-  );
-  return {
-    ...actual,
-    isUnsupportedWalletEnvironment: vi.fn(() => false),
-    getUnsupportedEnvironmentMessage: () =>
-      'This browser cannot complete Freighter wallet handoff.',
-  };
-});
+const isUnsupportedMock = vi.hoisted(() => vi.fn(() => false));
+
+vi.mock('@/lib/freighter-utils', () => ({
+  FreighterError: class FreighterError extends Error {},
+  isUnsupportedWalletEnvironment: (...args: unknown[]) => isUnsupportedMock(...args),
+  getUnsupportedEnvironmentMessage: () =>
+    'This browser cannot complete Freighter wallet handoff.',
+}));
 
 describe('WalletOnboardingModal a11y (#626)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    isUnsupportedMock.mockReturnValue(false);
     mockWallet.state.unsupportedEnvironment = false;
+    mockWallet.state.unsupportedMessage = null;
   });
 
   it('exposes dialog semantics and live status region', () => {
@@ -86,14 +85,13 @@ describe('WalletOnboardingModal a11y (#626)', () => {
     expect(screen.getByTestId('wallet-modal-status')).toHaveTextContent(/ready to connect|connecting|error/i);
   });
 
-  it('shows non-dead-end message for unsupported environments', async () => {
-    const freighter = await import('@/lib/freighter-utils');
-    vi.mocked(freighter.isUnsupportedWalletEnvironment).mockReturnValue(true);
+  it('shows non-dead-end message for unsupported environments', () => {
+    isUnsupportedMock.mockReturnValue(true);
 
     render(<WalletOnboardingModal isOpen onClose={vi.fn()} />);
 
     expect(screen.getByTestId('wallet-unsupported')).toBeInTheDocument();
-    expect(screen.getByText(/not supported/i)).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: /not supported/i })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /freighter help/i })).toHaveAttribute(
       'href',
       'https://www.freighter.app',

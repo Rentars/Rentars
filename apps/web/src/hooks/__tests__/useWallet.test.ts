@@ -1,9 +1,25 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { renderHook, waitFor } from '@testing-library/react';
+import { renderHook, waitFor, act } from '@testing-library/react';
 import { useWallet } from '../useWallet';
 import * as freighterUtils from '@/lib/freighter-utils';
 
-vi.mock('@/lib/freighter-utils');
+vi.mock('@/lib/freighter-utils', async () => {
+  class FreighterError extends Error {
+    code: string;
+    constructor(message: string, code = 'NETWORK_ERROR') {
+      super(message);
+      this.name = 'FreighterError';
+      this.code = code;
+    }
+  }
+  return {
+    connectFreighterWallet: vi.fn(),
+    getWalletStatus: vi.fn(),
+    isUnsupportedWalletEnvironment: vi.fn(() => false),
+    getUnsupportedEnvironmentMessage: vi.fn(() => 'unsupported'),
+    FreighterError,
+  };
+});
 vi.mock('@/lib/network-utils', () => ({
   getExpectedNetwork: () => 'testnet',
 }));
@@ -83,8 +99,10 @@ describe('useWallet', () => {
 
       await expect(result.current.connect()).rejects.toThrow();
 
-      expect(result.current.state.error).toContain('mainnet');
-      expect(result.current.state.error).toContain('testnet');
+      await waitFor(() => {
+        expect(result.current.state.error).toContain('mainnet');
+        expect(result.current.state.error).toContain('testnet');
+      });
     });
 
     it('should show network mismatch in status', async () => {
@@ -114,13 +132,24 @@ describe('useWallet', () => {
       localStorage.setItem('freighter_wallet_connected', 'true');
       localStorage.setItem('freighter_wallet_address', 'GABC123...');
 
+      vi.mocked(freighterUtils.getWalletStatus).mockResolvedValue({
+        isConnected: false,
+        address: null,
+        network: 'testnet',
+        networkMismatch: false,
+        isLoading: false,
+        error: null,
+      });
+
       const { result } = renderHook(() => useWallet());
 
       await waitFor(() => {
         expect(result.current.state.isLoading).toBe(false);
       });
 
-      result.current.disconnect();
+      act(() => {
+        result.current.disconnect();
+      });
 
       expect(localStorage.getItem('freighter_wallet_connected')).toBeNull();
       expect(localStorage.getItem('freighter_wallet_address')).toBeNull();
