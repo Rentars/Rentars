@@ -5,6 +5,7 @@ import {
   deleteNotification,
   getNotifications,
   getNotificationsCursor,
+  getNotificationsSince,
   getPreferences,
   markAllAsRead,
   markAsRead,
@@ -26,6 +27,44 @@ export async function listNotifications(req: AuthRequest, res: Response): Promis
 
   const pagination = (req as AuthRequest & { parsedPagination?: { page: number; pageSize: number } }).parsedPagination;
   const result = await getNotifications(userId, pagination?.page ?? 1, pagination?.pageSize ?? 20);
+  if (!result.success) {
+    res.status(400).json({ error: result.error });
+    return;
+  }
+  res.json(result.data);
+}
+
+/**
+ * GET /api/v1/notifications/sync?since=<iso>&cursor=<opaque>&limit=<n>
+ *
+ * Forward-only replay endpoint for realtime reconnection back-fill
+ * (issue #646). Returns records created strictly after `since`, ascending,
+ * as a cursor page so the client can keep walking until it catches up.
+ *
+ * Kept separate from `GET /` so the existing offset-paginated response
+ * shape — which other consumers depend on — is left untouched.
+ */
+export async function syncNotifications(req: AuthRequest, res: Response): Promise<void> {
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const since = typeof req.query.since === 'string' ? req.query.since : null;
+  const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : null;
+  const rawLimit = typeof req.query.limit === 'string' ? Number(req.query.limit) : 50;
+
+  if (since !== null && Number.isNaN(Date.parse(since))) {
+    res.status(400).json({ error: 'since must be a valid ISO timestamp' });
+    return;
+  }
+  if (!Number.isFinite(rawLimit) || !Number.isInteger(rawLimit) || rawLimit < 1) {
+    res.status(400).json({ error: 'limit must be a positive integer' });
+    return;
+  }
+
+  const result = await getNotificationsSince(userId, since, cursor, rawLimit);
   if (!result.success) {
     res.status(400).json({ error: result.error });
     return;

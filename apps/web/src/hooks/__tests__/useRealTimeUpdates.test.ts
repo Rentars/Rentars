@@ -224,12 +224,23 @@ describe('useRealTimeUpdates', () => {
     // Flush the async catch-up fetch
     await flush();
 
+    // The replay goes through the forward-only cursor endpoint, scoped to
+    // the high-water mark established by the last realtime event.
     expect(mockFetch).toHaveBeenCalledWith(
-      expect.stringContaining('/api/v1/notifications?'),
-      expect.objectContaining({
-        headers: expect.objectContaining({ Authorization: 'Bearer test-token' }),
-      }),
+      expect.stringContaining('/api/v1/notifications/sync?'),
+      expect.anything(),
     );
+    const syncUrl = mockFetch.mock.calls
+      .map((c) => String(c[0]))
+      .find((u) => u.includes('/api/v1/notifications/sync'));
+    expect(syncUrl).toContain('since=2024-06-01T10%3A00%3A00Z');
+
+    // The request is authorised with the bearer token.
+    const syncCall = mockFetch.mock.calls.find((c) => String(c[0]).includes('/sync'));
+    expect(new Headers(syncCall?.[1]?.headers as HeadersInit).get('Authorization')).toBe(
+      'Bearer test-token',
+    );
+
     expect(onMissedNotifications).toHaveBeenCalledWith(
       expect.arrayContaining([
         expect.objectContaining({ id: 'n-missed-1' }),

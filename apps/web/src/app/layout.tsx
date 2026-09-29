@@ -3,6 +3,7 @@ import { Inter } from 'next/font/google';
 import { cookies } from 'next/headers';
 import { AuthProvider } from '@/hooks/useUserRole';
 import { Navbar } from '@/components/layout/Navbar';
+import { RealtimeProvider } from '@/components/shared/RealtimeProvider';
 import { I18nProvider } from '@/lib/i18n/context';
 import { OfflineBanner } from '@/components/shared/OfflineBanner';
 import { isValidLocale, DEFAULT_LOCALE, LOCALE_COOKIE, type Locale } from '@/lib/i18n/config';
@@ -65,13 +66,17 @@ export default async function RootLayout({ children }: { children: React.ReactNo
       </a>
       <I18nProvider initialLocale={initialLocale}>
         <AuthProvider>
-          <WalletProvider>
-            <OfflineBanner />
-            <Navbar />
-            <main id="main-content" tabIndex={-1}>
-              {children}
-            </main>
-          </WalletProvider>
+          {/* One realtime connection for the whole app, so reconnect backoff
+              and fallback polling are not duplicated per consumer. */}
+          <RealtimeProvider>
+            <WalletProvider>
+              <OfflineBanner />
+              <Navbar />
+              <main id="main-content" tabIndex={-1}>
+                {children}
+              </main>
+            </WalletProvider>
+          </RealtimeProvider>
         </AuthProvider>
       </I18nProvider>
 

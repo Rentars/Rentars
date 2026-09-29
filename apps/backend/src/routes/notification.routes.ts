@@ -8,6 +8,7 @@ import {
   readNotification,
   registerPushSubscription,
   removeNotification,
+  syncNotifications,
   unregisterPushSubscription,
   updateNotificationPreferences,
   updatePreferencesByToken,
@@ -19,6 +20,12 @@ const router = Router();
 
 // GET /api/v1/notifications
 router.get('/', authenticate, validatePagination, listNotifications);
+
+// GET /api/v1/notifications/sync?since=<iso>&cursor=<opaque>&limit=<n>
+// Forward-only cursor replay used by the client to back-fill records missed
+// while the realtime connection was down (issue #646). Declared before the
+// `/:id` routes so the literal path always wins.
+router.get('/sync', authenticate, syncNotifications);
 
 // PATCH /api/v1/notifications/read-all
 router.patch('/read-all', authenticate, readAllNotifications);

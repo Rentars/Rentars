@@ -7,6 +7,8 @@ import { WalletAuthButton } from '@/components/auth/WalletAuthButton';
 import { ThemeToggle } from '@/components/shared/theme-toggle';
 import { LocaleSwitcher } from '@/components/shared/LocaleSwitcher';
 import NotificationBell from '@/components/shared/NotificationBell';
+import { ConnectionStatusIndicator } from '@/components/shared/ConnectionStatusIndicator';
+import { useOptionalRealtimeConnection } from '@/components/shared/RealtimeProvider';
 import { useTranslations } from '@/lib/i18n/useTranslations';
 import { House, Menu, X, LogOut, User } from 'lucide-react';
 import { WalletConnectButton } from '@/components/wallet';
@@ -16,6 +18,7 @@ export function Navbar() {
   const { user, logout } = useAuth();
   const [isOpen, setIsOpen] = useState(false);
   const t = useTranslations('nav');
+  const { connectionStatus, retryAttempt, retriesRemaining } = useOptionalRealtimeConnection();
 
   const navLinks = [
     { href: '/', label: t('home') },
@@ -51,6 +54,15 @@ export function Navbar() {
             <div className="flex items-center gap-3">
               <LocaleSwitcher />
               <ThemeToggle />
+
+              {/* Live-connection state. Surfaces stale/reconnecting so the UI
+                  never looks current while data is out of date. */}
+              <ConnectionStatusIndicator
+                  status={connectionStatus}
+                  showLabel
+                  retryAttempt={retryAttempt}
+                  retriesRemaining={retriesRemaining}
+              />
 
               {/* Wallet Status Badge - shows network and address */}
               <WalletStatusBadge className="hidden md:flex" />

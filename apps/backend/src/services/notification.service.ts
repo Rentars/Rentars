@@ -182,6 +182,63 @@ export async function getNotificationsCursor(
   return { success: true, data: page };
 }
 
+/**
+ * Forward-only ("since") notification sync used for realtime reconnection
+ * back-fill (issue #646).
+ *
+ * Unlike `getNotificationsCursor`, this walks **forward** in time
+ * (`created_at ASC, id ASC`) starting from a high-water mark the client
+ * supplies, so a client that was offline can replay exactly the records it
+ * missed and nothing else. Keyset pagination means concurrent inserts during
+ * the walk can neither duplicate nor skip rows.
+ *
+ * @param userId - The authenticated user's ID
+ * @param since  - ISO timestamp high-water mark; only strictly newer rows are returned
+ * @param cursor - Opaque cursor from a previous page of this same walk
+ * @param limit  - Page size, default 50, max 100
+ */
+export async function getNotificationsSince(
+  userId: string,
+  since?: string | null,
+  cursor?: string | null,
+  limit = 50,
+): Promise<ServiceResponse<CursorPaginatedResult<Notification>>> {
+  if (!Number.isFinite(limit) || !Number.isInteger(limit)) {
+    return { success: false, error: 'limit must be a finite integer' };
+  }
+
+  const pageSize = Math.min(Math.max(1, limit), 100);
+  // A cursor from a previous page wins over `since`: it encodes a position
+  // further along the same ascending walk. Applying both would skip rows.
+  const decoded = decodeCursor(cursor);
+
+  let query = supabase
+    .from('notifications')
+    .select('*')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: true })
+    .order('id', { ascending: true })
+    .limit(pageSize + 1); // +1 to detect hasMore
+
+  if (decoded) {
+    // Keyset filter for forward pagination: rows strictly after the cursor.
+    query = query.or(
+      `created_at.gt.${decoded.created_at},and(created_at.eq.${decoded.created_at},id.gt.${decoded.id})`,
+    );
+  } else if (since) {
+    query = query.gt('created_at', since);
+  }
+
+  const { data, error } = await query;
+
+  if (error) return { success: false, error: error.message };
+
+  const rows = (data ?? []) as Notification[];
+  const page = buildCursorPage(rows, pageSize);
+
+  return { success: true, data: page };
+}
+
 export async function markAsRead(
   notificationId: string,
   userId: string

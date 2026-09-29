@@ -2,6 +2,7 @@
 
 import { createClient } from '@supabase/supabase-js';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { authenticatedFetch } from '@/lib/realtime/authToken';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
 const API_BASE = `${API_URL}/api/v1/notifications`;
@@ -62,9 +63,10 @@ export function useNotifications(userId?: string, pageSize = 20) {
         const params = new URLSearchParams({ limit: String(pageSize) });
         if (cursor) params.set('cursor', cursor);
 
-        const res = await fetch(`${API_BASE}?${params.toString()}`, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
+        // authenticatedFetch refreshes an expired access token once and
+        // replays the request, instead of 401-ing and leaving the list
+        // permanently stale (issue #646).
+        const res = await authenticatedFetch(`${API_BASE}?${params.toString()}`);
 
         // Check token again after request completes (it may have been removed during the request)
         const currentToken = getToken();
