@@ -1,5 +1,5 @@
 import { Keypair, StrKey } from '@stellar/stellar-sdk';
-import jwt from 'jsonwebtoken';
+import jsonted from 'jsonwebtoken';
 import { supabase } from '@/config/supabase.js';
 import type { ServiceResponse } from './index.js';
 
