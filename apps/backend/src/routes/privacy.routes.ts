@@ -1,18 +1,29 @@
 /**
  * Privacy routes — data subject rights endpoints.
  *
- * GET  /api/v1/privacy/export          — export all personal data for the authenticated user
- * POST /api/v1/privacy/delete-account  — request account deletion (anonymises PII; see service)
+ * POST /api/v1/privacy/export                        — request an async export (202)
+ * GET  /api/v1/privacy/export/:exportId              — poll status; payload when completed
+ * POST /api/v1/privacy/delete-account                — request deletion (password + confirmation)
+ * GET  /api/v1/privacy/delete-account/:deletionId    — deletion status
+ * POST /api/v1/privacy/delete-account/:deletionId/cancel — cancel within the 7-day window
  *
- * Both endpoints are rate-limited to prevent abuse.
+ * All endpoints are authenticated and rate-limited.
  */
 
+import { type AuthRequest, authenticate } from '@/middleware/auth.middleware.js';
+import { createUserRateLimiter } from '@/middleware/rateLimiter.js';
+import {
+  DeletionBlockedError,
+  cancelAccountDeletion,
+  getDataExportStatus,
+  getDeletionRequest,
+  processDataExport,
+  requestAccountDeletion,
+  requestDataExport,
+  verifyUserPassword,
+} from '@/services/privacy.service.js';
 import { Router } from 'express';
 import type { Response } from 'express';
-import { authenticate, type AuthRequest } from '@/middleware/auth.middleware.js';
-import { supabase } from '@/config/supabase.js';
-import { auditLogger } from '@/services/auditLogger.service.js';
-import { createUserRateLimiter } from '@/middleware/rateLimiter.js';
 
 const router = Router();
 
@@ -23,166 +34,234 @@ const exportLimiter = createUserRateLimiter({
   keyPrefix: 'rl:privacy:export',
 });
 
-/** Max one deletion request per user per day. */
+/** Max three deletion attempts per user per day (covers wrong-password retries). */
 const deletionLimiter = createUserRateLimiter({
   windowMs: 24 * 60 * 60 * 1000,
   max: 3,
   keyPrefix: 'rl:privacy:delete',
 });
 
+/** Exact phrase the client must send to confirm an irreversible action. */
+const DELETION_CONFIRMATION = 'DELETE MY ACCOUNT';
+
 // ── Data export ────────────────────────────────────────────────────────────────
 
 /**
- * GET /api/v1/privacy/export
+ * POST /api/v1/privacy/export
  *
- * Returns a JSON object containing all personal data held for the authenticated
- * user that can be exported (profile, bookings, reviews, messages).
- * Blockchain records are referenced by ID but not replicated here.
+ * Queues an export and returns 202 immediately. The payload is generated in the
+ * background and retrieved via GET /export/:exportId.
  */
-router.get('/export', authenticate, exportLimiter, async (req: AuthRequest, res: Response): Promise<void> => {
-  const userId = req.userId;
-  if (!userId) {
-    res.status(401).json({ error: 'Unauthorized' });
-    return;
+router.post(
+  '/export',
+  authenticate,
+  exportLimiter,
+  async (req: AuthRequest, res: Response): Promise<void> => {
+    const userId = req.userId;
+    if (!userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const request = await requestDataExport(userId, req.ip ?? 'unknown');
+
+    void processDataExport(userId, request.id).catch((err: unknown) => {
+      console.error(
+        '[privacy] export generation crashed',
+        request.id,
+        err instanceof Error ? err.message : err
+      );
+    });
+
+    res.status(202).json({
+      export_id: request.id,
+      status: request.status,
+      expires_at: request.expires_at,
+      poll_url: `/api/v1/privacy/export/${request.id}`,
+    });
   }
+);
 
-  const [
-    profileResult,
-    bookingsResult,
-    reviewsResult,
-    messagesResult,
-    notificationPrefsResult,
-  ] = await Promise.all([
-    supabase.from('profiles').select('*').eq('id', userId).single(),
-    supabase
-      .from('bookings')
-      .select('id, property_id, check_in, check_out, guest_count, total_price, status, terms_version, terms_accepted_at, created_at')
-      .eq('tenant_id', userId),
-    supabase
-      .from('reviews')
-      .select('id, property_id, rating, comment, created_at')
-      .eq('author_id', userId),
-    supabase
-      .from('messages')
-      .select('id, recipient_id, content, created_at')
-      .eq('sender_id', userId),
-    supabase
-      .from('notification_preferences')
-      .select('*')
-      .eq('user_id', userId)
-      .maybeSingle(),
-  ]);
+/**
+ * GET /api/v1/privacy/export/:exportId
+ */
+router.get(
+  '/export/:exportId',
+  authenticate,
+  async (req: AuthRequest, res: Response): Promise<void> => {
+    const userId = req.userId;
+    if (!userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
 
-  await auditLogger.log({
-    actorId: userId,
-    action: 'auth.unauthorized_access', // closest available; use 'privacy.export' if added to AuditAction
-    resourceType: 'user',
-    resourceId: userId,
-    ip: req.ip,
-    meta: { action: 'data_export_requested' },
-  });
+    const exportRecord = await getDataExportStatus(userId, req.params.exportId as string);
+    if (!exportRecord) {
+      res.status(404).json({ error: 'Export not found' });
+      return;
+    }
 
-  res.json({
-    exported_at: new Date().toISOString(),
-    note: 'Blockchain records (wallet addresses, transaction hashes, on-chain IDs) are permanently public on the Stellar ledger and are not included here. They cannot be deleted.',
-    profile: profileResult.data ?? null,
-    bookings: bookingsResult.data ?? [],
-    reviews: reviewsResult.data ?? [],
-    messages: messagesResult.data ?? [],
-    notification_preferences: notificationPrefsResult.data ?? null,
-  });
-});
+    if (exportRecord.status === 'pending') {
+      res.status(202).json({ export_id: exportRecord.id, status: 'pending' });
+      return;
+    }
+
+    if (exportRecord.status === 'failed') {
+      res.status(500).json({
+        export_id: exportRecord.id,
+        status: 'failed',
+        error: 'Export generation failed. Please request a new export.',
+      });
+      return;
+    }
+
+    if (new Date(exportRecord.expires_at) < new Date()) {
+      res.status(410).json({ error: 'Export has expired. Please request a new export.' });
+      return;
+    }
+
+    res.json({
+      export_id: exportRecord.id,
+      status: exportRecord.status,
+      expires_at: exportRecord.expires_at,
+      data: exportRecord.export_payload ?? null,
+    });
+  }
+);
 
 // ── Account deletion ───────────────────────────────────────────────────────────
 
 /**
  * POST /api/v1/privacy/delete-account
  *
- * Anonymises the user's personal data:
- *   - Email replaced with deleted-<id>@rentars.invalid
- *   - Profile name/avatar/bio cleared
- *   - Stellar address removed from profile
- *   - Account status set to 'deleted'
+ * Body: { password: string, confirmation: "DELETE MY ACCOUNT" }
  *
- * Data that CANNOT be deleted:
- *   - Booking & payment records (7-year financial retention)
- *   - Audit log entries
- *   - Blockchain records (Stellar ledger — permanently public)
- *
- * The tenant_id on bookings is retained to preserve financial records but is
- * no longer linkable to a real identity once the email and profile are wiped.
+ * - Re-verifies the password (fresh proof of possession, not just a session).
+ * - Refuses (409) while the user has open bookings, escrow, or disputes.
+ * - Opens a 7-day cancellation window. Anonymisation runs after it closes.
  */
-router.post('/delete-account', authenticate, deletionLimiter, async (req: AuthRequest, res: Response): Promise<void> => {
-  const userId = req.userId;
-  if (!userId) {
-    res.status(401).json({ error: 'Unauthorized' });
-    return;
+router.post(
+  '/delete-account',
+  authenticate,
+  deletionLimiter,
+  async (req: AuthRequest, res: Response): Promise<void> => {
+    const userId = req.userId;
+    if (!userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const { password, confirmation } = (req.body ?? {}) as {
+      password?: unknown;
+      confirmation?: unknown;
+    };
+
+    if (confirmation !== DELETION_CONFIRMATION) {
+      res.status(400).json({ error: `Send confirmation: "${DELETION_CONFIRMATION}"` });
+      return;
+    }
+
+    if (typeof password !== 'string' || password.length === 0) {
+      res.status(400).json({ error: 'Password is required to delete your account' });
+      return;
+    }
+
+    if (!(await verifyUserPassword(userId, password))) {
+      res.status(401).json({ error: 'Invalid password' });
+      return;
+    }
+
+    try {
+      const deletion = await requestAccountDeletion(userId, req.ip ?? 'unknown');
+      res.status(202).json({
+        deletion_id: deletion.id,
+        status: deletion.status,
+        cancel_expires_at: deletion.cancel_expires_at,
+        message:
+          'Your account will be anonymised when the cancellation window closes. You can cancel until then.',
+        retained_data: [
+          'Booking and payment records (7-year legal retention)',
+          'Audit log entries (7-year legal retention)',
+          'Blockchain records on the Stellar ledger (permanent — cannot be deleted)',
+        ],
+      });
+    } catch (err) {
+      if (err instanceof DeletionBlockedError) {
+        res.status(409).json({
+          error:
+            'Account deletion is blocked by open bookings or disputes. Resolve them and try again.',
+          code: err.code,
+          open_bookings: err.obligations.map((o) => ({
+            booking_id: o.booking_id,
+            status: o.status,
+            role: o.role,
+          })),
+        });
+        return;
+      }
+      console.error('[privacy] deletion request failed', err instanceof Error ? err.message : err);
+      res.status(500).json({ error: 'Could not start account deletion. Please try again.' });
+    }
   }
+);
 
-  const deletedEmail = `deleted-${userId}@rentars.invalid`;
+/**
+ * GET /api/v1/privacy/delete-account/:deletionId
+ */
+router.get(
+  '/delete-account/:deletionId',
+  authenticate,
+  async (req: AuthRequest, res: Response): Promise<void> => {
+    const userId = req.userId;
+    if (!userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
 
-  // 1. Anonymise the user record
-  const { error: userError } = await supabase
-    .from('users')
-    .update({
-      email: deletedEmail,
-      status: 'deleted',
-      email_verified: false,
-    })
-    .eq('id', userId);
+    const deletion = await getDeletionRequest(userId, req.params.deletionId as string);
+    if (!deletion) {
+      res.status(404).json({ error: 'Deletion request not found' });
+      return;
+    }
 
-  if (userError) {
-    res.status(500).json({ error: 'Failed to anonymise account. Please try again or contact support.' });
-    return;
+    res.json({
+      deletion_id: deletion.id,
+      status: deletion.status,
+      requested_at: deletion.requested_at,
+      cancel_expires_at: deletion.cancel_expires_at,
+      completed_at: deletion.completed_at ?? null,
+      last_blocked_reason: deletion.last_blocked_reason ?? null,
+    });
   }
+);
 
-  // 2. Wipe profile PII
-  const { error: profileError } = await supabase
-    .from('profiles')
-    .update({
-      display_name: 'Deleted User',
-      avatar_url: null,
-      bio: null,
-      stellar_address: null,
-      phone: null,
-      location: null,
-    })
-    .eq('id', userId);
+/**
+ * POST /api/v1/privacy/delete-account/:deletionId/cancel
+ */
+router.post(
+  '/delete-account/:deletionId/cancel',
+  authenticate,
+  async (req: AuthRequest, res: Response): Promise<void> => {
+    const userId = req.userId;
+    if (!userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
 
-  if (profileError) {
-    // Non-fatal: log but return success since account is already anonymised
-    console.error('[privacy] Failed to wipe profile for', userId, profileError.message);
+    const cancelled = await cancelAccountDeletion(
+      userId,
+      req.params.deletionId as string,
+      req.ip ?? 'unknown'
+    );
+    if (!cancelled) {
+      res
+        .status(409)
+        .json({ error: 'Deletion cannot be cancelled (not pending, or the window has closed)' });
+      return;
+    }
+
+    res.json({ status: 'cancelled' });
   }
-
-  // 3. Delete notifications (not required for retention)
-  await supabase.from('notifications').delete().eq('user_id', userId);
-  await supabase.from('notification_preferences').delete().eq('user_id', userId);
-  await supabase.from('push_subscriptions').delete().eq('user_id', userId);
-  await supabase.from('refresh_tokens').delete().eq('user_id', userId);
-  await supabase.from('saved_searches').delete().eq('user_id', userId);
-
-  // 4. Audit the deletion
-  await auditLogger.log({
-    actorId: userId,
-    action: 'auth.logout',
-    resourceType: 'user',
-    resourceId: userId,
-    ip: req.ip,
-    meta: {
-      action: 'account_deletion',
-      anonymised_email: deletedEmail,
-      retained: ['bookings', 'payments', 'audit_logs', 'blockchain_records'],
-    },
-  });
-
-  res.json({
-    message: 'Your account has been anonymised. Email, profile, and notification data have been deleted.',
-    retained_data: [
-      'Booking and payment records (7-year legal retention)',
-      'Audit log entries (7-year legal retention)',
-      'Blockchain records on the Stellar ledger (permanent — cannot be deleted)',
-    ],
-  });
-});
+);
 
 export default router;
