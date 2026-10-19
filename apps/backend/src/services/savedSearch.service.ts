@@ -2,8 +2,10 @@ import { supabase } from '../config/supabase.js';
 import type { ServiceResponse } from './index.js';
 import type { Property } from './property.service.js';
 import {
+  buildSavedSearchLink,
   isAlertDue,
   isWithinQuietHours,
+  normalizeSavedSearchFilters,
   type DigestFrequency,
 } from '../utils/savedSearchAlerts.js';
 
@@ -21,7 +23,14 @@ export interface SavedSearch {
   created_at?: string;
   updated_at?: string;
   version?: number;
+  /** Normalisation rules that produced `filters`. */
+  filter_version?: number;
+  /** Link that reopens the search page with these filters applied. */
+  share_url?: string;
 }
+
+/** Fields a user may change on an existing saved search. */
+const UPDATABLE_FIELDS = ['name', 'filters', 'is_paused', 'digest_frequency'] as const;
 
 /** Subset of AdvancedSearchFilters relevant for matching a new property. */
 export interface SavedSearchFilters {
@@ -50,14 +59,20 @@ export async function createSavedSearch(
     return { success: false, error: 'Search name is required' };
   }
 
+  const normalized = normalizeSavedSearchFilters(filters);
   const { data, error } = await supabase
     .from('saved_searches')
-    .insert({ user_id: userId, name: name.trim(), filters })
+    .insert({
+      user_id: userId,
+      name: name.trim(),
+      filters: normalized.filters,
+      filter_version: normalized.version,
+    })
     .select()
     .single();
 
   if (error) return { success: false, error: error.message };
-  return { success: true, data: data as SavedSearch };
+  return { success: true, data: withShareUrl(data as SavedSearch) };
 }
 
 export async function listSavedSearches(
@@ -70,24 +85,57 @@ export async function listSavedSearches(
     .order('created_at', { ascending: false });
 
   if (error) return { success: false, error: error.message };
-  return { success: true, data: (data ?? []) as SavedSearch[] };
+  return { success: true, data: (data ?? []).map((row) => withShareUrl(row as SavedSearch)) };
 }
 
+/**
+ * Update one of the user's saved searches. Only the fields in UPDATABLE_FIELDS
+ * are written, so a request cannot reassign ownership or change bookkeeping
+ * columns. Filters are normalised and versioned the same way as on create.
+ */
 export async function updateSavedSearch(
   userId: string,
   searchId: string,
   updates: Partial<SavedSearch>,
 ): Promise<ServiceResponse<SavedSearch>> {
+  const writable: Record<string, unknown> = {};
+  for (const key of UPDATABLE_FIELDS) {
+    if (updates[key] !== undefined) writable[key] = updates[key];
+  }
+
+  if (writable.name !== undefined) {
+    const name = String(writable.name).trim();
+    if (name.length === 0) return { success: false, error: 'Search name is required' };
+    writable.name = name;
+  }
+
+  if (writable.filters !== undefined) {
+    const normalized = normalizeSavedSearchFilters(writable.filters as Record<string, unknown>);
+    writable.filters = normalized.filters;
+    writable.filter_version = normalized.version;
+  }
+
+  if (Object.keys(writable).length === 0) {
+    return { success: false, error: 'At least one updatable field is required' };
+  }
+
   const { data, error } = await supabase
     .from('saved_searches')
-    .update(updates)
+    .update(writable)
     .eq('id', searchId)
     .eq('user_id', userId)
     .select()
     .single();
 
   if (error) return { success: false, error: error.message };
-  return { success: true, data: data as SavedSearch };
+  return { success: true, data: withShareUrl(data as SavedSearch) };
+}
+
+/** Attach a share link built from the saved, normalised filters. */
+function withShareUrl(search: SavedSearch): SavedSearch {
+  const baseUrl = process.env.FRONTEND_URL ?? 'http://localhost:3001';
+  const filters = (search.filters ?? {}) as Record<string, unknown>;
+  return { ...search, share_url: buildSavedSearchLink(baseUrl, filters) };
 }
 
 export async function pauseSavedSearch(

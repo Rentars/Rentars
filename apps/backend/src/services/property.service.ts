@@ -440,6 +440,20 @@ export async function updateProperty(
     });
   }
 
+  // Re-run saved-search matching when a listing becomes available or changes in a
+  // way a saved search can match on. Delivery rows keep each (search, listing)
+  // pair to a single alert, so repeated edits do not resend.
+  const becameAvailable =
+    (before as Partial<Property>).status !== 'available' && updated.status === 'available';
+  const matchFieldChanged = SAVED_SEARCH_MATCH_FIELDS.some((field) => payload[field] !== undefined);
+  if (updated.status === 'available' && (becameAvailable || matchFieldChanged)) {
+    import('./savedSearch.service.js').then(({ notifyMatchingSavedSearches }) => {
+      notifyMatchingSavedSearches(updated).catch((err) =>
+        console.error('[updateProperty] notifyMatchingSavedSearches failed:', err),
+      );
+    });
+  }
+
   // Record a version snapshot when tracked fields changed.
   recordPropertyVersion(id, before, updated, changedBy, changeSource, changeNotes).catch((err) =>
     console.warn('[updateProperty] version record failed:', err),
@@ -447,6 +461,19 @@ export async function updateProperty(
 
   return { success: true, data: updated };
 }
+
+/** Listing fields a saved search can match on. */
+const SAVED_SEARCH_MATCH_FIELDS = [
+  'title',
+  'city',
+  'country',
+  'price_per_night',
+  'bedrooms',
+  'bathrooms',
+  'max_guests',
+  'amenities',
+  'property_type',
+] as const satisfies readonly (keyof Property)[];
 
 /**
  * Soft-delete a property record by setting `deleted_at` to the current
