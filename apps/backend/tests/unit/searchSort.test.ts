@@ -3,7 +3,7 @@
  */
 
 import { describe, expect, it } from 'bun:test';
-import { buildSearchOrderClauses } from '../../src/utils/searchSort.js';
+import { buildSearchOrderClauses, compareSearchRows } from '../../src/utils/searchSort.js';
 
 const SORTS = ['price_asc', 'price_desc', 'rating', 'relevance', 'distance', 'newest'];
 
@@ -62,35 +62,76 @@ describe('buildSearchOrderClauses', () => {
  * row exactly once, which is the property issue #749 requires.
  */
 describe('stable pagination with tied sort keys', () => {
-  type Row = { id: string; price_per_night: number };
+  type Row = {
+    id: string;
+    price_per_night: number;
+    average_rating: number | null;
+    review_count: number | null;
+    created_at: string;
+  };
 
+  // Fixture matrix: ties on price and rating, plus unrated listings with null
+  // ratings and review counts, so nulls and equal keys are both exercised.
   const rows: Row[] = Array.from({ length: 23 }, (_, i) => ({
     id: `listing-${String(i).padStart(2, '0')}`,
     price_per_night: 100 + (i % 4) * 10,
+    average_rating: i % 5 === 0 ? null : 3 + (i % 3),
+    review_count: i % 5 === 0 ? null : i % 2,
+    created_at: `2026-01-${String((i % 3) + 1).padStart(2, '0')}T00:00:00Z`,
   }));
 
-  function sortRows(input: Row[], sortBy: string): Row[] {
-    const clauses = buildSearchOrderClauses(sortBy);
-    return [...input].sort((a, b) => {
-      for (const { column, options } of clauses) {
-        const av = a[column as keyof Row];
-        const bv = b[column as keyof Row];
-        if (av === bv) continue;
-        const cmp = av < bv ? -1 : 1;
-        return options.ascending ? cmp : -cmp;
-      }
-      return 0;
-    });
-  }
-
-  it.each(['price_asc', 'price_desc'])('pages %s without duplicates or skipped rows', (sortBy) => {
-    const ordered = sortRows(rows, sortBy);
-    const pageSize = 5;
+  function pageAll(input: Row[], sortBy: string, pageSize: number): string[] {
+    const ordered = [...input].sort((a, b) =>
+      compareSearchRows(a, b, buildSearchOrderClauses(sortBy))
+    );
     const seen: string[] = [];
     for (let from = 0; from < ordered.length; from += pageSize) {
       seen.push(...ordered.slice(from, from + pageSize).map((r) => r.id));
     }
-    expect(new Set(seen).size).toBe(rows.length);
-    expect(seen.sort()).toEqual(rows.map((r) => r.id).sort());
+    return seen;
+  }
+
+  it.each(['price_asc', 'price_desc', 'rating', 'newest'])(
+    'pages %s without duplicates or skipped rows',
+    (sortBy) => {
+      for (const pageSize of [1, 5, 7]) {
+        const seen = pageAll(rows, sortBy, pageSize);
+        expect(new Set(seen).size).toBe(rows.length);
+        expect([...seen].sort()).toEqual(rows.map((r) => r.id).sort());
+      }
+    }
+  );
+
+  it('keeps the same order no matter how the input is shuffled', () => {
+    const reversed = [...rows].reverse();
+    expect(pageAll(reversed, 'rating', 4)).toEqual(pageAll(rows, 'rating', 4));
+  });
+
+  it('places unrated listings last when sorting by rating', () => {
+    const ordered = [...rows].sort((a, b) =>
+      compareSearchRows(a, b, buildSearchOrderClauses('rating'))
+    );
+    const firstNullIndex = ordered.findIndex((r) => r.average_rating === null);
+    expect(firstNullIndex).toBeGreaterThan(0);
+    expect(ordered.slice(firstNullIndex).every((r) => r.average_rating === null)).toBe(true);
+  });
+});
+
+describe('compareSearchRows null handling', () => {
+  const clauses = [{ column: 'v', options: { ascending: true } }];
+
+  it('sorts nulls last for ascending by default (Postgres default)', () => {
+    const ordered = [{ v: null }, { v: 2 }, { v: 1 }].sort((a, b) =>
+      compareSearchRows(a, b, clauses)
+    );
+    expect(ordered.map((r) => r.v)).toEqual([1, 2, null]);
+  });
+
+  it('honours an explicit nullsFirst option', () => {
+    const first = [{ column: 'v', options: { ascending: false, nullsFirst: true } }];
+    const ordered = [{ v: 1 }, { v: null }, { v: 2 }].sort((a, b) =>
+      compareSearchRows(a, b, first)
+    );
+    expect(ordered.map((r) => r.v)).toEqual([null, 2, 1]);
   });
 });

@@ -109,7 +109,10 @@ export function promoteFeatureToTop(
   }
 
   // Sort by weight descending and keep only the top `effectiveCap` entries.
-  featuredCandidates.sort((a, b) => (b.featured_weight ?? 0) - (a.featured_weight ?? 0));
+  // Equal weights fall back to id so the featured order never depends on input order.
+  featuredCandidates.sort(
+    (a, b) => (b.featured_weight ?? 0) - (a.featured_weight ?? 0) || a.id.localeCompare(b.id),
+  );
   const promoted = featuredCandidates.slice(0, effectiveCap);
 
   // Properties that were featured but did not fit the cap are demoted to
