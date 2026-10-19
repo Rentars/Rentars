@@ -29,6 +29,7 @@ import {
 } from '@/middleware/metrics.middleware.js';
 import { checkDateRangeAvailability } from './availability.service.js';
 import { assertQuotedTotal, calculateRangePrice } from './pricing.service.js';
+import { captureListingTermsSnapshot } from './property.service.js';
 import { bookingAuthorizationService } from './bookingAuthorization.service.js';
 
 // ─── State machine ────────────────────────────────────────────────────────────
@@ -598,6 +599,13 @@ export class BookingService {
     }
     const chargedTotal = priceCheck.data.total;
 
+    // Capture the listing terms the tenant is agreeing to, at the same point the
+    // price is confirmed. This is stored with the booking and never changes after.
+    const termsSnapshot = await captureListingTermsSnapshot(property_id);
+    if (!termsSnapshot.success || !termsSnapshot.data) {
+      return { success: false, error: 'Could not record the listing terms for this booking' };
+    }
+
     // 2. Fetch Stellar addresses
     const [ownerStellarAddress, buyerStellarAddress] = await Promise.all([
       fetchStellarAddress(prop.owner_id),
@@ -648,6 +656,21 @@ export class BookingService {
     }
 
     const bookingId = reservedId as string;
+
+    // Store the agreed listing terms on the booking. The snapshot is immutable
+    // (see migration 00065), so this is the only write that sets it.
+    const { error: snapshotError } = await supabase
+      .from('bookings')
+      .update({
+        listing_terms_snapshot: termsSnapshot.data.terms,
+        listing_revision: termsSnapshot.data.revision,
+      })
+      .eq('id', bookingId);
+
+    if (snapshotError) {
+      await supabase.from('bookings').delete().eq('id', bookingId);
+      return { success: false, error: 'Could not record the listing terms for this booking' };
+    }
 
     // 5. Check on-chain availability (advisory; non-blocking on error).
     if (prop.on_chain_id !== undefined && prop.on_chain_id !== null) {

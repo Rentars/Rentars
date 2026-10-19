@@ -471,8 +471,9 @@ export async function updateProperty(
     });
   }
 
-  // Record a version snapshot when tracked fields changed.
-  recordPropertyVersion(id, before, updated, changedBy, changeSource, changeNotes).catch((err) =>
+  // Record a version snapshot when tracked fields changed. Awaited so a revision
+  // exists before the caller returns (rollbacks and booking snapshots depend on it).
+  await recordPropertyVersion(id, before, updated, changedBy, changeSource, changeNotes).catch((err) =>
     console.warn('[updateProperty] version record failed:', err),
   );
 
@@ -1609,7 +1610,58 @@ const VERSIONED_FIELDS: ReadonlyArray<keyof Property> = [
   'city',
   'country',
   'property_type',
+  'min_nights',
+  'max_nights',
+  'check_in_time',
+  'check_out_time',
 ] as const;
+
+/**
+ * Capture the booking-relevant terms of a listing as they stand now, plus its
+ * revision number. Booking creation stores this so a tenant's booking keeps the
+ * terms they agreed to, however the host edits the listing later.
+ *
+ * @returns `revision` is the latest property_versions number (0 if never versioned).
+ */
+export async function captureListingTermsSnapshot(
+  propertyId: string,
+): Promise<ServiceResponse<{ revision: number; terms: Record<string, unknown> }>> {
+  const { data: property, error } = await supabase
+    .from('properties')
+    .select('*')
+    .eq('id', propertyId)
+    .maybeSingle();
+
+  if (error || !property) {
+    return { success: false, error: 'Property not found', statusCode: 404 };
+  }
+
+  const { data: latest } = await supabase
+    .from('property_versions')
+    .select('version_number')
+    .eq('property_id', propertyId)
+    .order('version_number', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  const row = property as unknown as Record<string, unknown>;
+  const terms: Record<string, unknown> = {};
+  for (const field of VERSIONED_FIELDS) {
+    terms[field] = row[field] ?? null;
+  }
+
+  return {
+    success: true,
+    data: {
+      revision: (latest as { version_number: number } | null)?.version_number ?? 0,
+      terms: {
+        ...terms,
+        listing_updated_at: row.updated_at ?? null,
+        captured_at: new Date().toISOString(),
+      },
+    },
+  };
+}
 
 export interface PropertyVersion {
   id: string;
@@ -1765,8 +1817,40 @@ export async function rollbackToVersion(
     return { success: false, error: 'Forbidden: only the property owner may roll back a version', statusCode: 403 };
   }
 
-  // Apply the snapshot as an update (this will trigger a new version record).
-  const restorePayload = version.snapshot as Partial<Property>;
+  // A restore is a host edit, so it must not get around moderation or removal.
+  // Moderation-hidden and removed listings are restored only by a moderator.
+  if (currentProperty.deleted_at) {
+    return { success: false, error: 'Property not found', statusCode: 404 };
+  }
+  if (currentProperty.moderation_state === 'hidden') {
+    return {
+      success: false,
+      error: 'This listing is hidden by moderation and cannot be restored by the host',
+      statusCode: 409,
+      code: 'LISTING_HIDDEN',
+    };
+  }
+
+  // Only tracked, booking-relevant fields are restored. Anything else in the
+  // snapshot (visibility, draft state, ownership) is ignored.
+  const snapshot = version.snapshot as Record<string, unknown>;
+  const restorePayload: Partial<Property> = {};
+  for (const field of VERSIONED_FIELDS) {
+    if (snapshot[field] !== undefined) {
+      (restorePayload as Record<string, unknown>)[field] = snapshot[field];
+    }
+  }
+
+  const alreadyCurrent = VERSIONED_FIELDS.every(
+    (field) =>
+      restorePayload[field] === undefined ||
+      JSON.stringify(restorePayload[field]) === JSON.stringify(currentProperty[field]),
+  );
+  if (alreadyCurrent) {
+    return { success: false, error: 'The listing already matches this version', statusCode: 409 };
+  }
+
+  // Apply the snapshot as an update (this records a new version rather than rewriting history).
   const updateResult = await updateProperty(propertyId, restorePayload, actorId, 'rollback',
     `Rolled back to version ${version.version_number} (id: ${versionId})`);
 
