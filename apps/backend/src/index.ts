@@ -40,6 +40,7 @@ import { tracingMiddleware } from './middleware/tracing.middleware.js';
 
 // ── Core middleware ───────────────────────────────────────────────────────────
 import { rateLimiter } from './middleware/rateLimiter.js';
+import { sessionRevocationGuard } from './middleware/sessionRevocation.middleware.js';
 import { timeoutMiddleware } from './middleware/timeout.middleware.js';
 
 // ── Routes & services ─────────────────────────────────────────────────────────
@@ -95,6 +96,9 @@ app.use(csrfMiddleware);
 
 // ── 8. Rate limiting ──────────────────────────────────────────────────────────
 app.use(rateLimiter);
+
+// ── 8b. Session revocation guard (rejects tokens issued before a password reset / logout-all) ──
+app.use(sessionRevocationGuard);
 
 // ── 9. Request timeout ────────────────────────────────────────────────────────
 app.use(timeoutMiddleware);
