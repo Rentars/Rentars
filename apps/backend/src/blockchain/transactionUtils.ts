@@ -12,7 +12,7 @@ import {
   STELLAR_ADMIN_SECRET,
   STELLAR_SOURCE_ACCOUNT,
 } from './config.js';
-import { getSorobanServer, simulateTransaction, type SimulationResult } from './soroban.js';
+import { getSorobanServer } from './soroban.js';
 import { BlockchainError } from './errors.js';
 
 const FEE_ESTIMATION_PERCENTILE = 90;
@@ -99,7 +99,7 @@ export async function buildPrepareAndSign(server: rpc.Server, operations: xdr.Op
   const tx = await buildTransaction(operations, adminKeypair.publicKey());
 
   // Preflight: simulate and surface any contract or transaction errors before signing.
-  await simulateOrThrow(tx);
+  await simulateOrThrow(server, tx);
 
   const prepared = await server.prepareTransaction(tx);
   (prepared as Transaction).sign(adminKeypair);
@@ -183,14 +183,9 @@ export async function getTransactionStatus(
  * Preflight a transaction and return the simulation result (fee estimate, events, auth).
  * Throws ContractError/TransactionError on failure so callers can reject signing.
  */
-export async function preflightTransaction(tx: Transaction): Promise<SimulationResult> {
-  return simulateOrThrow(tx);
-}
-
-async function simulateOrThrow(tx: Transaction): Promise<SimulationResult> {
-  const result = await simulateTransaction(getSorobanServer(), tx);
-  if (!result.success) {
-    throw new BlockchainError(result.error ?? 'Transaction simulation failed', 'SIMULATION_FAILED');
-  }
-  return result;
+export async function preflightTransaction(
+  server: rpc.Server,
+  tx: Transaction,
+): Promise<SimulationResult> {
+  return simulateOrThrow(server, tx);
 }
