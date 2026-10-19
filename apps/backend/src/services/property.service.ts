@@ -10,6 +10,7 @@ import { supabase } from '@/config/supabase.js';
 import * as cache from './cache.service.js';
 import type { ServiceResponse } from './index.js';
 import type { PaginatedResult } from '../types/pagination.js';
+import { buildSearchOrderClauses } from '../utils/searchSort.js';
 import { executePaginatedQuery } from '../utils/pagination.js';
 import { CANONICAL_AMENITIES } from '@/types/amenities.js';
 import { sanitizeLongText, sanitizeShortText } from '@/utils/sanitize.js';
@@ -865,26 +866,10 @@ export async function advancedSearch(
   const countQuery = buildQuery(true);
   let dataQuery = buildQuery(false);
 
-  // Sorting
+  // Sorting (ends with `id` so pages are stable when sort keys tie)
   const sortBy = filters.sortBy || 'newest';
-  switch (sortBy) {
-    case 'price_asc':
-      dataQuery = dataQuery.order('price_per_night', { ascending: true });
-      break;
-    case 'price_desc':
-      dataQuery = dataQuery.order('price_per_night', { ascending: false });
-      break;
-    case 'rating':
-      dataQuery = dataQuery
-        .order('average_rating', { ascending: false, nullsFirst: false })
-        .order('review_count', { ascending: false, nullsFirst: false });
-      break;
-    case 'relevance':
-    case 'distance':
-    case 'newest':
-    default:
-      dataQuery = dataQuery.order('created_at', { ascending: false });
-      break;
+  for (const clause of buildSearchOrderClauses(sortBy)) {
+    dataQuery = dataQuery.order(clause.column, clause.options);
   }
 
   // Pagination
