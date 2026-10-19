@@ -28,7 +28,7 @@ import {
   escrowFailuresTotal,
 } from '@/middleware/metrics.middleware.js';
 import { checkDateRangeAvailability } from './availability.service.js';
-import { calculateRangePrice } from './pricing.service.js';
+import { assertQuotedTotal, calculateRangePrice } from './pricing.service.js';
 import { bookingAuthorizationService } from './bookingAuthorization.service.js';
 
 // ─── State machine ────────────────────────────────────────────────────────────
@@ -132,6 +132,8 @@ export interface CreateBookingInput {
   /** UTC timestamp when the tenant accepted the terms. */
   terms_accepted_at?: string;
   on_chain_property_id?: bigint;
+  /** Quote token from GET /properties/:id/quote, binding total_price to the quoted stay. */
+  quote_token?: string;
 }
 
 export interface RequestModificationInput {
@@ -574,6 +576,28 @@ export class BookingService {
       }
     }
 
+    // 1b. Re-price the stay on the server. The tenant's total must match a fresh
+    //     quote (and a supplied quote token, if any) before dates are reserved or
+    //     funds are authorised. The server total is what gets charged.
+    const priceCheck = await assertQuotedTotal({
+      propertyId: property_id,
+      checkIn: check_in,
+      checkOut: check_out,
+      clientTotal: total_price,
+      quoteToken: input.quote_token,
+    });
+    if (!priceCheck.success || !priceCheck.data) {
+      return {
+        success: false,
+        error: priceCheck.error,
+        statusCode: priceCheck.statusCode,
+        conflict: priceCheck.conflict,
+        code: priceCheck.code,
+        details: priceCheck.details,
+      };
+    }
+    const chargedTotal = priceCheck.data.total;
+
     // 2. Fetch Stellar addresses
     const [ownerStellarAddress, buyerStellarAddress] = await Promise.all([
       fetchStellarAddress(prop.owner_id),
@@ -604,7 +628,7 @@ export class BookingService {
         p_tenant_id: tenant_id,
         p_check_in: check_in,
         p_check_out: check_out,
-        p_total_price: total_price,
+        p_total_price: chargedTotal,
         p_guest_count: guest_count,
         p_rules_acknowledged_at: rules_acknowledged_at ?? null,
         p_terms_version: terms_version ?? null,
@@ -675,7 +699,7 @@ export class BookingService {
         bookingId,
         buyerAddress: buyerStellarAddress,
         sellerAddress: ownerStellarAddress,
-        amountUsdc: String(total_price),
+        amountUsdc: String(chargedTotal),
         checkIn: check_in,
         checkOut: check_out,
       });
@@ -768,7 +792,7 @@ export class BookingService {
           buyerStellarAddress,
           checkInTs,
           checkOutTs,
-          BigInt(Math.round(total_price * 1e7)),
+          BigInt(Math.round(chargedTotal * 1e7)),
         );
 
         loggingService.logBlockchainOperation('createBookingOnChain', {
