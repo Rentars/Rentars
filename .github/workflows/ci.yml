@@ -56,6 +56,9 @@ jobs:
       - name: Verify generate-release-manifest runs cleanly
         run: bun run scripts/generate-release-manifest.ts --version 0.0.0-ci
 
+      - name: Test release health gate (#737)
+        run: bun test scripts/release-health-gate.test.ts
+
   # ─── Job 1: Validate migration filenames ────────────────────────────────────
   validate-migrations:
     name: Validate Migration Filenames
