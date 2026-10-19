@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Disallowed origins no longer raise a 500. CORS headers are withheld and the browser blocks the read.
 - In production, `CORS_ORIGIN` must be explicit and use `https://`.
 - Documented token transport, CORS, and CSRF behaviour in `docs/SECURITY_AUTH_HARDENING.md`.
+- Bearer-authenticated mutations skip the double-submit CSRF check. The web client sends Bearer tokens and never sends `X-CSRF-Token`, so every write was being rejected. Cookie-only cross-site posts still get 403.
 
 ### Added — 2026-09-25
 

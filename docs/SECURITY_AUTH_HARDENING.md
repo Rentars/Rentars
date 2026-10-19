@@ -112,11 +112,15 @@ HttpOnly, `SameSite=Strict`, `Secure` in production).
 - In production, `CORS_ORIGIN` must be set explicitly and every entry must be `https://`.
   The development default (`http://localhost:3001`) is never used by omission.
 
-**CSRF.** State-changing requests must send the `X-CSRF-Token` header matching the cookie.
-A cross-site form or script cannot read the cookie, so it cannot forge a matching header.
+**CSRF.** Mutating requests without an `Authorization: Bearer` header must send the
+`X-CSRF-Token` header matching the `__Host-csrf-token` cookie. A cross-site form or script
+cannot read the cookie, so it cannot forge a matching header, and a cross-site form post
+without a Bearer token is rejected with `403 CSRF_TOKEN_MISSING`.
 
-**Known gap.** The CSRF check applies to every mutating request, including Bearer-token API
-calls that carry no cookies. The web client does not send `X-CSRF-Token`, so those requests
-are rejected. Resolving this needs a decision on whether Bearer-only requests should bypass the
-double-submit check; this change does not alter that behaviour. In development over plain
-HTTP, browsers ignore the `__Host-` cookie because it requires `Secure`.
+Bearer requests skip the double-submit check. The API stores no session in cookies, so a
+Bearer request has no ambient credentials to forge. A cross-site page cannot set the
+`Authorization` header without a CORS preflight, and preflight succeeds only for origins in
+`CORS_ORIGIN`. The web client sends Bearer tokens and does not send `X-CSRF-Token`, so this
+exemption is what keeps its mutations working.
+
+In development over plain HTTP, browsers ignore the `__Host-` cookie because it requires `Secure`.
