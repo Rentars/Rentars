@@ -490,7 +490,7 @@ export class BookingService {
     // 1. Fetch property + owner (include capacity and stay-length limits)
     const { data: property, error: propertyError } = await supabase
       .from('properties')
-      .select('id, owner_id, on_chain_id, max_guests, min_nights, max_nights, check_in_time, check_out_time, deleted_at')
+      .select('id, owner_id, on_chain_id, max_guests, min_nights, max_nights, check_in_time, check_out_time, deleted_at, draft_status, moderation_state')
       .eq('id', property_id)
       .single();
 
@@ -508,11 +508,27 @@ export class BookingService {
       check_in_time?: string;
       check_out_time?: string;
       deleted_at?: string | null;
+      draft_status?: string | null;
+      moderation_state?: string | null;
     };
 
     // Reject bookings against soft-deleted (removed) listings
     if (prop.deleted_at) {
       return { success: false, error: 'This property is no longer available for booking' };
+    }
+
+    // Drafts are not bookable. A listing hidden by moderation stops accepting new
+    // bookings, but bookings made before the hide are not changed.
+    if (prop.draft_status === 'draft') {
+      return { success: false, error: 'This property is not available for booking' };
+    }
+    if (prop.moderation_state === 'hidden') {
+      return {
+        success: false,
+        error: 'This property is temporarily unavailable for new bookings',
+        statusCode: 409,
+        code: 'LISTING_HIDDEN',
+      };
     }
 
     // Capacity check
