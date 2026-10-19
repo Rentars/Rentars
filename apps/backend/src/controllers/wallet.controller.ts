@@ -1,5 +1,5 @@
 import type { Request, Response } from 'express';
-rt import { Transaction } from '@stellar/stellar-sdk';
+import { Transaction } from '@stellar/stellar-sdk';
 import { WalletAuthService } from '@/services/wallet.service.js';
 import { simulateTransaction } from '@/blockchain/simulation.js';
 

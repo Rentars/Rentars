@@ -11,7 +11,7 @@ import {
   NETWORK_PASSPHRASE,
   STELLAR_ADMIN_SECRET,
   STELLAR_SOURCE_ACCOUNT,
-from './config.js';
+} from './config.js';
 import { getSorobanServer } from './soroban.js';
 import { BlockchainError } from './errors.js';
 import { simulateOrThrow, type SimulationResult } from './simulation.js';
