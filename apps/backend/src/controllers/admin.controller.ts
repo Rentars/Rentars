@@ -688,7 +688,7 @@ export async function approveRefundHandler(req: AdminRequest, res: Response): Pr
   // Record refund approval in audit log with both actors
   await auditLogger.log({
     actorId: req.adminId,
-    action: 'payment.confirmed',
+    action: 'admin.refund_approve',
     resourceType: 'payment',
     resourceId: booking_id,
     ip: req.ip,
