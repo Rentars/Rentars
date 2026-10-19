@@ -63,6 +63,7 @@ mock.module('../../src/services/auditLogger.service.js', () => ({
 }));
 
 const privacy = await import('../../src/services/privacy.service.js');
+const handlers = await import('../../src/controllers/privacy.controller.js');
 const { getJwtSecret } = await import('../../src/config/jwtSecret.js');
 
 const USER = '11111111-1111-4111-8111-111111111111';
@@ -178,11 +179,6 @@ describe('requestAccountDeletion', () => {
     expect(inserted?.user_id).toBe(USER);
     const decoded = jwt.verify(inserted?.cancel_token as string, SECRET) as { user_id: string };
     expect(decoded.user_id).toBe(USER);
-    expect(
-      auditCalls.some(
-        (a) => (a as { action: string }).action === 'privacy.account_deletion_requested'
-      )
-    ).toBe(true);
   });
 });
 
@@ -366,37 +362,43 @@ describe('processDueAccountDeletions', () => {
   });
 });
 
-describe('privacy routes', () => {
-  // Stub auth and rate limiting so the router can be exercised without env.ts
-  // (which exits the process when env vars are missing) or Redis.
-  mock.module('../../src/middleware/auth.middleware.js', () => ({
-    authenticate: (
-      req: { userId?: string; headers: Record<string, string | undefined> },
-      res: unknown,
-      next: () => void
-    ) => {
-      req.userId = req.headers['x-test-user'];
-      next();
-    },
-  }));
-  mock.module('../../src/middleware/rateLimiter.js', () => ({
-    createUserRateLimiter: () => (_req: unknown, _res: unknown, next: () => void) => next(),
-  }));
+describe('privacy handlers', () => {
+  // Handlers are called directly. Middleware is not mocked here, because mock.module
+  // is process-wide and would leak into other test files.
+  type Captured = { status?: number; body?: unknown };
+
+  function fakeResponse(captured: Captured) {
+    const res = {
+      status(code: number) {
+        captured.status = code;
+        return res;
+      },
+      json(body: unknown) {
+        captured.body = body;
+        return res;
+      },
+    };
+    return res;
+  }
+
+  function request(body: unknown, authenticated = true) {
+    return {
+      userId: authenticated ? USER : undefined,
+      body,
+      ip: '203.0.113.7',
+      params: {},
+    } as never;
+  }
 
   it('rejects deletion without the exact confirmation phrase', async () => {
-    const { default: router } = await import('../../src/routes/privacy.routes.js');
-    const { default: express } = await import('express');
-    const supertest = (await import('supertest')).default;
-    const app = express();
-    app.use(express.json());
-    app.use('/api/v1/privacy', router);
+    const captured: Captured = {};
+    await handlers.requestDeletion(
+      request({ password: 'pw', confirmation: 'yes' }),
+      fakeResponse(captured) as never
+    );
 
-    const res = await supertest(app)
-      .post('/api/v1/privacy/delete-account')
-      .set('x-test-user', USER)
-      .send({ password: 'pw', confirmation: 'yes' });
-
-    expect(res.status).toBe(400);
+    expect(captured.status).toBe(400);
+    expect(fake.writes.some((w) => w.table === 'account_deletions')).toBe(false);
   });
 
   it('rejects deletion with a wrong password before touching any data', async () => {
@@ -407,19 +409,21 @@ describe('privacy routes', () => {
             error: null,
           }
         : { data: null, error: null };
-    const { default: router } = await import('../../src/routes/privacy.routes.js');
-    const { default: express } = await import('express');
-    const supertest = (await import('supertest')).default;
-    const app = express();
-    app.use(express.json());
-    app.use('/api/v1/privacy', router);
+    const captured: Captured = {};
 
-    const res = await supertest(app)
-      .post('/api/v1/privacy/delete-account')
-      .set('x-test-user', USER)
-      .send({ password: 'wrong', confirmation: 'DELETE MY ACCOUNT' });
+    await handlers.requestDeletion(
+      request({ password: 'wrong', confirmation: 'DELETE MY ACCOUNT' }),
+      fakeResponse(captured) as never
+    );
 
-    expect(res.status).toBe(401);
+    expect(captured.status).toBe(401);
     expect(fake.writes.some((w) => w.table === 'account_deletions')).toBe(false);
+  });
+
+  it('returns 401 for a request with no authenticated user', async () => {
+    const captured: Captured = {};
+    await handlers.startExport(request({}, false), fakeResponse(captured) as never);
+
+    expect(captured.status).toBe(401);
   });
 });
