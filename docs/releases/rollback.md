@@ -96,6 +96,63 @@ These steps cannot be undone by re-deploying an older image. Each one needs an e
 
 Schema-level compatibility rules are in DEPLOYMENT.md section 7.7.
 
+## Soroban contract limitations
+
+Soroban contracts are immutable once deployed. There is no in-place upgrade and no "roll back the contract" step: rolling back a release that changed contract behaviour means deploying a **successor** contract (or repointing to the previously deployed contract ID) and repointing every integration. The full upgrade and data-migration strategy is in [DEPLOYMENT.md section 7.3](../../DEPLOYMENT.md); this section records only what it means for a rollback.
+
+### What a rollback can and cannot do
+
+| State | Rollback behaviour |
+|-------|--------------------|
+| Backend/frontend images | Fully reversible: re-deploy `release.image_tag` from the target manifest. |
+| Database schema and rows | Reversible only within the compatibility window (DEPLOYMENT.md section 7.7). Data-rewriting migrations need a restore point. |
+| Contract WASM and contract ID | **Not reversible.** The old contract ID still exists on-chain, but any state written by the new contract stays with the new contract. Repointing back to the old ID does not move that state. |
+| On-chain bookings, escrow, payments | Final. They are reconciled against the ledger, never replayed. |
+| Off-chain references to contract IDs | Reversible by repointing configuration, but only if the references were stored in a way that can be rewritten (see below). |
+
+### Identifying contract versions
+
+Every manifest records `components.contracts.version`, `contracts.abi_sha256`, and `dependencies.contract_ids`. After any cutover or rollback, confirm that:
+
+- the deployed backend and frontend load the ABI whose SHA-256 matches `contracts.abi_sha256` in the manifest that is actually live;
+- `dependencies.contract_ids` matches the contract IDs the application is configured with;
+- the ledger explorer shows the expected WASM hash for each contract ID.
+
+If the live contract ID is not the one in the manifest, the release is in an unreconciled state: stop, record it in the incident, and do not resume the rollout until the manifest and the live configuration agree.
+
+### Repointing to a successor or back to a predecessor
+
+1. Deploy the successor (or confirm the predecessor contract ID is still live and callable).
+2. Update `PROPERTY_LISTING_CONTRACT_ID`, `BOOKING_CONTRACT_ID`, and `REVIEW_CONTRACT_ID` in the environment configuration.
+3. Clear feature-flag and configuration caches (DEPLOYMENT.md section 7.8).
+4. Verify cross-contract calls: create a listing, read it back, open a booking against it, and read the review aggregate.
+5. Record the old and new contract IDs in the incident and in the next release manifest.
+
+### Recovering lost booking or payment references
+
+A booking or payment reference can appear "lost" when the application points at a contract that does not hold the record, or when the record was written to a successor contract. Recover in this order:
+
+1. **Locate the record on-chain.** Search the ledger for the booking or payment ID across every contract ID in the current and previous manifests. The record exists on exactly one contract.
+2. **Repoint, do not rewrite.** Point the application at the contract that holds the record. Never re-create a booking or re-submit a payment to make it visible; that duplicates funds movement.
+3. **Reconcile the off-chain mirror.** Compare the off-chain booking and payment rows with the on-chain record. If the off-chain row references a contract ID that no longer holds the record, update the reference and note it in the incident.
+4. **Check escrow balances.** For any escrow that was funded, confirm the balance on the contract that holds it. If funds moved to a successor contract, the successor's balance is authoritative.
+5. **Escalate unresolved references.** If a reference cannot be matched to any contract, treat it as a funds-affecting incident: notify finance, freeze the affected bookings, and reconcile manually against the ledger before closing.
+
+### Cutover and recovery checklist
+
+Rehearse this checklist in staging before any release that deploys a successor contract, and repeat it during a production cutover or recovery. Attach the completed checklist to the release ticket.
+
+- [ ] Successor contract deployed to testnet and its contract ID recorded.
+- [ ] Representative fixtures migrated (listings, bookings, reviews) and read back through the new contract.
+- [ ] Cross-contract calls verified: listing → booking → review.
+- [ ] Escrow and payment balances reconciled against the ledger before and after cutover.
+- [ ] ABI SHA-256 hashes match the manifest; application compatibility evidence attached.
+- [ ] Old and new contract versions identifiable in the manifest and in the ledger explorer.
+- [ ] Repointing rehearsed in both directions (predecessor → successor and successor → predecessor).
+- [ ] Recovery of a deliberately orphaned booking reference rehearsed without losing the payment reference.
+- [ ] Rollback rehearsal record saved: both manifests, gate output, smoke results, and the completed checklist.
+=======
+
 ## Staging rollback rehearsal
 
 A rollback that has not been rehearsed is not a plan. Before each production release that changes the database schema or a contract, rehearse the rollback in staging and keep the record:

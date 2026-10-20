@@ -819,4 +819,389 @@ mod tests {
             &-500_i128,
         );
     }
+
+    // ─── Authorization Matrix Tests ───────────────────────────────────────────
+
+    /// Method-to-authority matrix.
+    ///
+    /// | Method          | Caller authority required          | State precondition |
+    /// |-----------------|------------------------------------|--------------------|
+    /// | create_listing  | `owner` must authorize             | none               |
+    /// | get_listing     | none (read-only)                   | listing exists     |
+    /// | update_listing  | stored `owner` must authorize      | listing exists     |
+    /// | update_status   | stored `owner` must authorize      | listing exists     |
+    /// | set_rented      | none (internal booking hook)       | status == Active   |
+    /// | listing_count   | none (read-only)                   | none               |
+    ///
+    /// This test asserts the matrix end-to-end: every mutating entry point
+    /// requires the expected authority, and read-only entry points never do.
+    #[test]
+    fn test_authorization_matrix() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+        let other = Address::generate(&env);
+
+        // create_listing — owner authorizes.
+        let id = client.create_listing(
+            &owner,
+            &String::from_str(&env, "Matrix Property"),
+            &String::from_str(&env, "desc"),
+            &100_0000000_i128,
+        );
+        let auths = env.auths();
+        assert!(
+            auths.iter().any(|(addr, _)| addr == &owner),
+            "create_listing must require owner authorization"
+        );
+
+        // get_listing / listing_count — no authorization recorded.
+        let _ = client.get_listing(&id);
+        let _ = client.listing_count();
+        assert!(
+            env.auths().is_empty(),
+            "read-only entry points must not require authorization"
+        );
+
+        // update_listing — stored owner authorizes, not the caller argument.
+        client.update_listing(
+            &owner,
+            &id,
+            &String::from_str(&env, "Matrix Updated"),
+            &String::from_str(&env, "desc"),
+            &200_0000000_i128,
+        );
+        let auths = env.auths();
+        assert!(
+            auths.iter().any(|(addr, _)| addr == &owner),
+            "update_listing must require owner authorization"
+        );
+
+        // update_status — stored owner authorizes.
+        client.update_status(&owner, &id, &ListingStatus::Inactive);
+        let auths = env.auths();
+        assert!(
+            auths.iter().any(|(addr, _)| addr == &owner),
+            "update_status must require owner authorization"
+        );
+
+        // set_rented — no caller authority, only state precondition.
+        client.update_status(&owner, &id, &ListingStatus::Active);
+        client.set_rented(&id);
+        assert!(
+            env.auths().is_empty(),
+            "set_rented must not require caller authorization"
+        );
+        assert_eq!(client.get_listing(&id).status, ListingStatus::Rented);
+
+        // A different address is never implicitly authorized.
+        assert_ne!(owner, other);
+    }
+
+    /// Unauthorized create_listing must fail when the owner does not authorize.
+    #[test]
+    #[should_panic]
+    fn test_create_listing_unauthorized() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, PropertyListingContract);
+        let client = PropertyListingContractClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+
+        // No mock_all_auths: the owner has not signed.
+        client.create_listing(
+            &owner,
+            &String::from_str(&env, "Unauthorized"),
+            &String::from_str(&env, "desc"),
+            &100_0000000_i128,
+        );
+    }
+
+    /// Unauthorized update_listing must fail when the stored owner does not sign.
+    #[test]
+    #[should_panic]
+    fn test_update_listing_unauthorized_no_auth() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, PropertyListingContract);
+        let client = PropertyListingContractClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+
+        let id = client.create_listing(
+            &owner,
+            &String::from_str(&env, "Property"),
+            &String::from_str(&env, "desc"),
+            &100_0000000_i128,
+        );
+
+        // Drop mocked auths so the update must present real authorization.
+        env.set_auths(&[]);
+        client.update_listing(
+            &owner,
+            &id,
+            &String::from_str(&env, "Hijacked"),
+            &String::from_str(&env, "desc"),
+            &1_i128,
+        );
+    }
+
+    /// Unauthorized update_status must fail when the stored owner does not sign.
+    #[test]
+    #[should_panic]
+    fn test_update_status_unauthorized_no_auth() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, PropertyListingContract);
+        let client = PropertyListingContractClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+
+        let id = client.create_listing(
+            &owner,
+            &String::from_str(&env, "Property"),
+            &String::from_str(&env, "desc"),
+            &100_0000000_i128,
+        );
+
+        env.set_auths(&[]);
+        client.update_status(&owner, &id, &ListingStatus::Inactive);
+    }
+
+    /// A failed unauthorized mutation must leave state untouched.
+    #[test]
+    fn test_unauthorized_mutation_does_not_corrupt_state() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        let id = client.create_listing(
+            &owner,
+            &String::from_str(&env, "Original"),
+            &String::from_str(&env, "desc"),
+            &100_0000000_i128,
+        );
+
+        // Attempt an unauthorized update; it must panic and roll back.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.update_listing(
+                &attacker,
+                &id,
+                &String::from_str(&env, "Hacked"),
+                &String::from_str(&env, "hacked"),
+                &1_i128,
+            );
+        }));
+        assert!(result.is_err(), "unauthorized update must fail");
+
+        // State is unchanged.
+        let listing = client.get_listing(&id);
+        assert_eq!(listing.owner, owner);
+        assert_eq!(listing.title, String::from_str(&env, "Original"));
+        assert_eq!(listing.price_per_night, 100_0000000_i128);
+        assert_eq!(listing.status, ListingStatus::Active);
+        assert_eq!(client.listing_count(), 1);
+    }
+
+    // ─── Bounded Input Tests ──────────────────────────────────────────────────
+
+    /// Prices across the full valid range round-trip exactly (no overflow).
+    #[test]
+    fn test_price_bounds_round_trip() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        let prices: &[i128] = &[1, 2, 999, 1_000_000, 50_0000000, i128::MAX / 2, i128::MAX];
+        for &price in prices {
+            let id = client.create_listing(
+                &owner,
+                &String::from_str(&env, "Bounded"),
+                &String::from_str(&env, "desc"),
+                &price,
+            );
+            assert_eq!(client.get_listing(&id).price_per_night, price);
+        }
+    }
+
+    /// Repeated updates never accumulate drift: the last write wins exactly.
+    #[test]
+    fn test_repeated_updates_last_write_wins() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        let id = client.create_listing(
+            &owner,
+            &String::from_str(&env, "Start"),
+            &String::from_str(&env, "desc"),
+            &100_0000000_i128,
+        );
+
+        for i in 1_u64..=20 {
+            let price = (i as i128) * 1_0000000;
+            client.update_listing(
+                &owner,
+                &id,
+                &String::from_str(&env, "Updated"),
+                &String::from_str(&env, "desc"),
+                &price,
+            );
+            assert_eq!(client.get_listing(&id).price_per_night, price);
+        }
+
+        // Ownership and identity are invariant across updates.
+        let listing = client.get_listing(&id);
+        assert_eq!(listing.id, id);
+        assert_eq!(listing.owner, owner);
+        assert_eq!(client.listing_count(), 1);
+    }
+
+    /// Long-but-valid strings are stored verbatim without truncation.
+    #[test]
+    fn test_long_strings_round_trip() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        let long_title = "T".repeat(200);
+        let long_desc = "D".repeat(500);
+        let id = client.create_listing(
+            &owner,
+            &String::from_str(&env, &long_title),
+            &String::from_str(&env, &long_desc),
+            &100_0000000_i128,
+        );
+
+        let listing = client.get_listing(&id);
+        assert_eq!(listing.title, String::from_str(&env, &long_title));
+        assert_eq!(listing.description, String::from_str(&env, &long_desc));
+    }
+
+    // ─── Lifecycle / Invariant Tests ──────────────────────────────────────────
+
+    /// Status lifecycle: Active -> Rented is one-way via set_rented.
+    #[test]
+    #[should_panic(expected = "Property is not available for booking")]
+    fn test_set_rented_replay_rejected() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        let id = client.create_listing(
+            &owner,
+            &String::from_str(&env, "Property"),
+            &String::from_str(&env, "desc"),
+            &100_0000000_i128,
+        );
+
+        client.set_rented(&id);
+        // Replaying the transition must fail.
+        client.set_rented(&id);
+    }
+
+    /// set_rented on an already-Rented listing (via update_status) is rejected.
+    #[test]
+    #[should_panic(expected = "Property is not available for booking")]
+    fn test_set_rented_on_rented_rejected() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        let id = client.create_listing(
+            &owner,
+            &String::from_str(&env, "Property"),
+            &String::from_str(&env, "desc"),
+            &100_0000000_i128,
+        );
+
+        client.update_status(&owner, &id, &ListingStatus::Rented);
+        client.set_rented(&id);
+    }
+
+    /// A rejected transition leaves the previous status intact.
+    #[test]
+    fn test_rejected_transition_preserves_state() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        let id = client.create_listing(
+            &owner,
+            &String::from_str(&env, "Property"),
+            &String::from_str(&env, "desc"),
+            &100_0000000_i128,
+        );
+        client.update_status(&owner, &id, &ListingStatus::Inactive);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.set_rented(&id);
+        }));
+        assert!(result.is_err(), "set_rented on Inactive must fail");
+
+        assert_eq!(client.get_listing(&id).status, ListingStatus::Inactive);
+    }
+
+    /// Ownership invariant: only the recorded owner can mutate a listing,
+    /// even after other listings are created by other owners.
+    #[test]
+    fn test_ownership_invariant_across_owners() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+        let owner_a = Address::generate(&env);
+        let owner_b = Address::generate(&env);
+
+        let id_a = client.create_listing(
+            &owner_a,
+            &String::from_str(&env, "A"),
+            &String::from_str(&env, "desc"),
+            &100_0000000_i128,
+        );
+        let id_b = client.create_listing(
+            &owner_b,
+            &String::from_str(&env, "B"),
+            &String::from_str(&env, "desc"),
+            &200_0000000_i128,
+        );
+
+        // owner_b cannot mutate owner_a's listing.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.update_listing(
+                &owner_b,
+                &id_a,
+                &String::from_str(&env, "Hijacked"),
+                &String::from_str(&env, "desc"),
+                &1_i128,
+            );
+        }));
+        assert!(result.is_err(), "cross-owner update must fail");
+
+        // Both listings retain their original owners and data.
+        assert_eq!(client.get_listing(&id_a).owner, owner_a);
+        assert_eq!(client.get_listing(&id_b).owner, owner_b);
+        assert_eq!(client.get_listing(&id_a).title, String::from_str(&env, "A"));
+        assert_eq!(client.get_listing(&id_b).title, String::from_str(&env, "B"));
+    }
+
+    /// Listing IDs are unique and monotonically increasing (no reuse).
+    #[test]
+    fn test_ids_unique_and_monotonic() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        let mut seen: std::vec::Vec<u64> = std::vec::Vec::new();
+        for _ in 0..15 {
+            let id = client.create_listing(
+                &owner,
+                &String::from_str(&env, "Property"),
+                &String::from_str(&env, "desc"),
+                &100_0000000_i128,
+            );
+            assert!(!seen.contains(&id), "listing ID must be unique");
+            if let Some(&last) = seen.last() {
+                assert!(id > last, "listing IDs must be monotonically increasing");
+            }
+            seen.push(id);
+        }
+        assert_eq!(client.listing_count(), seen.len() as u64);
+    }
 }

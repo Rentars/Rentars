@@ -51,6 +51,56 @@ export interface IdempotencyRecord {
   created_at: string;
 }
 
+/**
+ * A sync-inbox receipt keyed by a blockchain event identity.
+ *
+ * Unlike HTTP idempotency keys (scoped per user), event keys are global and
+ * derived from the chain event itself (e.g. `tx:<hash>:<opIndex>`), so that
+ * duplicate, delayed, or reordered deliveries of the same ledger event are
+ * recognised regardless of which worker sees them.
+ */
+export interface EventInboxRecord {
+  id: string;
+  /** Deterministic event identity, e.g. `tx:<hash>:<opIndex>`. */
+  event_key: string;
+  /** Logical stream the event belongs to (e.g. 'payments', 'escrow'). */
+  stream: string;
+  /** Ledger sequence / cursor position used for ordered resume. */
+  cursor: string;
+  /** SHA-256 hex digest of the canonical event payload. */
+  payload_hash: string;
+  /** 'processing' = projection in flight; 'completed' = applied. */
+  status: 'processing' | 'completed';
+  /** Number of projection attempts so far (for retry/backoff). */
+  attempts: number;
+  /** Last projection error, if any. */
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Prefix used to namespace event-identity keys inside `idempotency_keys`. */
+export const EVENT_KEY_PREFIX = 'event:';
+
+/**
+ * Build a deterministic event-identity key from a transaction hash and the
+ * operation index within that transaction.  Two deliveries of the same ledger
+ * operation always produce the same key.
+ */
+export function buildEventKey(txHash: string, opIndex: number | string): string {
+  return `${EVENT_KEY_PREFIX}tx:${txHash.toLowerCase()}:${opIndex}`;
+}
+
+/**
+ * Produce a stable SHA-256 hex digest of an event payload so that a replayed
+ * event with a mutated body can be detected (and quarantined) rather than
+ * silently re-projected.
+ */
+export function hashEventPayload(payload: unknown): string {
+  const stable = JSON.stringify(payload, Object.keys(payload as object).sort());
+  return createHash('sha256').update(stable).digest('hex');
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
@@ -243,4 +293,243 @@ export async function purgeExpired(
 
   const deleted = Array.isArray(data) ? data.length : 0;
   return { success: true, data: { deleted } };
+}
+
+// ─── Event inbox (sync replay-safety) ─────────────────────────────────────────
+
+/**
+ * Look up an existing event-inbox receipt for `eventKey`.
+ *
+ * This is the replay-safe read used by sync workers before projecting an
+ * event: a `completed` record means the projection already happened and the
+ * event must be skipped; a `processing` record means another worker (or a
+ * previous incarnation of this worker) is mid-projection and the caller should
+ * back off rather than double-apply.
+ *
+ * @returns
+ *   - `{ success: true, data: EventInboxRecord }` if a receipt exists.
+ *   - `{ success: true, data: null }` if the event has never been seen.
+ *   - `{ success: false, error }` on a database error.
+ */
+export async function lookupEvent(
+  eventKey: string,
+): Promise<ServiceResponse<EventInboxRecord | null>> {
+  const { data, error } = await supabase
+    .from('event_inbox')
+    .select('*')
+    .eq('event_key', eventKey)
+    .maybeSingle();
+
+  if (error) {
+    return { success: false, error: `Event inbox lookup failed: ${error.message}` };
+  }
+
+  return { success: true, data: data as EventInboxRecord | null };
+}
+
+/**
+ * Atomically record receipt of an event before its projection runs.
+ *
+ * Returns `{ claimed: true, id }` when this call wins the INSERT race and the
+ * caller may proceed to project the event.  Returns `{ claimed: false, existing }`
+ * when a receipt already exists so the caller can decide to skip (completed),
+ * back off (processing), or quarantine (payload hash mismatch).
+ *
+ * @param eventKey    - Deterministic identity from `buildEventKey`.
+ * @param stream      - Logical stream the event belongs to.
+ * @param cursor      - Ledger sequence / cursor position for ordered resume.
+ * @param payloadHash - SHA-256 hex digest of the canonical event payload.
+ */
+export async function claimEvent(
+  eventKey: string,
+  stream: string,
+  cursor: string,
+  payloadHash: string,
+): Promise<ServiceResponse<{ claimed: true; id: string } | { claimed: false; existing: EventInboxRecord }>> {
+  const { data: inserted, error: insertError } = await supabase
+    .from('event_inbox')
+    .insert({
+      event_key: eventKey,
+      stream,
+      cursor,
+      payload_hash: payloadHash,
+      status: 'processing',
+      attempts: 1,
+      last_error: null,
+    })
+    .select('id')
+    .single();
+
+  if (!insertError && inserted) {
+    return { success: true, data: { claimed: true, id: (inserted as { id: string }).id } };
+  }
+
+  // Unique constraint fired — fetch the existing receipt.
+  const { data: existing, error: fetchError } = await supabase
+    .from('event_inbox')
+    .select('*')
+    .eq('event_key', eventKey)
+    .maybeSingle();
+
+  if (fetchError || !existing) {
+    return { success: false, error: `Event claim failed: ${fetchError?.message ?? 'record not found'}` };
+  }
+
+  return { success: true, data: { claimed: false, existing: existing as EventInboxRecord } };
+}
+
+/**
+ * Mark an event receipt as successfully projected.
+ *
+ * Idempotent: re-completing an already-completed receipt is a no-op that
+ * still returns success, so a worker that crashes after projection but before
+ * acknowledging can safely retry.
+ */
+export async function completeEvent(id: string): Promise<ServiceResponse<void>> {
+  const { error } = await supabase
+    .from('event_inbox')
+    .update({ status: 'completed', last_error: null, updated_at: new Date().toISOString() })
+    .eq('id', id);
+
+  if (error) {
+    return { success: false, error: `Event complete failed: ${error.message}` };
+  }
+
+  return { success: true };
+}
+
+/**
+ * Record a projection failure so the event can be retried from a known cursor
+ * or quarantined after exhausting its retry budget.
+ *
+ * The receipt is left in `processing` so a later retry can re-claim it; the
+ * `attempts` counter is incremented and `last_error` is stored for inspection.
+ */
+export async function failEvent(id: string, error: string): Promise<ServiceResponse<void>> {
+  const { data: current, error: fetchError } = await supabase
+    .from('event_inbox')
+    .select('attempts')
+    .eq('id', id)
+    .maybeSingle();
+
+  if (fetchError || !current) {
+    return { success: false, error: `Event fail failed: ${fetchError?.message ?? 'record not found'}` };
+  }
+
+  const attempts = ((current as { attempts: number }).attempts ?? 0) + 1;
+
+  const { error: updateError } = await supabase
+    .from('event_inbox')
+    .update({ attempts, last_error: error, updated_at: new Date().toISOString() })
+    .eq('id', id);
+
+  if (updateError) {
+    return { success: false, error: `Event fail failed: ${updateError.message}` };
+  }
+
+  return { success: true };
+}
+
+/**
+ * Reset a `processing` receipt back to a claimable state so a restarted worker
+ * can retry the projection.  Used by the recovery path when a worker dies
+ * mid-projection.
+ */
+export async function releaseEvent(id: string): Promise<void> {
+  await supabase
+    .from('event_inbox')
+    .update({ status: 'processing', updated_at: new Date().toISOString() })
+    .eq('id', id)
+    .eq('status', 'processing');
+}
+
+/**
+ * Return the highest cursor successfully projected for `stream`, so a
+ * restarted worker can resume from a known-good position instead of replaying
+ * the whole ledger.
+ */
+export async function getResumeCursor(
+  stream: string,
+): Promise<ServiceResponse<{ cursor: string | null }>> {
+  const { data, error } = await supabase
+    .from('event_inbox')
+    .select('cursor')
+    .eq('stream', stream)
+    .eq('status', 'completed')
+    .order('cursor', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    return { success: false, error: `Resume cursor lookup failed: ${error.message}` };
+  }
+
+  return { success: true, data: { cursor: (data as { cursor: string } | null)?.cursor ?? null } };
+}
+
+/**
+ * Measure sync lag for `stream`: the number of events received but not yet
+ * projected, plus the oldest outstanding receipt's age in seconds.
+ */
+export async function getStreamLag(
+  stream: string,
+): Promise<ServiceResponse<{ pending: number; oldestPendingSeconds: number | null }>> {
+  const { data, error } = await supabase
+    .from('event_inbox')
+    .select('created_at')
+    .eq('stream', stream)
+    .eq('status', 'processing');
+
+  if (error) {
+    return { success: false, error: `Lag lookup failed: ${error.message}` };
+  }
+
+  const rows = (data ?? []) as Array<{ created_at: string }>;
+  const pending = rows.length;
+  const oldestPendingSeconds = pending
+    ? Math.floor((Date.now() - Math.min(...rows.map((r) => Date.parse(r.created_at)))) / 1000)
+    : null;
+
+  return { success: true, data: { pending, oldestPendingSeconds } };
+}
+
+/**
+ * List quarantined (dead-letter) events for `stream` — receipts that have
+ * exceeded `maxAttempts` and are still not completed — so operators can
+ * inspect and repair them.
+ */
+export async function listDeadLetters(
+  stream: string,
+  maxAttempts: number = 5,
+): Promise<ServiceResponse<EventInboxRecord[]>> {
+  const { data, error } = await supabase
+    .from('event_inbox')
+    .select('*')
+    .eq('stream', stream)
+    .eq('status', 'processing')
+    .gte('attempts', maxAttempts)
+    .order('cursor', { ascending: true });
+
+  if (error) {
+    return { success: false, error: `Dead-letter lookup failed: ${error.message}` };
+  }
+
+  return { success: true, data: (data ?? []) as EventInboxRecord[] };
+}
+
+/**
+ * Repair a dead-lettered event by clearing its error and resetting its attempt
+ * counter so the worker will re-claim and re-project it from its stored cursor.
+ */
+export async function repairDeadLetter(id: string): Promise<ServiceResponse<void>> {
+  const { error } = await supabase
+    .from('event_inbox')
+    .update({ attempts: 0, last_error: null, status: 'processing', updated_at: new Date().toISOString() })
+    .eq('id', id);
+
+  if (error) {
+    return { success: false, error: `Dead-letter repair failed: ${error.message}` };
+  }
+
+  return { success: true };
 }

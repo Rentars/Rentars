@@ -42,6 +42,17 @@ import { ReviewClient } from '@/blockchain/reviewClient.js';
 import { supabase } from '@/config/supabase.js';
 import type { ServiceResponse } from './index.js';
 import type { Review as ChainReview } from '@/blockchain/types.js';
+import {
+  buildEventKey,
+  recordInboxReceipt,
+  markInboxProcessed,
+  markInboxFailed,
+  getInboxCursor,
+  setInboxCursor,
+  type InboxReceipt,
+} from './syncInbox.service.js';
+
+const REVIEW_SYNC_STREAM = 'review_sync';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -92,6 +103,48 @@ function buildReviewClient(): ReviewClient {
   return new ReviewClient(REVIEW_CONTRACT_ID, STELLAR_RPC_URL, NETWORK_PASSPHRASE);
 }
 
+// ─── Idempotency helpers ─────────────────────────────────────────────────────
+
+/**
+ * Build the stable event identity for a review projection.
+ *
+ * The on-chain review ID is unique per contract and immutable, so it is the
+ * natural transaction/operation key.  When a tx hash is available it is
+ * folded into the key so that a re-submitted (re-orged) review is treated as
+ * a distinct event rather than silently dropped.
+ */
+function reviewEventKey(onChainId: number, txHash?: string | null): string {
+  return buildEventKey('review', txHash ? `${onChainId}:${txHash}` : String(onChainId));
+}
+
+/**
+ * Record inbox receipt for a review event before any projection runs.
+ *
+ * Returns `null` when the event was already received (duplicate/replay) and
+ * the caller must skip the projection to avoid repeating side effects.
+ */
+async function beginReviewEvent(
+  onChainId: number,
+  txHash?: string | null,
+): Promise<InboxReceipt | null> {
+  return recordInboxReceipt({
+    stream: REVIEW_SYNC_STREAM,
+    eventKey: reviewEventKey(onChainId, txHash),
+    payload: { onChainId, txHash: txHash ?? null },
+  });
+}
+
+/**
+ * Advance the persisted cursor for the review sync stream.  Cursors only move
+ * forward so a reordered (older) event can never rewind progress.
+ */
+async function advanceReviewCursor(onChainId: number): Promise<void> {
+  const current = await getInboxCursor(REVIEW_SYNC_STREAM);
+  if (current === null || onChainId > current) {
+    await setInboxCursor(REVIEW_SYNC_STREAM, onChainId);
+  }
+}
+
 // ─── Core reconciliation ─────────────────────────────────────────────────────
 
 /**
@@ -132,6 +185,13 @@ export async function reconcileReview(
     return { success: true, data: { status: 'none' } };
   }
 
+  // Record inbox receipt before projecting.  A duplicate/replayed event is
+  // skipped so reconciliation side effects are not repeated.
+  const receipt = await beginReviewEvent(review.on_chain_id, review.on_chain_tx_hash);
+  if (!receipt) {
+    return { success: true, data: { status: review.reconciliation_status } };
+  }
+
   const client = buildReviewClient();
 
   let chainReview: ChainReview;
@@ -152,10 +212,13 @@ export async function reconcileReview(
           onChainId: review.on_chain_id,
         },
       });
+      await markInboxProcessed(receipt.id);
+      await advanceReviewCursor(review.on_chain_id);
       return { success: true, data: { status: 'missing' } };
     }
     // Transient error — leave status as-is for retry.
     console.error(`[reviewSync] Error reading on-chain review ${review.on_chain_id}:`, message);
+    await markInboxFailed(receipt.id, message);
     return { success: false, error: message };
   }
 
@@ -180,6 +243,8 @@ export async function reconcileReview(
     }
 
     await supabase.from('reviews').update(updatePayload).eq('id', reviewId);
+    await markInboxProcessed(receipt.id);
+    await advanceReviewCursor(review.on_chain_id);
     return { success: true, data: { status: 'matched' } };
   }
 
@@ -206,6 +271,9 @@ export async function reconcileReview(
     `[reviewSync] Mismatch detected for review ${reviewId} (on_chain_id=${review.on_chain_id}):`,
     mismatchDetails,
   );
+
+  await markInboxProcessed(receipt.id);
+  await advanceReviewCursor(review.on_chain_id);
 
   return { success: true, data: { status: 'mismatched' } };
 }
@@ -258,28 +326,24 @@ export async function detectOrphanedReviews(): Promise<ServiceResponse<{
 
     if (!dbReview) {
       // Orphan detected — on-chain review has no DB counterpart.
-      // Check if we've already queued this orphan.
-      const { data: existing } = await supabase
-        .from('review_repair_queue')
-        .select('id')
-        .eq('on_chain_id', onChainId)
-        .eq('issue_type', 'orphaned')
-        .neq('status', 'resolved')
-        .maybeSingle();
-
-      if (!existing) {
+      // Record inbox receipt first so a replayed scan does not re-queue.
+      const receipt = await beginReviewEvent(onChainId);
+      if (receipt) {
         await queueRepair({
           reviewId: null,
           onChainId,
           issueType: 'orphaned',
           details: { message: 'On-chain review has no off-chain counterpart', onChainId },
         });
+        await markInboxProcessed(receipt.id);
       }
       orphaned++;
     } else {
       matched++;
     }
   }
+
+  await advanceReviewCursor(Number(totalCount));
 
   return { success: true, data: { matched, orphaned, errors } };
 }
@@ -309,12 +373,17 @@ export async function detectDuplicateOnChainIds(): Promise<ServiceResponse<{
   for (const [onChainId, count] of counts) {
     if (count > 1) {
       duplicates++;
-      await queueRepair({
-        reviewId: null,
-        onChainId,
-        issueType: 'duplicate',
-        details: { message: `${count} DB reviews point to the same on_chain_id`, onChainId, count },
-      });
+      // Idempotent: only queue once per duplicate on_chain_id.
+      const receipt = await beginReviewEvent(onChainId);
+      if (receipt) {
+        await queueRepair({
+          reviewId: null,
+          onChainId,
+          issueType: 'duplicate',
+          details: { message: `${count} DB reviews point to the same on_chain_id`, onChainId, count },
+        });
+        await markInboxProcessed(receipt.id);
+      }
     }
   }
 
@@ -556,6 +625,13 @@ export async function recordOnChainSubmission(
   ledger?: number,
   timestamp?: number,
 ): Promise<ServiceResponse<void>> {
+  // Record inbox receipt before projecting the submission.  A replayed
+  // submission event is a no-op so the projection is not repeated.
+  const receipt = await beginReviewEvent(onChainId, txHash);
+  if (!receipt) {
+    return { success: true };
+  }
+
   const updatePayload: Record<string, unknown> = {
     on_chain_id: onChainId,
     reconciliation_status: 'pending',
@@ -571,6 +647,12 @@ export async function recordOnChainSubmission(
     .update(updatePayload)
     .eq('id', reviewId);
 
-  if (error) return { success: false, error: error.message };
+  if (error) {
+    await markInboxFailed(receipt.id, error.message);
+    return { success: false, error: error.message };
+  }
+
+  await markInboxProcessed(receipt.id);
+  await advanceReviewCursor(onChainId);
   return { success: true };
 }

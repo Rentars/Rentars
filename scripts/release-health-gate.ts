@@ -26,6 +26,11 @@
  * recovery rule must be at or below its recovery threshold for its recovery
  * windows, and no gate may be breached. The snapshot does not record which gate
  * paused the rollout, so the check applies to all of them.
+ *
+ * Contract upgrade evidence (#781): when --compat <file> is supplied, the gate
+ * also requires a migration changelog entry and an ABI diff check for the
+ * release, and fails closed when the old and new contract versions are not
+ * declared compatible. See docs/releases/contract-upgrades.md.
  */
 
 import { createHash } from 'node:crypto';
@@ -35,6 +40,7 @@ import { resolve } from 'node:path';
 export type GateAction = 'pause' | 'rollback';
 export type Decision = 'proceed' | 'pause' | 'rollback';
 export type Mode = 'evaluate' | 'resume';
+export type CompatStatus = 'ok' | 'missing_evidence' | 'incompatible';
 
 export interface Recovery {
   threshold: number;
@@ -69,6 +75,32 @@ export interface GateResult {
 export interface Evaluation {
   decision: Decision;
   gates: GateResult[];
+}
+
+export interface ContractVersion {
+  contract: string;
+  version: string;
+}
+
+export interface CompatibilityEvidence {
+  /** Old and new contract versions must both be declared. */
+  from: ContractVersion;
+  to: ContractVersion;
+  /** Path to the migration changelog entry for this release. */
+  migration_changelog: string;
+  /** Path to the recorded ABI diff check output. */
+  abi_diff: string;
+  /** Whether the ABI diff check passed. */
+  abi_diff_passed: boolean;
+  /** Whether the application was verified against the new ABI. */
+  application_compatible: boolean;
+}
+
+export interface CompatibilityResult {
+  status: CompatStatus;
+  from: ContractVersion | null;
+  to: ContractVersion | null;
+  reasons: string[];
 }
 
 export const EXIT_CODES: Record<Decision, number> = {
@@ -213,7 +245,110 @@ export function evaluateMode(policy: Policy, snapshot: Snapshot, mode: Mode): Ev
   return mode === 'resume' ? evaluateResume(policy, snapshot) : evaluate(policy, snapshot);
 }
 
-function parseArgs(argv: string[]): { metrics: string; policy: string; mode: Mode } {
+function parseContractVersion(raw: unknown, field: string): ContractVersion {
+  if (
+    !isRecord(raw) ||
+    typeof raw.contract !== 'string' ||
+    raw.contract === '' ||
+    typeof raw.version !== 'string' ||
+    raw.version === ''
+  ) {
+    fail(`${field} must declare a non-empty contract and version`);
+  }
+  return { contract: raw.contract, version: raw.version };
+}
+
+export function parseCompatibility(raw: unknown): CompatibilityEvidence {
+  if (!isRecord(raw)) fail('compatibility evidence must be a JSON object');
+
+  const from = parseContractVersion(raw.from, 'from');
+  const to = parseContractVersion(raw.to, 'to');
+
+  if (typeof raw.migration_changelog !== 'string' || raw.migration_changelog === '') {
+    fail('migration_changelog must be a non-empty path');
+  }
+  if (typeof raw.abi_diff !== 'string' || raw.abi_diff === '') {
+    fail('abi_diff must be a non-empty path');
+  }
+  if (typeof raw.abi_diff_passed !== 'boolean') fail('abi_diff_passed must be a boolean');
+  if (typeof raw.application_compatible !== 'boolean') {
+    fail('application_compatible must be a boolean');
+  }
+
+  return {
+    from,
+    to,
+    migration_changelog: raw.migration_changelog,
+    abi_diff: raw.abi_diff,
+    abi_diff_passed: raw.abi_diff_passed,
+    application_compatible: raw.application_compatible,
+  };
+}
+
+/**
+ * Verifies the contract upgrade evidence. The gate fails closed: missing
+ * evidence, a failed ABI diff, an application that was not verified against the
+ * new ABI, or undeclared/identical versions all block the release.
+ */
+export function evaluateCompatibility(evidence: CompatibilityEvidence): CompatibilityResult {
+  const reasons: string[] = [];
+
+  if (evidence.from.contract !== evidence.to.contract) {
+    reasons.push(
+      `contract identity changed (${evidence.from.contract} -> ${evidence.to.contract}); ` +
+        'successor deployments must be recorded as a migration, not an in-place upgrade',
+    );
+  }
+  if (evidence.from.version === evidence.to.version) {
+    reasons.push(
+      `contract version not bumped (${evidence.from.version}); declare the new version explicitly`,
+    );
+  }
+  if (!evidence.abi_diff_passed) reasons.push('ABI diff check did not pass');
+  if (!evidence.application_compatible) {
+    reasons.push('application compatibility against the new ABI was not verified');
+  }
+
+  const status: CompatStatus =
+    reasons.length === 0
+      ? 'ok'
+      : reasons.some((r) => r.includes('not bumped') || r.includes('identity changed'))
+        ? 'incompatible'
+        : 'missing_evidence';
+
+  return { status, from: evidence.from, to: evidence.to, reasons };
+}
+
+function readEvidenceFile(path: string, label: string): string {
+  try {
+    return readFileSync(path, 'utf-8');
+  } catch {
+    fail(`${label} not found at ${path}`);
+  }
+}
+
+/**
+ * Loads the compatibility evidence and confirms the referenced migration
+ * changelog and ABI diff artifacts exist and are non-empty.
+ */
+export function loadCompatibility(path: string): CompatibilityEvidence {
+  const evidence = parseCompatibility(JSON.parse(readFileSync(path, 'utf-8')));
+  const base = resolve(path, '..');
+
+  const changelog = readEvidenceFile(resolve(base, evidence.migration_changelog), 'migration changelog');
+  if (changelog.trim() === '') fail('migration changelog is empty');
+  const abiDiff = readEvidenceFile(resolve(base, evidence.abi_diff), 'ABI diff check');
+  if (abiDiff.trim() === '') fail('ABI diff check output is empty');
+
+  return evidence;
+}
+
+function parseArgs(argv: string[]): {
+  metrics: string;
+  policy: string;
+  mode: Mode;
+  compat: string | null;
+} {
   const value = (flag: string): string | undefined => {
     const index = argv.indexOf(flag);
     return index >= 0 ? argv[index + 1] : undefined;
@@ -226,27 +361,37 @@ function parseArgs(argv: string[]): { metrics: string; policy: string; mode: Mod
   if (mode !== 'evaluate' && mode !== 'resume') fail('--mode must be "evaluate" or "resume"');
 
   const defaultPolicy = resolve(import.meta.dir, '../docs/releases/health-gates.json');
-  return { metrics, policy: value('--policy') ?? defaultPolicy, mode };
+  return {
+    metrics,
+    policy: value('--policy') ?? defaultPolicy,
+    mode,
+    compat: value('--compat') ?? null,
+  };
 }
 
 function main(): number {
-  const { metrics, policy: policyPath, mode } = parseArgs(process.argv.slice(2));
+  const { metrics, policy: policyPath, mode, compat } = parseArgs(process.argv.slice(2));
 
   const policyText = readFileSync(policyPath, 'utf-8');
   const policy = parsePolicy(JSON.parse(policyText));
   const snapshot = parseSnapshot(JSON.parse(readFileSync(metrics, 'utf-8')));
   const result = evaluateMode(policy, snapshot, mode);
 
+  const compatibility = compat ? evaluateCompatibility(loadCompatibility(compat)) : null;
+  const decision: Decision =
+    compatibility && compatibility.status !== 'ok' ? 'pause' : result.decision;
+
   const report = {
     mode,
-    decision: result.decision,
+    decision,
     policy_version: policy.policy_version,
     policy_sha256: createHash('sha256').update(policyText).digest('hex'),
     evaluated_at: new Date().toISOString(),
     gates: result.gates,
+    compatibility,
   };
   console.log(JSON.stringify(report, null, 2));
-  return EXIT_CODES[result.decision];
+  return EXIT_CODES[decision];
 }
 
 if (import.meta.main) {

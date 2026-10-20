@@ -123,6 +123,21 @@ export interface TransitionResult {
   replayed: boolean;
 }
 
+/**
+ * Options controlling replay-safety for a payment transition.
+ *
+ * `eventKey` is the unique transaction/operation identity of the ledger event
+ * (e.g. `stellar:<tx_hash>:<op_index>`). When supplied, the transition is
+ * deduplicated against previously recorded event keys so that duplicate,
+ * delayed, or reordered ledger events cannot double-record payments.
+ */
+export interface TransitionOptions {
+  /** Unique transaction/operation key for the originating ledger event. */
+  eventKey?: string;
+  /** Optional actor UUID for audit (omit for system actions). */
+  actorId?: string;
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
@@ -139,6 +154,31 @@ export function hashEventPayload(payload: Record<string, unknown>): string {
  */
 export function isAllowedTransition(from: PaymentStatus, to: PaymentStatus): boolean {
   return ALLOWED_TRANSITIONS[from]?.includes(to) ?? false;
+}
+
+/**
+ * Derive a stable transaction/operation identity for a ledger event.
+ *
+ * Prefers an explicit `eventKey`; otherwise falls back to the Stellar
+ * transaction hash (optionally scoped by operation index) so that duplicate
+ * ledger deliveries of the same operation share one identity.
+ */
+export function deriveEventKey(
+  txHash: string | null | undefined,
+  opIndex?: number | string | null,
+): string | null {
+  if (!txHash) return null;
+  return opIndex === undefined || opIndex === null
+    ? `stellar:${txHash}`
+    : `stellar:${txHash}:${opIndex}`;
+}
+
+/**
+ * Read the list of already-applied event keys from a payment's metadata.
+ */
+function readAppliedEventKeys(metadata: Record<string, unknown> | null): string[] {
+  const raw = metadata?.applied_event_keys;
+  return Array.isArray(raw) ? raw.filter((k): k is string => typeof k === 'string') : [];
 }
 
 /**
@@ -212,6 +252,7 @@ export async function createPaymentIntent(
  * @param eventPayload - Raw event data (used for duplicate detection).
  * @param txHash       - Optional Stellar transaction hash to record.
  * @param actorId      - Optional actor UUID for audit (omit for system actions).
+ * @param options      - Optional replay-safety controls (event key, actor).
  *
  * @returns TransitionResult containing updated Payment and replayed flag.
  */
@@ -221,6 +262,7 @@ export async function transitionPaymentStatus(
   eventPayload: Record<string, unknown>,
   txHash?: string | null,
   actorId?: string,
+  options?: TransitionOptions,
 ): Promise<ServiceResponse<TransitionResult>> {
   const payment = await getPaymentStatus(paymentId);
   if (!payment) {
@@ -228,9 +270,22 @@ export async function transitionPaymentStatus(
   }
 
   const eventHash = hashEventPayload(eventPayload);
+  const effectiveActorId = options?.actorId ?? actorId;
 
   // ── Idempotency: same event hash → replay without side-effects ────────────
   if (payment.last_event_hash === eventHash) {
+    return {
+      success: true,
+      data: { payment, replayed: true },
+    };
+  }
+
+  // ── Idempotency: same transaction/operation key → replay ──────────────────
+  // Guards against duplicate ledger events whose payload hash differs (e.g.
+  // reordered fields) but which refer to the same on-chain operation.
+  const eventKey = options?.eventKey ?? deriveEventKey(txHash);
+  const appliedEventKeys = readAppliedEventKeys(payment.metadata);
+  if (eventKey && appliedEventKeys.includes(eventKey)) {
     return {
       success: true,
       data: { payment, replayed: true },
@@ -255,13 +310,19 @@ export async function transitionPaymentStatus(
     updated_at: new Date().toISOString(),
   };
   if (txHash !== undefined) updatePayload.stellar_tx_hash = txHash;
+
+  // Record the applied event key so replays of the same operation are no-ops.
+  const nextMetadata: Record<string, unknown> = { ...(payment.metadata ?? {}) };
+  if (eventKey) {
+    nextMetadata.applied_event_keys = [...appliedEventKeys, eventKey];
+  }
   if (quarantineReason) {
     // Store quarantine reason in metadata for manual review
-    updatePayload.metadata = {
-      ...(payment.metadata ?? {}),
-      quarantine_reason: quarantineReason,
-      quarantined_at: new Date().toISOString(),
-    };
+    nextMetadata.quarantine_reason = quarantineReason;
+    nextMetadata.quarantined_at = new Date().toISOString();
+  }
+  if (eventKey || quarantineReason) {
+    updatePayload.metadata = nextMetadata;
   }
 
   const { data, error } = await supabase
@@ -290,7 +351,7 @@ export async function transitionPaymentStatus(
     ('payment.submit' as const);
 
   await auditLogger.log({
-    actorId,
+    actorId: effectiveActorId,
     action: auditAction,
     resourceType: 'payment',
     resourceId: paymentId,
@@ -298,6 +359,7 @@ export async function transitionPaymentStatus(
       fromStatus: payment.status,
       toStatus: targetStatus,
       txHash,
+      eventKey,
       quarantineReason,
     },
   });
@@ -326,12 +388,15 @@ export async function updatePaymentStatus(
   paymentId: string,
   txHash: string | null,
   status: PaymentStatus,
+  opIndex?: number | string | null,
 ): Promise<Payment> {
   const result = await transitionPaymentStatus(
     paymentId,
     status,
     { txHash, status, _source: 'stellar_confirmation' },
     txHash,
+    undefined,
+    { eventKey: deriveEventKey(txHash, opIndex) ?? undefined },
   );
 
   if (!result.success || !result.data) {

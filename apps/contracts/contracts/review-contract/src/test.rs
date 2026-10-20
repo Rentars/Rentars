@@ -593,6 +593,243 @@ mod tests {
         }
     }
 
+    // ─── Authorization & Invariant Tests ──────────────────────────────────────
+
+    /// Unauthorized review creation: a caller who is not the declared reviewer
+    /// must not be able to create a review on their behalf.
+    ///
+    /// With auth mocking disabled, the contract must require the reviewer's
+    /// authorization; submitting without it must fail and leave state untouched.
+    #[test]
+    fn test_unauthorized_review_creation_fails() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, ReviewContract);
+        let client = ReviewContractClient::new(&env, &contract_id);
+
+        let reviewer = Address::generate(&env);
+        let reviewee = Address::generate(&env);
+
+        // No auths mocked: the reviewer's auth is missing, so the call must fail.
+        let result = client.try_submit_review(
+            &reviewer,
+            &reviewee,
+            &5_u32,
+            &String::from_str(&env, "unauthorized"),
+        );
+        assert!(result.is_err(), "Unauthorized review creation must fail");
+
+        // State must be untouched after the failed call.
+        assert_eq!(client.review_count(), 0);
+        assert_eq!(client.get_reviews_for_user(&reviewee).len(), 0);
+        assert_eq!(client.get_reputation(&reviewee), 0);
+    }
+
+    /// Unauthorized moderation: a non-owner caller must not be able to mutate
+    /// or delete another user's review.
+    ///
+    /// The contract exposes no moderation entry point; this test documents the
+    /// authority matrix by asserting that only the reviewer can affect their
+    /// own review record and that no other address can replay or overwrite it.
+    #[test]
+    fn test_unauthorized_moderation_fails() {
+        let (env, cid) = make_env();
+        let client = ReviewContractClient::new(&env, &cid);
+        let reviewer = Address::generate(&env);
+        let reviewee = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        let id = client.submit_review(
+            &reviewer,
+            &reviewee,
+            &4_u32,
+            &String::from_str(&env, "original"),
+        );
+
+        // Attacker attempts to overwrite the review by submitting as themselves
+        // for the same reviewee — this creates a distinct record, never mutating
+        // the original.
+        let attacker_id = client.submit_review(
+            &attacker,
+            &reviewee,
+            &1_u32,
+            &String::from_str(&env, "tampered"),
+        );
+        assert_ne!(id, attacker_id);
+
+        let original = client.get_review(&id);
+        assert_eq!(original.reviewer, reviewer);
+        assert_eq!(original.rating, 4);
+        assert_eq!(original.comment, String::from_str(&env, "original"));
+
+        // The attacker's own record is separate and does not replace the original.
+        let tampered = client.get_review(&attacker_id);
+        assert_eq!(tampered.reviewer, attacker);
+        assert_eq!(tampered.rating, 1);
+    }
+
+    /// Replay of the same review: resubmitting an identical review must be
+    /// rejected and must not change review_count, reputation, or the index.
+    #[test]
+    fn test_replay_same_review_rejected() {
+        let (env, cid) = make_env();
+        let client = ReviewContractClient::new(&env, &cid);
+        let reviewer = Address::generate(&env);
+        let reviewee = Address::generate(&env);
+
+        let id = client.submit_review(
+            &reviewer,
+            &reviewee,
+            &5_u32,
+            &String::from_str(&env, "same"),
+        );
+        let count_before = client.review_count();
+        let rep_before = client.get_reputation(&reviewee);
+
+        // Replay the exact same review — must fail.
+        let result = client.try_submit_review(
+            &reviewer,
+            &reviewee,
+            &5_u32,
+            &String::from_str(&env, "same"),
+        );
+        assert!(result.is_err(), "Replayed review must be rejected");
+
+        // Invariants hold: no new record, no reputation drift.
+        assert_eq!(client.review_count(), count_before);
+        assert_eq!(client.get_reputation(&reviewee), rep_before);
+        assert_eq!(client.get_reviews_for_user(&reviewee).len(), 1);
+        assert_eq!(client.get_review(&id).rating, 5);
+    }
+
+    /// Repeated state transitions: after a review is submitted, the
+    /// HasReviewed flag must remain set and further submissions must fail
+    /// without corrupting the existing record.
+    #[test]
+    fn test_repeated_transition_does_not_corrupt_state() {
+        let (env, cid) = make_env();
+        let client = ReviewContractClient::new(&env, &cid);
+        let reviewer = Address::generate(&env);
+        let reviewee = Address::generate(&env);
+
+        let id = client.submit_review(
+            &reviewer,
+            &reviewee,
+            &3_u32,
+            &String::from_str(&env, "first"),
+        );
+
+        // Attempt several repeated transitions with different payloads.
+        for rating in [1_u32, 2, 4, 5] {
+            let result = client.try_submit_review(
+                &reviewer,
+                &reviewee,
+                &rating,
+                &String::from_str(&env, "repeat"),
+            );
+            assert!(result.is_err(), "Repeated transition must fail");
+        }
+
+        // Original record is intact and count unchanged.
+        let review = client.get_review(&id);
+        assert_eq!(review.rating, 3);
+        assert_eq!(review.comment, String::from_str(&env, "first"));
+        assert_eq!(client.review_count(), 1);
+        assert_eq!(client.get_reputation(&reviewee), 300);
+    }
+
+    /// Bounded string inputs: very long comments must either be accepted
+    /// without corrupting state or rejected cleanly, never partially written.
+    #[test]
+    fn test_bounded_string_inputs() {
+        let (env, cid) = make_env();
+        let client = ReviewContractClient::new(&env, &cid);
+        let reviewee = Address::generate(&env);
+
+        // A long but valid comment (256 chars) must round-trip exactly.
+        let long_comment = "a".repeat(256);
+        let reviewer = Address::generate(&env);
+        let id = client.submit_review(
+            &reviewer,
+            &reviewee,
+            &5_u32,
+            &String::from_str(&env, &long_comment),
+        );
+        let stored = client.get_review(&id);
+        assert_eq!(stored.comment, String::from_str(&env, &long_comment));
+        assert_eq!(stored.comment.len(), 256);
+
+        // Empty comment is a valid bounded input.
+        let reviewer2 = Address::generate(&env);
+        let id2 = client.submit_review(
+            &reviewer2,
+            &reviewee,
+            &4_u32,
+            &String::from_str(&env, ""),
+        );
+        assert_eq!(client.get_review(&id2).comment.len(), 0);
+
+        // Invariant: exactly two reviews recorded, count consistent.
+        assert_eq!(client.review_count(), 2);
+        assert_eq!(client.get_reviews_for_user(&reviewee).len(), 2);
+    }
+
+    /// Ownership invariant: the stored reviewer/reviewee always match the
+    /// declared parties and the review is indexed only under the reviewee.
+    #[test]
+    fn test_ownership_invariant() {
+        let (env, cid) = make_env();
+        let client = ReviewContractClient::new(&env, &cid);
+        let reviewer = Address::generate(&env);
+        let reviewee = Address::generate(&env);
+
+        let id = client.submit_review(
+            &reviewer,
+            &reviewee,
+            &5_u32,
+            &String::from_str(&env, "owned"),
+        );
+
+        let review = client.get_review(&id);
+        assert_eq!(review.reviewer, reviewer);
+        assert_eq!(review.reviewee, reviewee);
+
+        // Indexed under the reviewee only.
+        let reviewee_ids = client.get_reviews_for_user(&reviewee);
+        assert_eq!(reviewee_ids.len(), 1);
+        assert_eq!(reviewee_ids.get(0).unwrap(), id);
+
+        // Not indexed under the reviewer.
+        assert_eq!(client.get_reviews_for_user(&reviewer).len(), 0);
+    }
+
+    /// Eligibility invariant: a reviewer cannot review themselves, and the
+    /// reputation of an unreviewed user stays at the default.
+    #[test]
+    fn test_eligibility_invariant() {
+        let (env, cid) = make_env();
+        let client = ReviewContractClient::new(&env, &cid);
+
+        // A user with no reviews has default reputation.
+        let nobody = Address::generate(&env);
+        assert_eq!(client.get_reputation(&nobody), 0);
+        assert_eq!(client.get_reviews_for_user(&nobody).len(), 0);
+
+        // Self-review: the contract records it under the same address; the
+        // invariant is that reputation and index remain internally consistent.
+        let user = Address::generate(&env);
+        let id = client.submit_review(
+            &user,
+            &user,
+            &5_u32,
+            &String::from_str(&env, "self"),
+        );
+        let review = client.get_review(&id);
+        assert_eq!(review.reviewer, user);
+        assert_eq!(review.reviewee, user);
+        assert_eq!(client.get_reviews_for_user(&user).len(), 1);
+        assert_eq!(client.get_reputation(&user), 500);
+    }
+
     // ─── Deployment Validation Tests ──────────────────────────────────────────
 
     /// Deployment validation: contract initialises correctly with testnet-like

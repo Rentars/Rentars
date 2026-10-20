@@ -43,6 +43,11 @@ export default defineConfig({
       name: 'mobile-chrome',
       use: { ...devices['Pixel 5'] },
     },
+    // Mobile Safari (iPhone) for wallet handoff and return-from-wallet testing
+    {
+      name: 'mobile-safari',
+      use: { ...devices['iPhone 13'] },
+    },
   ],
   webServer: {
     command: process.env.CI ? 'yarn start' : 'yarn dev',

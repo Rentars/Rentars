@@ -284,7 +284,25 @@ export async function createNotification(
     .select()
     .single();
 
-  if (error) return { success: false, error: error.message };
+  if (error) {
+    // Replay-safe dedup: a concurrent worker may have inserted the same
+    // (user_id, event_id) between our check and this insert.  The unique
+    // constraint rejects the duplicate; return the existing row so the
+    // caller treats the replay as a no-op rather than a failure.
+    if (options?.eventId && isUniqueViolation(error)) {
+      const { data: existing } = await supabase
+        .from('notifications')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('event_id', options.eventId)
+        .maybeSingle();
+
+      if (existing) {
+        return { success: true, data: existing as Notification };
+      }
+    }
+    return { success: false, error: error.message };
+  }
 
   // Invalidate the notification cache so the next list request sees the new row.
   await invalidateNotificationCache(userId);

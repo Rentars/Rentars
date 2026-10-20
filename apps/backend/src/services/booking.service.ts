@@ -34,6 +34,7 @@ import {
   type BookingActor,
 } from './bookingAuthorization.service.js';
 import { auditLogger } from './auditLogger.service.js';
+import { syncInboxService } from './syncInbox.service.js';
 
 // ─── State machine ────────────────────────────────────────────────────────────
 
@@ -138,6 +139,11 @@ export interface CreateBookingInput {
   on_chain_property_id?: bigint;
   /** Quote token from GET /properties/:id/quote, binding total_price to the quoted stay. */
   quote_token?: string;
+  /**
+   * Unique identity of the originating chain event (tx hash + operation index).
+   * When present, creation is treated as a replay-safe projection.
+   */
+  event_key?: string;
 }
 
 export interface RequestModificationInput {
@@ -452,9 +458,43 @@ export class BookingService {
    *   5. Create TrustlessWork escrow
    *   6. Insert booking into Supabase
    *   7. Create on-chain booking record
+   *
+   * Replay safety: when the caller supplies a chain `event_key` (i.e. this
+   * creation is a projection of a ledger event), the event is recorded in the
+   * sync inbox before any side effect. A duplicate or replayed event returns the
+   * already-projected booking instead of creating a second one.
    */
   async createBooking(input: CreateBookingInput): Promise<ServiceResponse<Booking>> {
     const { property_id, tenant_id, check_in, check_out, guest_count, total_price, rules_acknowledged_at, terms_version, terms_accepted_at } = input;
+
+    // Replay guard: record inbox receipt before any projection side effect.
+    if (input.event_key) {
+      const receipt = await syncInboxService.receive({
+        eventKey: input.event_key,
+        eventType: 'booking.created',
+        payload: {
+          property_id,
+          tenant_id,
+          check_in,
+          check_out,
+          guest_count,
+          total_price,
+        },
+      });
+
+      if (!receipt.success) {
+        return { success: false, error: receipt.error ?? 'Failed to record sync inbox receipt' };
+      }
+
+      if (receipt.data?.duplicate) {
+        const existing = await this.findBookingByEventKey(input.event_key);
+        if (existing) {
+          return { success: true, data: existing };
+        }
+        // Receipt exists but projection never completed — fall through and
+        // (re)apply the projection idempotently.
+      }
+    }
 
     if (!property_id || !tenant_id || !check_in || !check_out) {
       return {
@@ -660,6 +700,18 @@ export class BookingService {
 
     const bookingId = reservedId as string;
 
+    // Link the booking to its originating chain event so replays resolve to it.
+    if (input.event_key) {
+      const { error: eventLinkError } = await supabase
+        .from('bookings')
+        .update({ sync_event_key: input.event_key })
+        .eq('id', bookingId);
+
+      if (eventLinkError) {
+        console.warn('[BookingService] Failed to link booking to sync event:', eventLinkError);
+      }
+    }
+
     // Store the agreed listing terms on the booking. The snapshot is immutable
     // (see migration 00065), so this is the only write that sets it.
     const { error: snapshotError } = await supabase
@@ -801,6 +853,11 @@ export class BookingService {
       console.warn('[BookingService] Confirmation email dispatch failed:', err),
     );
 
+    // Mark the inbox event as projected so a replay short-circuits above.
+    if (input.event_key) {
+      await syncInboxService.markProjected(input.event_key, { booking_id: booking.id });
+    }
+
     // 8. Create on-chain booking record (non-fatal on failure).
     if (prop.on_chain_id !== undefined && prop.on_chain_id !== null) {
       const checkInTs = BigInt(Math.floor(checkInDate.getTime() / 1000));
@@ -846,6 +903,25 @@ export class BookingService {
     }
 
     return { success: true, data: booking };
+  }
+
+  /**
+   * Look up the booking previously projected from a chain event key.
+   * Returns null when no projection has been recorded yet.
+   */
+  private async findBookingByEventKey(eventKey: string): Promise<Booking | null> {
+    const { data, error } = await supabase
+      .from('bookings')
+      .select('*')
+      .eq('sync_event_key', eventKey)
+      .maybeSingle();
+
+    if (error) {
+      console.warn('[BookingService] Event-key lookup failed:', error);
+      return null;
+    }
+
+    return (data as Booking | null) ?? null;
   }
 
   // ── Cancel ─────────────────────────────────────────────────────────────────

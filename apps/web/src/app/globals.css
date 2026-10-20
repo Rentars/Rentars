@@ -77,3 +77,61 @@
     outline-offset: 2px;
   }
 }
+
+/* ── Wallet status live region ─────────────────────────────────────────────── */
+@layer components {
+  /* Visually hidden but announced by assistive technology. */
+  .wallet-live-region {
+    @apply sr-only;
+  }
+
+  /* Visible status banner for connection / transaction states. */
+  .wallet-status {
+    @apply flex items-start gap-2 rounded-md border px-3 py-2 text-sm;
+  }
+
+  .wallet-status[data-state='connecting'],
+  .wallet-status[data-state='pending'] {
+    @apply border-border bg-muted text-muted-foreground;
+  }
+
+  .wallet-status[data-state='connected'],
+  .wallet-status[data-state='success'] {
+    @apply border-border bg-secondary text-secondary-foreground;
+  }
+
+  .wallet-status[data-state='rejected'],
+  .wallet-status[data-state='error'] {
+    @apply border-destructive bg-destructive/10 text-destructive;
+  }
+
+  /* ── Wallet fallback panel (unsupported / unavailable provider) ──────────── */
+  .wallet-fallback {
+    @apply flex flex-col gap-3 rounded-md border border-border bg-card p-4 text-card-foreground;
+  }
+
+  .wallet-fallback:focus-visible {
+    outline: 2px solid hsl(var(--ring));
+    outline-offset: 2px;
+  }
+
+  .wallet-fallback a,
+  .wallet-fallback button {
+    @apply underline underline-offset-2;
+  }
+
+  /* Ensure wallet actions remain keyboard reachable and clearly focused. */
+  .wallet-action {
+    @apply inline-flex items-center justify-center rounded-md px-4 py-2 text-sm font-medium;
+  }
+
+  .wallet-action:focus-visible {
+    outline: 2px solid hsl(var(--ring));
+    outline-offset: 2px;
+  }
+
+  .wallet-action[disabled],
+  .wallet-action[aria-disabled='true'] {
+    @apply cursor-not-allowed opacity-60;
+  }
+}
