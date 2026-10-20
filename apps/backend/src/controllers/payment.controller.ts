@@ -16,11 +16,18 @@ import {
   confirmTransaction,
   retryTransaction,
 } from '@/services/stellar.service.js';
+import {
+  parseAmountToMinor,
+  isSupportedCurrency,
+  type SupportedCurrency,
+} from '@/utils/payment.utils.js';
 
 const submitSchema = z.object({
   bookingId: z.string().uuid('bookingId must be a valid UUID'),
   signedXdr: z.string().min(1, 'signedXdr is required'),
   amountUsdc: z.number().positive('amountUsdc must be positive'),
+  currency: z.string().min(1).optional(),
+  quoteVersion: z.number().int().nonnegative().optional(),
   metadata: z.record(z.unknown()).optional(),
 });
 
@@ -44,11 +51,44 @@ export async function submitPayment(req: AuthRequest, res: Response): Promise<vo
     return;
   }
 
-  const { bookingId, signedXdr, amountUsdc, metadata } = parsed.data;
+  const { bookingId, signedXdr, amountUsdc, currency, quoteVersion, metadata } = parsed.data;
   const tenantId = req.userId!;
 
+  // 0. Validate currency support and amount precision before signing/intent creation
+  const resolvedCurrency = (currency ?? 'USDC') as SupportedCurrency;
+  if (!isSupportedCurrency(resolvedCurrency)) {
+    res.status(422).json({
+      error: {
+        code: 'UNSUPPORTED_CURRENCY',
+        message: `Currency ${resolvedCurrency} is not supported`,
+      },
+    });
+    return;
+  }
+
+  let amountMinor: bigint;
+  try {
+    amountMinor = parseAmountToMinor(amountUsdc, resolvedCurrency);
+  } catch (err) {
+    res.status(422).json({
+      error: {
+        code: 'INVALID_AMOUNT_PRECISION',
+        message: err instanceof Error ? err.message : 'Amount has excessive precision',
+      },
+    });
+    return;
+  }
+
   // 1. Create payment intent in 'pending' state
-  const payment = await createPaymentIntent({ bookingId, tenantId, amountUsdc, metadata });
+  const payment = await createPaymentIntent({
+    bookingId,
+    tenantId,
+    amountUsdc,
+    amountMinor,
+    currency: resolvedCurrency,
+    quoteVersion,
+    metadata,
+  });
 
   // 2. Submit signed XDR to Stellar
   let txHash: string;
@@ -102,6 +142,21 @@ export async function getStatus(req: AuthRequest, res: Response): Promise<void> 
     status: payment.status,
     txHash: payment.stellar_tx_hash,
     amountUsdc: payment.amount_usdc,
+    amountMinor: payment.amount_minor,
+    currency: payment.currency,
+    quoteVersion: payment.quote_version,
+    reconciliationState: payment.reconciliation_state,
+    settlementVerified: payment.settlement_verified,
+    refund: payment.refund
+      ? {
+          refundId: payment.refund.id,
+          status: payment.refund.status,
+          amountMinor: payment.refund.amount_minor,
+          currency: payment.refund.currency,
+          destination: payment.refund.destination,
+          updatedAt: payment.refund.updated_at,
+        }
+      : null,
     updatedAt: payment.updated_at,
   });
 }

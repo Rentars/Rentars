@@ -29,6 +29,11 @@ import {
   hashEventPayload,
   getPaymentByBookingId,
 } from './payment.service.js';
+import {
+  recordEarningsCredit,
+  recordPlatformFeeDebit,
+} from './earnings.service.js';
+import { enqueueOutboxEvent } from './outbox.service.js';
 import type { ServiceResponse } from './index.js';
 
 // ─── Configuration ────────────────────────────────────────────────────────────
@@ -243,11 +248,22 @@ export async function verifyAndProcessCallback(
   }
 
   const incomingStroops = BigInt(body.amountStroops);
-  if (incomingStroops !== payment.amount_stroops) {
+
+  // Compare against the canonical quote amount (amount_minor) as well as the
+  // payment row. The quote is the source of truth for what was authorized.
+  const quoteAmountMinor =
+    payment.quote_amount_minor != null ? BigInt(payment.quote_amount_minor) : null;
+
+  const amountMismatch =
+    incomingStroops !== payment.amount_stroops ||
+    (quoteAmountMinor !== null && incomingStroops !== quoteAmountMinor);
+
+  if (amountMismatch) {
     // Amount mismatch — quarantine; do NOT mark paid
     console.error(
       `[Callback] Amount mismatch for bookingId=${body.bookingId}: ` +
-      `got=${incomingStroops} expected=${payment.amount_stroops}`,
+      `got=${incomingStroops} expected=${payment.amount_stroops} ` +
+      `quote=${quoteAmountMinor ?? 'n/a'}`,
     );
     // Transition to under_review so the discrepancy is auditable
     await transitionPaymentStatus(
@@ -255,6 +271,11 @@ export async function verifyAndProcessCallback(
       'under_review',
       { ...body, _reason: 'amount_mismatch' } as unknown as Record<string, unknown>,
     );
+    // Flag the payment for reconciliation review
+    await supabase
+      .from('payments')
+      .update({ reconciliation_state: 'mismatch' })
+      .eq('id', payment.id);
     // Record in replay ledger to avoid re-processing
     await recordEvent(body.eventId, body.bookingId, eventHash);
     return {
@@ -289,6 +310,43 @@ export async function verifyAndProcessCallback(
   }
 
   const { replayed } = transitionResult.data!;
+
+  // ── 9. Ledger + notification side effects ─────────────────────────────────
+  if (!replayed) {
+    if (canonicalStatus === 'confirmed' || canonicalStatus === 'released') {
+      // Append-only earnings ledger entries. Unique source_ref makes these
+      // idempotent so duplicate callbacks cannot duplicate entries.
+      await recordEarningsCredit({
+        sourceRef: `payment:${payment.id}`,
+        bookingId: payment.booking_id,
+        hostId: payment.host_id,
+        currency: payment.currency,
+        amountMinor: incomingStroops,
+      });
+      await recordPlatformFeeDebit({
+        sourceRef: `payment:${payment.id}:platform_fee`,
+        bookingId: payment.booking_id,
+        hostId: payment.host_id,
+        currency: payment.currency,
+        amountMinor: payment.platform_fee_minor ?? 0n,
+      });
+    }
+
+    if (canonicalStatus === 'refunded' || canonicalStatus === 'refund_pending') {
+      // Surface refund state changes to the user via the outbox.
+      await enqueueOutboxEvent({
+        type: 'refund.state_changed',
+        aggregateId: payment.id,
+        payload: {
+          paymentId: payment.id,
+          bookingId: payment.booking_id,
+          status: canonicalStatus,
+          amountMinor: incomingStroops.toString(),
+          currency: payment.currency,
+        },
+      });
+    }
+  }
 
   return {
     status: replayed ? 'replayed' : 'acknowledged',

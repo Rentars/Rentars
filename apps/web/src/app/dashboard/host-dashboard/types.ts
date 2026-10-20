@@ -34,3 +34,34 @@ export interface OccupancyData {
   bookedNights: number;
   availableNights: number;
 }
+
+export type LedgerEntryType =
+  | 'booking_credit'
+  | 'fee_debit'
+  | 'release_credit'
+  | 'refund_debit'
+  | 'adjustment_credit'
+  | 'adjustment_debit';
+
+export interface EarningsLedgerEntry {
+  id: string;
+  entryType: LedgerEntryType;
+  amountMinor: number;
+  currency: string;
+  sourceRef: string;
+  createdAt: Date;
+}
+
+export interface ReconciliationSummary {
+  lastCheckedAt: Date | null;
+  discrepancyCount: number;
+}
+
+export interface EarningsPayload {
+  entries: EarningsLedgerEntry[];
+  balanceMinor: number;
+  currency: string;
+  periodStart: Date | null;
+  periodEnd: Date | null;
+  reconciliation: ReconciliationSummary;
+}

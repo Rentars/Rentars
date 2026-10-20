@@ -33,7 +33,13 @@ export type NotificationType =
   | 'message_received'
   | 'appeal_submitted'
   | 'report_notification'
-  | 'moderation_decision';
+  | 'moderation_decision'
+  | 'escrow_reconcile_failed'
+  | 'escrow_reconcile_pending'
+  | 'refund_requested'
+  | 'refund_confirmed'
+  | 'refund_failed'
+  | 'earnings_adjustment';
 
 /** Coarse bucket used for filtering the notification list. */
 export type NotificationCategory =
@@ -75,6 +81,12 @@ export function categoryForType(type: NotificationType): NotificationCategory {
     case 'booking_modification_declined':
       return 'booking';
     case 'payment_received':
+    case 'escrow_reconcile_failed':
+    case 'escrow_reconcile_pending':
+    case 'refund_requested':
+    case 'refund_confirmed':
+    case 'refund_failed':
+    case 'earnings_adjustment':
       return 'payment';
     case 'review_requested':
     case 'review_submitted':
@@ -149,6 +161,12 @@ const EMAIL_TEMPLATES: Partial<Record<NotificationType, string>> = {
   system_alert: 'System Alert',
   report_created: 'New Report Submitted',
   message_received: 'New Message',
+  escrow_reconcile_failed: 'Escrow Reconciliation Needs Attention',
+  escrow_reconcile_pending: 'Escrow Reconciliation In Progress',
+  refund_requested: 'Refund Requested',
+  refund_confirmed: 'Refund Confirmed',
+  refund_failed: 'Refund Could Not Be Completed',
+  earnings_adjustment: 'Earnings Adjustment',
 };
 
 const VALID_NOTIFICATION_TYPES: ReadonlyArray<NotificationType> = [
@@ -174,6 +192,12 @@ const VALID_NOTIFICATION_TYPES: ReadonlyArray<NotificationType> = [
   'appeal_submitted',
   'report_notification',
   'moderation_decision',
+  'escrow_reconcile_failed',
+  'escrow_reconcile_pending',
+  'refund_requested',
+  'refund_confirmed',
+  'refund_failed',
+  'earnings_adjustment',
 ];
 
 /**
@@ -685,6 +709,201 @@ export async function createNotificationWithAllChannels(
 }
 
 export { EMAIL_TEMPLATES };
+
+// ─── Idempotent outbox delivery ───────────────────────────────────────────────
+
+/** A row in the notification_outbox table. */
+export interface NotificationOutboxRow {
+  id: string;
+  event_id: string;
+  user_id: string;
+  type: NotificationType;
+  category: NotificationCategory;
+  payload: Record<string, unknown>;
+  deep_link?: string | null;
+  status: 'pending' | 'sent' | 'failed';
+  attempts: number;
+  next_attempt_at?: string | null;
+  last_error?: string | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+/** Input accepted by {@link enqueueNotification}. */
+export interface EnqueueNotificationInput {
+  /** Stable logical event identifier — used for idempotent dedupe. */
+  eventId: string;
+  userId: string;
+  type: NotificationType;
+  category?: NotificationCategory;
+  payload: Record<string, unknown>;
+  deepLink?: string;
+}
+
+/** Bounded exponential backoff for outbox retries (in seconds). */
+const OUTBOX_BACKOFF_SECONDS = [30, 120, 600, 1800, 3600] as const;
+const OUTBOX_MAX_ATTEMPTS = OUTBOX_BACKOFF_SECONDS.length;
+
+function outboxBackoffSeconds(attempts: number): number {
+  const idx = Math.min(Math.max(0, attempts - 1), OUTBOX_BACKOFF_SECONDS.length - 1);
+  return OUTBOX_BACKOFF_SECONDS[idx];
+}
+
+/**
+ * Enqueue a notification for idempotent, preference-aware delivery.
+ *
+ * Inserts into `notification_outbox` with ON CONFLICT (event_id, user_id)
+ * DO NOTHING so duplicate events (retries, worker restarts, replayed
+ * webhooks) never produce duplicate messages.
+ */
+export async function enqueueNotification(
+  input: EnqueueNotificationInput,
+): Promise<ServiceResponse<NotificationOutboxRow | null>> {
+  if (!VALID_NOTIFICATION_TYPES.includes(input.type)) {
+    return { success: false, error: `Unknown notification type: ${input.type}` };
+  }
+  if (!input.eventId || !input.userId) {
+    return { success: false, error: 'eventId and userId are required' };
+  }
+
+  const category = input.category ?? categoryForType(input.type);
+
+  const { data, error } = await supabase
+    .from('notification_outbox')
+    .upsert(
+      {
+        event_id: input.eventId,
+        user_id: input.userId,
+        type: input.type,
+        category,
+        payload: input.payload,
+        deep_link: input.deepLink ?? null,
+        status: 'pending',
+        attempts: 0,
+        next_attempt_at: new Date().toISOString(),
+      },
+      { onConflict: 'event_id,user_id', ignoreDuplicates: true },
+    )
+    .select()
+    .maybeSingle();
+
+  if (error) return { success: false, error: error.message };
+  // `null` data means the row already existed (duplicate event) — that is
+  // the desired idempotent outcome, not an error.
+  return { success: true, data: (data as NotificationOutboxRow | null) ?? null };
+}
+
+/**
+ * Drain pending outbox rows.
+ *
+ * For each due row:
+ *  - Respects notification_preferences (in-app/email/push + per-type filters).
+ *  - Inserts into `notifications` using the existing event_id dedupe index so
+ *    a worker restart cannot create duplicate in-app rows.
+ *  - Marks the row `sent` on success, or `failed` with a bounded
+ *    `next_attempt_at` backoff on transient errors.
+ *
+ * @param limit - Max rows to process in one pass (default 50).
+ */
+export async function flushOutbox(
+  limit = 50,
+): Promise<ServiceResponse<{ sent: number; failed: number; skipped: number }>> {
+  const now = new Date().toISOString();
+
+  const { data: rows, error } = await supabase
+    .from('notification_outbox')
+    .select('*')
+    .eq('status', 'pending')
+    .lte('next_attempt_at', now)
+    .order('next_attempt_at', { ascending: true })
+    .limit(Math.min(Math.max(1, limit), 500));
+
+  if (error) return { success: false, error: error.message };
+
+  let sent = 0;
+  let failed = 0;
+  let skipped = 0;
+
+  for (const row of (rows ?? []) as NotificationOutboxRow[]) {
+    try {
+      const sendInApp = await shouldSendInApp(row.user_id, row.type);
+      const sendEmail = await shouldSendEmail(row.user_id, row.type);
+      const sendPush = await shouldSendPush(row.user_id, row.type);
+
+      if (!sendInApp && !sendEmail && !sendPush) {
+        // All channels disabled — mark sent so we don't retry forever.
+        await supabase
+          .from('notification_outbox')
+          .update({ status: 'sent', updated_at: new Date().toISOString() })
+          .eq('id', row.id);
+        skipped++;
+        continue;
+      }
+
+      if (sendInApp) {
+        // Reuse the existing event_id dedupe index in `notifications`.
+        const result = await createNotification(row.user_id, row.type, row.payload, {
+          eventId: row.event_id,
+          deepLink: row.deep_link ?? undefined,
+        });
+        if (!result.success) throw new Error(result.error);
+      }
+
+      if (sendEmail && row.payload.userEmail) {
+        const emailData = {
+          to: String(row.payload.userEmail),
+          userName: String(row.payload.userName ?? ''),
+          propertyTitle: String(row.payload.propertyTitle ?? ''),
+          checkIn: String(row.payload.checkIn ?? ''),
+          checkOut: String(row.payload.checkOut ?? ''),
+          totalPrice: Number(row.payload.totalPrice ?? 0),
+          preferencesUrl: buildPreferenceUrlForUser(row.user_id),
+        };
+        const emailPromise =
+          row.type === 'booking_created'
+            ? emailService.sendBookingCreated(emailData)
+            : row.type === 'booking_confirmed'
+              ? emailService.sendBookingConfirmed(emailData)
+              : row.type === 'booking_cancelled'
+                ? emailService.sendBookingCancelled(emailData)
+                : Promise.resolve();
+        await emailPromise;
+      }
+
+      await supabase
+        .from('notification_outbox')
+        .update({ status: 'sent', updated_at: new Date().toISOString(), last_error: null })
+        .eq('id', row.id);
+      sent++;
+    } catch (err) {
+      const attempts = (row.attempts ?? 0) + 1;
+      const message = err instanceof Error ? err.message : String(err);
+      const exhausted = attempts >= OUTBOX_MAX_ATTEMPTS;
+      const nextAttemptAt = exhausted
+        ? null
+        : new Date(Date.now() + outboxBackoffSeconds(attempts) * 1000).toISOString();
+
+      await supabase
+        .from('notification_outbox')
+        .update({
+          status: exhausted ? 'failed' : 'pending',
+          attempts,
+          next_attempt_at: nextAttemptAt,
+          last_error: message,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', row.id);
+
+      console.error(
+        `[NotificationService] Outbox delivery failed for ${row.event_id}/${row.user_id} (attempt ${attempts}):`,
+        message,
+      );
+      failed++;
+    }
+  }
+
+  return { success: true, data: { sent, failed, skipped } };
+}
 
 // ─── Host-follow new-listing fan-out ──────────────────────────────────────────
 

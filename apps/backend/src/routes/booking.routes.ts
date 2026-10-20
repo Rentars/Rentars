@@ -11,6 +11,7 @@ import {
   getBooking,
   getBookingCalendar,
   getBookingReceipt,
+  getCancellationPreview,
   getBookingStatusHistory,
   getCalendarFeedToken,
   listUserBookings,
@@ -55,6 +56,11 @@ router.get('/', authenticate, validatePagination, listUserBookings);
 // GET /api/v1/bookings/calendar-feed-token — returns signed URL for the user's calendar feed
 // Must be registered BEFORE /:id to avoid being swallowed by the param route.
 router.get('/calendar-feed-token', authenticate, getCalendarFeedToken);
+
+// GET /api/v1/bookings/:id/cancellation-preview
+// Returns the refund calculation (from the booking-time policy snapshot) before the user confirms cancellation.
+// Must be registered BEFORE /:id to avoid being swallowed by the param route.
+router.get('/:id/cancellation-preview', authenticate, getCancellationPreview);
 
 // GET /api/v1/bookings/:id
 router.get('/:id', authenticate, getBooking);

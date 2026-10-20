@@ -7,6 +7,103 @@ export interface HostDashboardSummary {
   upcoming_reservations: number;
   total_revenue: number;
   net_revenue: number;
+  pending_earnings: number;
+  released_earnings: number;
+  currency: string;
+}
+
+export interface HostDashboardSummaryOptions {
+  /** Inclusive lower bound (ISO date) applied to ledger entry effective dates. */
+  periodStart?: string;
+  /** Inclusive upper bound (ISO date) applied to ledger entry effective dates. */
+  periodEnd?: string;
+  /** ISO 4217 currency code; defaults to USD. */
+  currency?: string;
+}
+
+type LedgerEntryType =
+  | 'booking_credit'
+  | 'fee_debit'
+  | 'release_credit'
+  | 'refund_debit'
+  | 'adjustment_credit'
+  | 'adjustment_debit';
+
+interface LedgerEntryRow {
+  entry_type: LedgerEntryType;
+  amount: number | string | null;
+  currency: string | null;
+  effective_at: string | null;
+}
+
+const CREDIT_ENTRY_TYPES: ReadonlySet<LedgerEntryType> = new Set<LedgerEntryType>([
+  'booking_credit',
+  'release_credit',
+  'adjustment_credit',
+]);
+
+const PENDING_ENTRY_TYPES: ReadonlySet<LedgerEntryType> = new Set<LedgerEntryType>([
+  'booking_credit',
+]);
+
+const RELEASED_ENTRY_TYPES: ReadonlySet<LedgerEntryType> = new Set<LedgerEntryType>([
+  'release_credit',
+]);
+
+function roundCurrency(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
+/**
+ * Derives host balances from append-only earnings_ledger entries.
+ * Credits increase the balance, debits decrease it. Entries are never
+ * mutated; corrections arrive as adjustment_credit/adjustment_debit rows.
+ */
+async function deriveLedgerBalances(
+  hostId: string,
+  options: HostDashboardSummaryOptions,
+): Promise<ServiceResponse<{ total: number; net: number; pending: number; released: number }>> {
+  const currency = (options.currency ?? 'USD').toUpperCase();
+
+  let query = supabase
+    .from('earnings_ledger')
+    .select('entry_type, amount, currency, effective_at')
+    .eq('host_id', hostId)
+    .eq('currency', currency);
+
+  if (options.periodStart) query = query.gte('effective_at', options.periodStart);
+  if (options.periodEnd) query = query.lte('effective_at', options.periodEnd);
+
+  const { data, error } = await query;
+
+  if (error) return { success: false, error: error.message };
+
+  let total = 0;
+  let net = 0;
+  let pending = 0;
+  let released = 0;
+
+  for (const row of (data ?? []) as LedgerEntryRow[]) {
+    const amount = Number(row.amount) || 0;
+    const isCredit = CREDIT_ENTRY_TYPES.has(row.entry_type);
+    const signed = isCredit ? amount : -amount;
+
+    if (isCredit) total += amount;
+    net += signed;
+
+    if (PENDING_ENTRY_TYPES.has(row.entry_type)) pending += amount;
+    if (RELEASED_ENTRY_TYPES.has(row.entry_type)) released += amount;
+  }
+
+  return {
+    success: true,
+    data: {
+      total: roundCurrency(total),
+      net: roundCurrency(net),
+      pending: roundCurrency(pending),
+      released: roundCurrency(released),
+    },
+  };
 }
 
 export interface HostProperty {
@@ -29,7 +126,10 @@ export interface HostProperty {
  */
 export async function getHostDashboardSummary(
   hostId: string,
+  options: HostDashboardSummaryOptions = {},
 ): Promise<ServiceResponse<HostDashboardSummary>> {
+  const currency = (options.currency ?? 'USD').toUpperCase();
+
   // Fetch all properties for the host
   const { data: properties, error: propError } = await supabase
     .from('properties')
@@ -50,6 +150,9 @@ export async function getHostDashboardSummary(
         upcoming_reservations: 0,
         total_revenue: 0,
         net_revenue: 0,
+        pending_earnings: 0,
+        released_earnings: 0,
+        currency,
       },
     };
   }
@@ -74,18 +177,11 @@ export async function getHostDashboardSummary(
     .gte('check_in', now)
     .lte('check_in', sevenDaysFromNow);
 
-  // Total revenue from completed bookings
-  const { data: revenueData } = await supabase
-    .from('bookings')
-    .select('total_price')
-    .in('property_id', propertyIds)
-    .in('status', ['Confirmed', 'Completed']);
-
-  const total_revenue = (revenueData ?? []).reduce(
-    (sum: number, b: { total_price: number }) => sum + (Number(b.total_price) || 0),
-    0,
-  );
-  const net_revenue = Math.round(total_revenue * 0.95 * 100) / 100; // 5% platform fee
+  // Revenue is derived from the append-only earnings ledger so that late
+  // payment events, refunds, and adjustments are reflected without mutating
+  // historical booking totals.
+  const balances = await deriveLedgerBalances(hostId, { ...options, currency });
+  if (!balances.success) return { success: false, error: balances.error };
 
   return {
     success: true,
@@ -93,8 +189,11 @@ export async function getHostDashboardSummary(
       total_properties,
       active_bookings: activeCount ?? 0,
       upcoming_reservations: upcomingCount ?? 0,
-      total_revenue: Math.round(total_revenue * 100) / 100,
-      net_revenue,
+      total_revenue: balances.data.total,
+      net_revenue: balances.data.net,
+      pending_earnings: balances.data.pending,
+      released_earnings: balances.data.released,
+      currency,
     },
   };
 }

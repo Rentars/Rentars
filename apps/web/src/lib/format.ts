@@ -10,10 +10,88 @@ const DEFAULT_LOCALE: Locale = 'en';
 const USDC_DECIMALS = 2;
 
 /**
- * Format USDC amount with proper precision and locale
+ * Canonical currency metadata: integer minor-unit precision per supported currency.
+ * Amounts must be handled as integer minor units to avoid floating-point loss.
+ */
+const CURRENCY_DECIMALS: Record<string, number> = {
+  USDC: USDC_DECIMALS,
+  USD: USDC_DECIMALS,
+};
+
+/**
+ * Check whether a currency is supported for canonical amount formatting.
+ */
+export function isSupportedCurrency(currency: string): boolean {
+  return Object.prototype.hasOwnProperty.call(CURRENCY_DECIMALS, currency);
+}
+
+/**
+ * Get the canonical minor-unit precision (decimals) for a supported currency.
+ * Throws for unsupported currencies.
+ */
+export function getCurrencyDecimals(currency: string): number {
+  if (!isSupportedCurrency(currency)) {
+    throw new Error(`Unsupported currency: ${currency}`);
+  }
+  return CURRENCY_DECIMALS[currency];
+}
+
+/**
+ * Format an integer amount expressed in canonical minor units (e.g. cents for
+ * USDC) into a localized display string without floating-point loss.
+ *
+ * The integer is split into whole and fractional parts using BigInt string
+ * manipulation, so no precision is lost regardless of magnitude.
+ */
+export function formatMinorUnits(
+  amountMinor: bigint | string,
+  currency: string,
+  locale: Locale = DEFAULT_LOCALE
+): string {
+  const decimals = getCurrencyDecimals(currency);
+
+  let minor: bigint;
+  try {
+    minor = typeof amountMinor === 'bigint' ? amountMinor : BigInt(amountMinor);
+  } catch {
+    throw new Error(`Invalid minor-unit amount: ${String(amountMinor)}`);
+  }
+
+  const negative = minor < 0n;
+  const abs = negative ? -minor : minor;
+
+  const divisor = 10n ** BigInt(decimals);
+  const whole = abs / divisor;
+  const fraction = abs % divisor;
+
+  const fractionDigits = decimals > 0 ? fraction.toString().padStart(decimals, '0') : '';
+  const numericString = `${negative ? '-' : ''}${whole.toString()}${
+    decimals > 0 ? `.${fractionDigits}` : ''
+  }`;
+
+  // Use Intl directly on the exact decimal string to avoid Number() rounding.
+  const formatter = new Intl.NumberFormat(locale, {
+    style: 'currency',
+    currency: currency === 'USDC' ? 'USD' : currency,
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
+  });
+
+  return formatter.format(numericString as unknown as number);
+}
+
+/**
+ * Format USDC amount with proper precision and locale.
+ * Converts the (legacy) major-unit number into canonical minor units and
+ * delegates to formatMinorUnits for lossless display.
  */
 export function formatUSDC(amount: number, locale: Locale = DEFAULT_LOCALE): string {
-  return formatCurrency(amount, locale, 'USD');
+  if (!Number.isFinite(amount)) {
+    throw new Error(`Invalid USDC amount: ${amount}`);
+  }
+  const factor = 10 ** USDC_DECIMALS;
+  const minor = BigInt(Math.round(amount * factor));
+  return formatMinorUnits(minor, 'USDC', locale);
 }
 
 /**
@@ -125,8 +203,13 @@ export function formatTotalPrice(
   numberOfNights: number,
   locale = DEFAULT_LOCALE
 ): string {
-  const total = pricePerNight * numberOfNights;
-  return formatUSDC(total, locale);
+  if (!Number.isFinite(pricePerNight) || !Number.isFinite(numberOfNights)) {
+    throw new Error('Invalid price or number of nights');
+  }
+  const factor = 10 ** USDC_DECIMALS;
+  const priceMinor = BigInt(Math.round(pricePerNight * factor));
+  const totalMinor = priceMinor * BigInt(Math.round(numberOfNights));
+  return formatMinorUnits(totalMinor, 'USDC', locale);
 }
 
 /**

@@ -18,7 +18,12 @@ import { loggingService } from './logging.service.js';
 import { createNotification, getPreferences } from './notification.service.js';
 import { emailService } from './email.service.js';
 import { buildPreferenceUrlForUser } from './preferenceToken.js';
-import { computeRefund } from './refundPolicy.service.js';
+import {
+  computeRefund,
+  getRefundPolicySnapshot,
+  computeRefundFromSnapshot,
+  type RefundPolicySnapshot,
+} from './refundPolicy.service.js';
 import { decodeCursor, buildCursorPage } from '../utils/cursor.js';
 import type { CursorPaginatedResult } from './notification.service.js';
 import type { ServiceResponse } from './index.js';
@@ -29,6 +34,11 @@ import {
 } from '@/middleware/metrics.middleware.js';
 import { checkDateRangeAvailability } from './availability.service.js';
 import { calculateRangePrice } from './pricing.service.js';
+import {
+  verifyQuoteToken,
+  toMinorUnits,
+  type QuoteTokenPayload,
+} from './quote.service.js';
 import {
   bookingAuthorizationService,
   type BookingActor,
@@ -79,6 +89,44 @@ export interface Booking {
   refund_policy_pct?: number | null;
   /** UTC instant at which a Pending booking will be automatically expired. */
   expires_at?: string | null;
+  /** Immutable snapshot of the refund policy that applied when the booking was made. */
+  refund_policy_snapshot?: RefundPolicySnapshot | null;
+  /** Version of the quote the payment was authorised against. */
+  quote_version?: string | null;
+  /** Authorised amount in integer minor units (token units). */
+  quote_amount_minor?: number | null;
+  /** Canonical currency of the authorised amount. */
+  quote_currency?: string | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+/**
+ * Settlement lifecycle for a refund. Only `confirmed` means the money has
+ * actually reached the tenant; `requested`, `submitted`, `failed` and
+ * `manual_review` are all non-terminal from the user's point of view.
+ */
+export type RefundState =
+  | 'requested'
+  | 'submitted'
+  | 'confirmed'
+  | 'failed'
+  | 'manual_review';
+
+export interface RefundRequest {
+  id: string;
+  booking_id: string;
+  /** Deterministic key so retries never create a second refund. */
+  idempotency_key: string;
+  amount_minor: number;
+  currency: string;
+  state: RefundState;
+  /** Snapshot the refund was calculated from. */
+  policy_snapshot?: RefundPolicySnapshot | null;
+  /** Escrow / destination reference preserved across retries. */
+  destination_ref?: string | null;
+  provider_ref?: string | null;
+  last_error?: string | null;
   created_at?: string;
   updated_at?: string;
 }
@@ -182,6 +230,83 @@ async function fetchStellarAddress(userId: string): Promise<string | null> {
     .eq('id', userId)
     .single();
   return (data as { stellar_address?: string } | null)?.stellar_address ?? null;
+}
+
+/**
+ * Verify the client's total against a fresh server-side quote and, when a quote
+ * token is supplied, against the exact quote the payment was authorised for.
+ * Returns the canonical server total plus the quote binding (version/currency).
+ */
+async function assertQuotedTotal(input: {
+  propertyId: string;
+  checkIn: string;
+  checkOut: string;
+  clientTotal: number;
+  quoteToken?: string;
+}): Promise<
+  ServiceResponse<{ total: number; currency: string; quoteVersion?: string }>
+> {
+  const priceResult = await calculateRangePrice(input.propertyId, input.checkIn, input.checkOut);
+  if (!priceResult.success || !priceResult.data) {
+    return { success: false, error: priceResult.error ?? 'Failed to price the stay' };
+  }
+
+  const currency = priceResult.data.currency ?? 'USDC';
+  const serverMinor = toMinorUnits(priceResult.data.total, currency);
+  const clientMinor = toMinorUnits(input.clientTotal, currency);
+  if (serverMinor === null || clientMinor === null) {
+    return {
+      success: false,
+      error: 'Amount has unsupported precision for the quote currency',
+      statusCode: 422,
+      code: 'AMOUNT_PRECISION',
+    };
+  }
+
+  if (serverMinor !== clientMinor) {
+    return {
+      success: false,
+      error: 'The quoted total no longer matches the current price. Please refresh the quote.',
+      statusCode: 409,
+      code: 'PRICE_MISMATCH',
+      conflict: true,
+      details: { server_total: priceResult.data.total, client_total: input.clientTotal },
+    };
+  }
+
+  let quoteVersion: string | undefined;
+  if (input.quoteToken) {
+    const verified = verifyQuoteToken(input.quoteToken);
+    if (!verified.success || !verified.data) {
+      return {
+        success: false,
+        error: verified.error ?? 'Invalid or expired quote',
+        statusCode: 409,
+        code: 'QUOTE_INVALID',
+      };
+    }
+    const quote = verified.data as QuoteTokenPayload;
+    if (quote.property_id !== input.propertyId) {
+      return {
+        success: false,
+        error: 'Quote does not match this property',
+        statusCode: 409,
+        code: 'QUOTE_MISMATCH',
+      };
+    }
+    if (quote.currency !== currency || quote.amount_minor !== serverMinor) {
+      return {
+        success: false,
+        error: 'Quote amount or currency does not match the current price',
+        statusCode: 409,
+        code: 'QUOTE_MISMATCH',
+        conflict: true,
+      };
+    }
+    quoteVersion = quote.version;
+  }
+
+  return { success: true, data: { total: priceResult.data.total, currency, quoteVersion } };
 }
 
 // ─── Service class ────────────────────────────────────────────────────────────
@@ -602,6 +727,18 @@ export class BookingService {
     }
     const chargedTotal = priceCheck.data.total;
 
+    // Canonical amount in integer minor units. Everything downstream (escrow,
+    // on-chain booking, refunds) is bound to this value, never to a float.
+    const chargedMinor = toMinorUnits(chargedTotal, priceCheck.data.currency);
+    if (chargedMinor === null) {
+      return {
+        success: false,
+        error: 'Booking total has unsupported precision for the quote currency',
+        statusCode: 422,
+        code: 'AMOUNT_PRECISION',
+      };
+    }
+
     // Capture the listing terms the tenant is agreeing to, at the same point the
     // price is confirmed. This is stored with the booking and never changes after.
     const termsSnapshot = await captureListingTermsSnapshot(property_id);
@@ -660,13 +797,22 @@ export class BookingService {
 
     const bookingId = reservedId as string;
 
-    // Store the agreed listing terms on the booking. The snapshot is immutable
-    // (see migration 00065), so this is the only write that sets it.
+    // Snapshot the refund policy that applies to this booking. Cancellation
+    // later executes against this snapshot, not whatever policy is live then.
+    const refundPolicySnapshot = getRefundPolicySnapshot();
+
+    // Store the agreed listing terms, refund policy snapshot, and the quote
+    // binding (version / amount / currency) on the booking. The snapshot is
+    // immutable (see migration 00065), so this is the only write that sets it.
     const { error: snapshotError } = await supabase
       .from('bookings')
       .update({
         listing_terms_snapshot: termsSnapshot.data.terms,
         listing_revision: termsSnapshot.data.revision,
+        refund_policy_snapshot: refundPolicySnapshot,
+        quote_version: priceCheck.data.quoteVersion ?? null,
+        quote_amount_minor: chargedMinor,
+        quote_currency: priceCheck.data.currency,
       })
       .eq('id', bookingId);
 
@@ -726,6 +872,8 @@ export class BookingService {
         buyerAddress: buyerStellarAddress,
         sellerAddress: ownerStellarAddress,
         amountUsdc: String(chargedTotal),
+        amountMinor: chargedMinor,
+        currency: priceCheck.data.currency,
         checkIn: check_in,
         checkOut: check_out,
       });
@@ -818,7 +966,7 @@ export class BookingService {
           buyerStellarAddress,
           checkInTs,
           checkOutTs,
-          BigInt(Math.round(chargedTotal * 1e7)),
+          BigInt(chargedMinor),
         );
 
         loggingService.logBlockchainOperation('createBookingOnChain', {
@@ -927,19 +1075,69 @@ export class BookingService {
       };
     }
 
-    // 4. Compute refund per the configured policy
+    // 4. Compute refund from the booking-time policy snapshot. If the booking
+    //    predates snapshots, fall back to the live policy but flag it so the
+    //    refund is routed to manual review rather than silently mispriced.
+    const policySnapshot = booking.refund_policy_snapshot ?? null;
     let refund;
     try {
-      refund = computeRefund({
-        totalPrice: booking.total_price ?? 0,
-        checkIn: booking.check_in,
-        cancelledAt: now,
-      });
+      refund = policySnapshot
+        ? computeRefundFromSnapshot(policySnapshot, {
+            totalPrice: booking.total_price ?? 0,
+            checkIn: booking.check_in,
+            cancelledAt: now,
+          })
+        : computeRefund({
+            totalPrice: booking.total_price ?? 0,
+            checkIn: booking.check_in,
+            cancelledAt: now,
+          });
     } catch (err) {
       return { success: false, error: `Cannot compute refund: ${String(err)}` };
     }
 
-    // 5. Drive the appropriate escrow action for the refund tier
+    // Refund amount in integer minor units, bound to the booking currency.
+    const currency = booking.quote_currency ?? 'USDC';
+    const refundMinor = toMinorUnits(refund.refundAmount, currency);
+    if (refundMinor === null) {
+      return {
+        success: false,
+        error: 'Refund amount has unsupported precision for the booking currency',
+        statusCode: 422,
+        code: 'AMOUNT_PRECISION',
+      };
+    }
+
+    // Refunds can never exceed the eligible (authorised) value.
+    const authorisedMinor = booking.quote_amount_minor ?? toMinorUnits(booking.total_price ?? 0, currency) ?? 0;
+    if (refundMinor > authorisedMinor) {
+      return {
+        success: false,
+        error: 'Refund exceeds the eligible booking value',
+        statusCode: 409,
+        code: 'REFUND_EXCEEDS_ELIGIBLE',
+      };
+    }
+
+    // 5. Create (or reuse) the idempotent refund request before touching escrow.
+    const idempotencyKey = `refund:${bookingId}`;
+    const refundRequest = await this.upsertRefundRequest({
+      bookingId,
+      idempotencyKey,
+      amountMinor: refundMinor,
+      currency,
+      policySnapshot,
+      destinationRef: booking.escrow_id ?? null,
+    });
+    if (!refundRequest.success || !refundRequest.data) {
+      return { success: false, error: refundRequest.error ?? 'Failed to create refund request' };
+    }
+
+    // 6. Drive the appropriate escrow action for the refund tier and record the
+    //    settlement state. A failed or pending refund is never reported as done.
+    let refundState: RefundState = 'requested';
+    let refundError: string | null = null;
+
     if (booking.escrow_id) {
       loggingService.logBlockchainOperation('cancelEscrowRefund', {
         bookingId,
@@ -949,18 +1147,22 @@ export class BookingService {
         refundAmount: refund.refundAmount,
       });
 
+      await this.updateRefundState(refundRequest.data.id, 'submitted');
+
       try {
         if (refund.tier === 'full') {
           // Full refund: return the entire escrow to the tenant.
           await trustlessWorkClient.cancelEscrow(booking.escrow_id);
+          refundState = 'confirmed';
         } else {
           // Partial or no refund: release the escrow to the host. For a partial
           // refund the host is then responsible for returning the tenant's
-          // refund_amount (recorded on the booking below).
+          // refund_amount, so it stays in manual review until settled.
           await trustlessWorkClient.releaseEscrow(
             booking.escrow_id,
             `Booking cancelled — refund ${refund.refundAmount} (tier: ${refund.tier})`,
           );
+          refundState = refund.tier === 'partial' ? 'manual_review' : 'confirmed';
         }
       } catch (err) {
         loggingService.logBlockchainOperation(
@@ -969,14 +1171,19 @@ export class BookingService {
           undefined,
           String(err),
         );
-        return {
-          success: false,
-          error: `Failed to settle escrow: ${String(err)}`,
-        };
+        refundError = String(err);
+        refundState = 'failed';
       }
+    } else if (refundMinor > 0) {
+      // No escrow to settle from — a human must reconcile this refund.
+      refundState = 'manual_review';
+    } else {
+      refundState = 'confirmed';
     }
 
-    // 6. Persist the cancellation + refund outcome via the state machine.
+    await this.updateRefundState(refundRequest.data.id, refundState, refundError);
+
+    // 7. Persist the cancellation + refund outcome via the state machine.
     const cancelledAt = now.toISOString();
     const transitionResult = await this.transitionStatus(
       bookingId,
@@ -989,18 +1196,23 @@ export class BookingService {
         refund_amount: refund.refundAmount,
         refund_tier: refund.tier,
         refund_policy_pct: refund.refundPct,
+        refund_state: refundState,
+        refund_request_id: refundRequest.data.id,
       },
     );
 
     if (!transitionResult.success) return transitionResult;
     const updatedData = transitionResult.data!
 
-    // 7. Notify both parties
+    // 8. Notify both parties with the accurate refund state. Pending, failed,
+    //    and manual-review refunds are described as such — never as complete.
     const notificationData = {
       booking_id: bookingId,
       refund_amount: refund.refundAmount,
       refund_tier: refund.tier,
       refund_policy_pct: refund.refundPct,
+      refund_state: refundState,
+      refund_complete: refundState === 'confirmed',
     };
 
     if (booking.tenant_id) {
@@ -1010,7 +1222,7 @@ export class BookingService {
       createNotification(hostId, 'booking_cancelled', notificationData).catch(() => {});
     }
 
-    // 8. Update on-chain status (non-fatal)
+    // 9. Update on-chain status (non-fatal)
     if (booking.on_chain_id !== undefined && booking.on_chain_id !== null) {
       const callerAddress = await fetchStellarAddress(userId);
 
@@ -1038,6 +1250,85 @@ export class BookingService {
     }
 
     return { success: true, data: updatedData };
+  }
+
+  // ── Refund requests ────────────────────────────────────────────────────────
+
+  /**
+   * Create or reuse the refund request for a booking. The idempotency key makes
+   * retries safe: a second call returns the existing row instead of creating a
+   * duplicate refund.
+   */
+  private async upsertRefundRequest(input: {
+    bookingId: string;
+    idempotencyKey: string;
+    amountMinor: number;
+    currency: string;
+    policySnapshot: RefundPolicySnapshot | null;
+    destinationRef: string | null;
+  }): Promise<ServiceResponse<RefundRequest>> {
+    const { data: existing, error: existingError } = await supabase
+      .from('refund_requests')
+      .select('*')
+      .eq('idempotency_key', input.idempotencyKey)
+      .maybeSingle();
+
+    if (existingError) {
+      return { success: false, error: existingError.message };
+    }
+    if (existing) {
+      return { success: true, data: existing as RefundRequest };
+    }
+
+    const { data, error } = await supabase
+      .from('refund_requests')
+      .insert({
+        booking_id: input.bookingId,
+        idempotency_key: input.idempotencyKey,
+        amount_minor: input.amountMinor,
+        currency: input.currency,
+        state: 'requested',
+        policy_snapshot: input.policySnapshot,
+        destination_ref: input.destinationRef,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      // A concurrent insert may have won the race; re-read by idempotency key.
+      const { data: raced } = await supabase
+        .from('refund_requests')
+        .select('*')
+        .eq('idempotency_key', input.idempotencyKey)
+        .maybeSingle();
+      if (raced) return { success: true, data: raced as RefundRequest };
+      return { success: false, error: error.message };
+    }
+
+    return { success: true, data: data as RefundRequest };
+  }
+
+  /**
+   * Advance a refund request's settlement state. Best-effort: a failure here is
+   * logged but never masks the refund outcome already recorded on the booking.
+   */
+  private async updateRefundState(
+    refundRequestId: string,
+    state: RefundState,
+    lastError?: string | null,
+  ): Promise<void> {
+    const { error } = await supabase
+      .from('refund_requests')
+      .update({
+        state,
+        last_error: lastError ?? null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', refundRequestId);
+
+    if (error) {
+      console.warn('[BookingService] Refund state update failed:', error.message);
+    }
   }
 
   // ── Confirm ────────────────────────────────────────────────────────────────
@@ -1916,15 +2207,24 @@ export class BookingService {
       return { success: false, error: priceResult.error ?? 'Failed to recompute price' };
     }
 
-    const newTotalPrice = Math.round(priceResult.data!.total * 100) / 100;
+    const currency = booking.quote_currency ?? 'USDC';
+    const newTotalMinor = toMinorUnits(priceResult.data!.total, currency);
+    if (newTotalMinor === null) {
+      return { success: false, error: 'Repriced total has unsupported precision for the booking currency' };
+    }
+    const newTotalPrice = newTotalMinor / 100;
     const originalPrice = modification.original_total_price ?? booking.total_price ?? 0;
-    const priceDelta = Math.round((newTotalPrice - originalPrice) * 100) / 100;
-    const requiresAdditionalPayment = priceDelta > 0;
+    const originalMinor = toMinorUnits(originalPrice, currency) ?? 0;
+    const priceDeltaMinor = newTotalMinor - originalMinor;
+    const priceDelta = priceDeltaMinor / 100;
+    const requiresAdditionalPayment = priceDeltaMinor > 0;
 
     const bookingPatch: Record<string, unknown> = {
       check_in:    modification.requested_start,
       check_out:   modification.requested_end,
       total_price: newTotalPrice,
+      quote_amount_minor: newTotalMinor,
+      quote_currency: currency,
       updated_at:  new Date().toISOString(),
     };
 
@@ -1966,6 +2266,7 @@ export class BookingService {
         new_total_price: newTotalPrice,
         price_delta: priceDelta,
         requires_additional_payment: requiresAdditionalPayment,
+        currency,
       }).catch(() => {});
     }
 

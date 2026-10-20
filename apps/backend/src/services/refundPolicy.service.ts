@@ -26,6 +26,20 @@ export interface RefundPolicyConfig {
   partialRefundPct: number;
 }
 
+/**
+ * The refund terms captured at booking time. Refund execution must always be
+ * reconciled against this snapshot — never against the currently active policy —
+ * so that later policy changes cannot retroactively alter a guest's entitlement.
+ */
+export interface RefundPolicySnapshot {
+  /** Identifier of the policy version that was active when the booking was made. */
+  policyId: string;
+  /** The tier thresholds and percentages that applied at booking time. */
+  config: RefundPolicyConfig;
+  /** ISO timestamp of when the snapshot was captured. */
+  capturedAt: string;
+}
+
 export interface RefundComputation {
   /** Which tier the cancellation fell into. */
   tier: RefundTierId;
@@ -39,6 +53,148 @@ export interface RefundComputation {
   hoursUntilCheckIn: number;
   /** The policy configuration that produced this result. */
   policy: RefundPolicyConfig;
+}
+
+/**
+ * Result of computing refund eligibility from a booking-time policy snapshot.
+ * All monetary values are integer minor units (e.g. cents) to avoid floating
+ * point drift between calculation, persistence, and provider submission.
+ */
+export interface RefundCalculation {
+  /** Which tier the cancellation fell into. */
+  tier: RefundTierId;
+  /** Refund fraction applied (0..1). */
+  refundPct: number;
+  /** Refund amount in integer minor units, capped at the eligible value. */
+  refundAmountMinor: number;
+  /** Maximum refundable amount in integer minor units (the eligible value). */
+  eligibleAmountMinor: number;
+  /** Booking total in integer minor units that the refund was computed against. */
+  totalAmountMinor: number;
+  /** ISO 4217 currency code of the booking. */
+  currency: string;
+  /** Reference to the policy snapshot used for the calculation. */
+  policySnapshot: RefundPolicySnapshot;
+  /** Hours between the cancellation time and the check-in time (can be negative). */
+  hoursUntilCheckIn: number;
+}
+
+/** Minimal booking shape needed to compute a refund from the snapshot. */
+export interface RefundableBooking {
+  id: string;
+  /** Canonical check-in timestamp (ISO string or Date). */
+  checkIn: string | Date;
+  /** Booking total in integer minor units. */
+  totalAmountMinor: number;
+  /** ISO 4217 currency code. */
+  currency: string;
+  /** Policy snapshot captured at booking time. */
+  refundPolicySnapshot: RefundPolicySnapshot;
+}
+
+/**
+ * Loads a booking for refund calculation. Injected so the pure calculation can
+ * be reused by the cancellation preview endpoint, the refund executor, and
+ * tests without coupling to a specific persistence layer.
+ */
+export type RefundableBookingLoader = (bookingId: string) => Promise<RefundableBooking | null>;
+======
+
+<<<<<<< SEARCH
+function round2(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+=======
+function round2(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
+function assertMinorUnits(value: number, label: string): void {
+  if (!Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
+    throw new Error(`${label} must be a non-negative integer in minor units`);
+  }
+}
+
+function toDate(value: string | Date, label: string): Date {
+  const date = value instanceof Date ? value : new Date(value);
+  if (isNaN(date.getTime())) {
+    throw new Error(`${label} must be a valid date`);
+  }
+  return date;
+}
+
+/**
+ * Compute refund eligibility from the booking-time policy snapshot using
+ * canonical timestamps and integer minor units.
+ *
+ * The refund amount is always capped at the eligible value so that rounding or
+ * a misconfigured snapshot can never produce a refund larger than the booking
+ * total or larger than the tier entitlement.
+ *
+ * @param params.booking      - Booking with its captured policy snapshot.
+ * @param params.cancelledAt  - Canonical cancellation timestamp (default: now).
+ *
+ * @throws Error if the booking is missing a snapshot, amounts are not integer
+ *         minor units, or timestamps are invalid.
+ */
+export function computeRefundFromSnapshot(params: {
+  booking: RefundableBooking;
+  cancelledAt?: Date | string;
+}): RefundCalculation {
+  const { booking, cancelledAt } = params;
+
+  if (!booking.refundPolicySnapshot || !booking.refundPolicySnapshot.config) {
+    throw new Error('booking is missing a refund policy snapshot');
+  }
+
+  assertMinorUnits(booking.totalAmountMinor, 'totalAmountMinor');
+  if (typeof booking.currency !== 'string' || booking.currency.trim() === '') {
+    throw new Error('currency is required');
+  }
+
+  const checkInDate = toDate(booking.checkIn, 'checkIn');
+  const cancelDate = toDate(cancelledAt ?? new Date(), 'cancelledAt');
+
+  const policy = booking.refundPolicySnapshot.config;
+  const hoursUntilCheckIn = (checkInDate.getTime() - cancelDate.getTime()) / (1000 * 60 * 60);
+  const tier = resolveRefundTier(hoursUntilCheckIn, policy);
+
+  const refundPct = tier === 'full' ? 1 : tier === 'partial' ? policy.partialRefundPct : 0;
+
+  // Eligible value is the booking total; the tier entitlement is a fraction of it.
+  const eligibleAmountMinor = booking.totalAmountMinor;
+  const rawRefundMinor = Math.round(eligibleAmountMinor * refundPct);
+  const refundAmountMinor = Math.min(Math.max(rawRefundMinor, 0), eligibleAmountMinor);
+
+  return {
+    tier,
+    refundPct,
+    refundAmountMinor,
+    eligibleAmountMinor,
+    totalAmountMinor: booking.totalAmountMinor,
+    currency: booking.currency,
+    policySnapshot: booking.refundPolicySnapshot,
+    hoursUntilCheckIn,
+  };
+}
+
+/**
+ * Preview the refund a guest would receive if they cancelled now (or at the
+ * supplied time). Used by the cancellation preview endpoint so users see the
+ * calculation before confirming cancellation.
+ *
+ * @throws Error if the booking cannot be found.
+ */
+export async function previewRefund(
+  bookingId: string,
+  cancelledAt: Date | string | undefined,
+  loadBooking: RefundableBookingLoader,
+): Promise<RefundCalculation> {
+  const booking = await loadBooking(bookingId);
+  if (!booking) {
+    throw new Error(`booking ${bookingId} not found`);
+  }
+  return computeRefundFromSnapshot({ booking, cancelledAt });
 }
 
 const DEFAULT_REFUND_POLICY: RefundPolicyConfig = {

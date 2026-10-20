@@ -35,9 +35,62 @@ export const MAX_USDC_AMOUNT = 1_000_000n * STROOPS_PER_USDC;
 /** Minimum accepted USDC amount: 0.01 USDC. */
 export const MIN_USDC_AMOUNT = 1_000n; // 0.0001 USDC actually; practical min
 
+// ─── Currency registry ────────────────────────────────────────────────────────
+
+/**
+ * Canonical token unit definition for a supported currency.
+ *
+ * `decimals` is the number of fractional digits the token supports on-chain;
+ * `minorUnitsPerUnit` is 10^decimals expressed as a BigInt so all arithmetic
+ * stays in integer space.
+ */
+export interface CurrencyDefinition {
+  /** Token symbol (e.g. 'USDC'). */
+  readonly code: string;
+  /** Number of fractional decimal places supported by the token. */
+  readonly decimals: number;
+  /** 10^decimals — the number of minor units in one whole token. */
+  readonly minorUnitsPerUnit: bigint;
+}
+
+function defineCurrency(code: string, decimals: number): CurrencyDefinition {
+  return {
+    code,
+    decimals,
+    minorUnitsPerUnit: 10n ** BigInt(decimals),
+  };
+}
+
+/**
+ * Registry of supported currencies. Add new tokens here when expanding.
+ * Only USDC (7 decimals / stroops) is supported at present.
+ */
+export const CURRENCY_REGISTRY = {
+  USDC: defineCurrency('USDC', 7),
+} as const satisfies Record<string, CurrencyDefinition>;
+
 /** Supported currency tokens. Add new tokens here when expanding. */
-export const SUPPORTED_CURRENCIES = ['USDC'] as const;
-export type SupportedCurrency = (typeof SUPPORTED_CURRENCIES)[number];
+export const SUPPORTED_CURRENCIES = Object.keys(CURRENCY_REGISTRY) as Array<
+  keyof typeof CURRENCY_REGISTRY
+>;
+export type SupportedCurrency = keyof typeof CURRENCY_REGISTRY;
+
+/**
+ * Look up the canonical definition for a currency, throwing on unsupported
+ * tokens. Unsupported currencies must fail before any signing occurs.
+ */
+export function getCurrencyDefinition(currency: string): CurrencyDefinition {
+  const def = (CURRENCY_REGISTRY as Record<string, CurrencyDefinition>)[currency];
+  if (!def) {
+    throw new RangeError(`Unsupported currency: "${currency}"`);
+  }
+  return def;
+}
+
+/** Type guard: is the given value a supported currency code? */
+export function isSupportedCurrency(value: unknown): value is SupportedCurrency {
+  return typeof value === 'string' && value in CURRENCY_REGISTRY;
+}
 
 // ─── Zod schemas ──────────────────────────────────────────────────────────────
 
@@ -61,7 +114,9 @@ export const stroopsSchema = z
 /**
  * Schema for currency fields.  Rejects unsupported tokens immediately.
  */
-export const currencySchema = z.enum(SUPPORTED_CURRENCIES);
+export const currencySchema = z.enum(
+  SUPPORTED_CURRENCIES as [SupportedCurrency, ...SupportedCurrency[]],
+);
 
 /**
  * Full payment amount input schema used on submit endpoints.
@@ -71,6 +126,116 @@ export const paymentAmountSchema = z.object({
   amountStroops: stroopsSchema,
   currency: currencySchema,
 });
+
+// ─── Precision / minor-unit helpers ──────────────────────────────────────────
+
+/**
+ * Assert that a decimal string does not exceed the currency's supported
+ * precision. Throws a RangeError on excessive precision.
+ *
+ * @example
+ *   assertPrecision('1.1234567', 'USDC')  // ok
+ *   assertPrecision('1.12345678', 'USDC') // throws
+ */
+export function assertPrecision(amount: string, currency: SupportedCurrency): void {
+  const def = getCurrencyDefinition(currency);
+  if (typeof amount !== 'string' || !/^\d+(\.\d+)?$/.test(amount)) {
+    throw new RangeError(`Invalid ${currency} amount: "${String(amount)}"`);
+  }
+  const [, fracPart = ''] = amount.split('.');
+  if (fracPart.length > def.decimals) {
+    throw new RangeError(
+      `${currency} amount "${amount}" has more than ${def.decimals} decimal places`,
+    );
+  }
+}
+
+/**
+ * Convert a decimal amount string to integer minor units for the given
+ * currency. Rejects floats, negative values, and excessive precision.
+ *
+ * @example
+ *   toMinorUnits('1.5', 'USDC')  // 15_000_000n
+ */
+export function toMinorUnits(amount: string, currency: SupportedCurrency): bigint {
+  const def = getCurrencyDefinition(currency);
+  assertPrecision(amount, currency);
+  const [intPart, fracPart = ''] = amount.split('.');
+  const paddedFrac = fracPart.padEnd(def.decimals, '0');
+  return BigInt(intPart) * def.minorUnitsPerUnit + BigInt(paddedFrac || '0');
+}
+
+/**
+ * Convert integer minor units back to a decimal string for the given currency.
+ * Trailing fractional zeros are trimmed; whole amounts render without a dot.
+ *
+ * @example
+ *   fromMinorUnits(15_000_000n, 'USDC')  // '1.5'
+ */
+export function fromMinorUnits(minor: bigint, currency: SupportedCurrency): string {
+  const def = getCurrencyDefinition(currency);
+  if (minor < 0n) {
+    throw new RangeError(`Amount must be non-negative, got ${minor.toString()}`);
+  }
+  const intPart = minor / def.minorUnitsPerUnit;
+  const fracPart = minor % def.minorUnitsPerUnit;
+  if (fracPart === 0n) return intPart.toString();
+  const fracStr = fracPart.toString().padStart(def.decimals, '0').replace(/0+$/, '');
+  return `${intPart.toString()}.${fracStr}`;
+}
+
+// ─── Server-side totals ──────────────────────────────────────────────────────
+
+export interface ComputeTotalsInput {
+  /** Nightly rate in minor units (integer). */
+  nightlyRateMinor: bigint;
+  /** Number of nights (integer). */
+  nights: number;
+  /** Platform fee in basis points (1 bps = 0.01%). */
+  feeBps: number;
+}
+
+export interface ComputeTotalsResult {
+  /** Subtotal (nightlyRateMinor * nights) in minor units. */
+  subtotalMinor: bigint;
+  /** Fee amount in minor units, rounded half-up. */
+  feeMinor: bigint;
+  /** Total (subtotal + fee) in minor units. */
+  totalMinor: bigint;
+}
+
+/**
+ * Compute booking totals server-side using BigInt only. Never trust
+ * client-supplied totals. Fees are rounded half-up to the nearest minor unit.
+ *
+ * @throws RangeError on negative inputs or non-integer nights/feeBps.
+ */
+export function computeTotalsServerSide(input: ComputeTotalsInput): ComputeTotalsResult {
+  const { nightlyRateMinor, nights, feeBps } = input;
+
+  if (typeof nightlyRateMinor !== 'bigint' || nightlyRateMinor < 0n) {
+    throw new RangeError('nightlyRateMinor must be a non-negative BigInt');
+  }
+  if (!Number.isInteger(nights) || nights < 0) {
+    throw new RangeError('nights must be a non-negative integer');
+  }
+  if (!Number.isInteger(feeBps) || feeBps < 0) {
+    throw new RangeError('feeBps must be a non-negative integer');
+  }
+
+  const subtotalMinor = nightlyRateMinor * BigInt(nights);
+
+  // fee = subtotal * feeBps / 10_000, rounded half-up
+  const numerator = subtotalMinor * BigInt(feeBps);
+  const denominator = 10_000n;
+  const feeMinor = (numerator + denominator / 2n) / denominator;
+
+  return {
+    subtotalMinor,
+    feeMinor,
+    totalMinor: subtotalMinor + feeMinor,
+  };
+}
 
 // ─── Conversion utilities ─────────────────────────────────────────────────────
 
@@ -139,6 +304,25 @@ export function buildAmountBreakdown(
     amountDisplay: `${stroopsToUsdc(amountStroops)} ${currency}`,
     currency,
   };
+}
+
+// ─── Quote binding ────────────────────────────────────────────────────────────
+
+/**
+ * Version of the quote format. Bump when the signed payload changes so
+ * stale quotes are rejected rather than silently accepted.
+ */
+export const QUOTE_VERSION = 1;
+
+/**
+ * A quote binding ties a payment authorization to the exact server-computed
+ * amount, currency, and quote version. The hash is verified before signing.
+ */
+export interface QuoteBinding {
+  quote_version: number;
+  amount_minor: bigint;
+  currency: SupportedCurrency;
+  hash: string;
 }
 
 // ─── Quote hash ───────────────────────────────────────────────────────────────
@@ -213,6 +397,33 @@ export function verifyQuote(
 export type AmountReconciliationResult =
   | { match: true }
   | { match: false; expected: bigint; actual: bigint; diff: bigint };
+
+export type SettledAmountComparison =
+  | { status: 'ok' }
+  | { status: 'mismatch'; quoteMinor: bigint; settledMinor: bigint; diff: bigint };
+
+/**
+ * Compare the quoted amount against the amount settled on-chain.
+ * A `mismatch` must route the payment into review and must NOT mark the
+ * booking paid.
+ *
+ * @param quoteMinor   - Amount bound to the signed quote (minor units).
+ * @param settledMinor - Amount observed on-chain (minor units).
+ */
+export function compareSettledAmount(
+  quoteMinor: bigint,
+  settledMinor: bigint,
+): SettledAmountComparison {
+  if (quoteMinor === settledMinor) {
+    return { status: 'ok' };
+  }
+  return {
+    status: 'mismatch',
+    quoteMinor,
+    settledMinor,
+    diff: settledMinor - quoteMinor,
+  };
+}
 
 /**
  * Compare the amount recorded in the DB against the amount observed on-chain.

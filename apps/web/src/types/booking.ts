@@ -34,6 +34,32 @@ export const TENANT_TRANSITIONS: Record<string, ('confirm' | 'complete' | 'cance
 
 // ─── Core types ───────────────────────────────────────────────────────────────
 
+/**
+ * Lifecycle of a refund request.
+ *
+ * A refund is only ever described as complete when it reaches `confirmed`;
+ * `requested`, `submitted`, `failed`, and `manual_review` must never be
+ * presented to users as a finished refund.
+ */
+export type RefundState =
+  | 'requested'
+  | 'submitted'
+  | 'confirmed'
+  | 'failed'
+  | 'manual_review';
+
+/** Server-computed refund breakdown shown to the user before cancelling. */
+export interface RefundCalculation {
+  /** Policy tier applied (e.g. 'flexible', 'moderate', 'strict'). */
+  tier: string;
+  /** Percentage of the eligible value refunded (0–100). */
+  refundPct: number;
+  /** Refund amount in integer minor units of `currency`. */
+  refundAmountMinor: number;
+  /** ISO 4217 currency code (or canonical token unit). */
+  currency: string;
+}
+
 export interface Booking {
   id: string;
   property_id: string;
@@ -50,6 +76,20 @@ export interface Booking {
   dispute_reason?: string | null;
   created_at: string;
   updated_at?: string;
+  /** Version of the quote the payment authorization is bound to. */
+  quote_version?: number;
+  /** Authorized amount in integer minor units of `quote_currency`. */
+  quote_amount_minor?: number;
+  /** Canonical currency code for the quote. */
+  quote_currency?: string;
+  /** Whether the settled on-chain amount matched the quote exactly. */
+  settlement_verified?: boolean;
+  /** Reconciliation outcome for the settled payment. */
+  reconciliation_state?: 'pending' | 'matched' | 'mismatch' | 'manual_review';
+  /** Current state of the refund request, if any. */
+  refund_request_state?: RefundState;
+  /** Booking-time refund calculation snapshot. */
+  refund_calculation?: RefundCalculation;
 }
 
 export interface BookingFormData {

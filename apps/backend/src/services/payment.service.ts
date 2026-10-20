@@ -40,6 +40,13 @@ import { createHash } from 'node:crypto';
 import { supabase } from '@/config/supabase.js';
 import { auditLogger } from './auditLogger.service.js';
 import type { ServiceResponse } from './index.js';
+import {
+  SUPPORTED_CURRENCIES,
+  type SupportedCurrency,
+  type QuoteBinding,
+  verifyQuoteBinding,
+  assertSupportedCurrency,
+} from './payment.utils.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -89,8 +96,12 @@ export interface Payment {
   tenant_id: string;
   /** Amount in USDC stroops (integer, 1 USDC = 10_000_000 stroops). */
   amount_stroops: bigint;
+  /** Canonical amount in token minor units (integer). */
+  amount_minor: bigint;
   /** Supported currency token — currently only USDC. */
-  currency: 'USDC';
+  currency: SupportedCurrency;
+  /** Version of the quote the authorized amount was bound to. */
+  quote_version: number | null;
   stellar_tx_hash: string | null;
   /** TrustlessWork escrow contract ID, if applicable. */
   escrow_id: string | null;
@@ -111,8 +122,11 @@ export interface CreatePaymentIntentParams {
   tenantId: string;
   /** Amount in USDC stroops (integer). Use amountUsdcToStroops() to convert. */
   amountStroops: bigint;
-  /** Quote hash produced by payment.utils.ts#hashQuote() and verified server-side. */
-  quoteHash?: string;
+  /**
+   * Verified quote binding produced by payment.utils.ts#verifyQuoteBinding().
+   * Required: the authorized amount must be bound to a server-computed quote.
+   */
+  quote: QuoteBinding;
   escrowId?: string;
   metadata?: Record<string, unknown>;
 }
@@ -121,6 +135,52 @@ export interface TransitionResult {
   payment: Payment;
   /** True when the event was a duplicate (same hash) — no side-effects applied. */
   replayed: boolean;
+}
+
+export type RefundState =
+  | 'requested'
+  | 'submitted'
+  | 'confirmed'
+  | 'failed'
+  | 'manual_review';
+
+const ALLOWED_REFUND_TRANSITIONS: Readonly<Record<RefundState, ReadonlyArray<RefundState>>> = {
+  requested:     ['submitted', 'failed', 'manual_review'],
+  submitted:     ['confirmed', 'failed', 'manual_review'],
+  confirmed:     [],                        // terminal
+  failed:        ['submitted', 'manual_review'], // retryable
+  manual_review: ['submitted', 'failed'],   // admin-only resolution
+};
+
+export interface RefundRequest {
+  id: string;
+  payment_id: string;
+  booking_id: string;
+  /** Amount in token minor units (integer). */
+  amount_minor: bigint;
+  currency: SupportedCurrency;
+  state: RefundState;
+  /** Unique key guaranteeing at-most-once refund creation. */
+  idempotency_key: string;
+  /** Opaque provider destination reference preserved across retries. */
+  destination_ref: string | null;
+  provider_ref: string | null;
+  last_event_hash: string | null;
+  created_at: string;
+  updated_at: string;
+  metadata: Record<string, unknown> | null;
+}
+
+export interface CreateRefundRequestParams {
+  paymentId: string;
+  bookingId: string;
+  /** Amount in token minor units (integer). Must not exceed eligible value. */
+  amountMinor: bigint;
+  currency: SupportedCurrency;
+  /** Caller-supplied idempotency key (e.g. derived from cancellation id). */
+  idempotencyKey: string;
+  destinationRef?: string;
+  metadata?: Record<string, unknown>;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -160,7 +220,19 @@ export function mapProviderStatus(raw: string): PaymentStatus {
 export async function createPaymentIntent(
   params: CreatePaymentIntentParams,
 ): Promise<Payment> {
-  const { bookingId, tenantId, amountStroops, quoteHash, escrowId, metadata } = params;
+  const { bookingId, tenantId, amountStroops, quote, escrowId, metadata } = params;
+
+  // ── Reject unsupported currency / precision before any signing ────────────
+  assertSupportedCurrency(quote.currency);
+
+  // ── Bind the authorized amount to the verified quote ──────────────────────
+  const binding = verifyQuoteBinding(quote, {
+    amountMinor: amountStroops,
+    currency: quote.currency,
+  });
+  if (!binding.ok) {
+    throw new Error(`Payment intent rejected: ${binding.reason}`);
+  }
 
   const { data, error } = await supabase
     .from('payments')
@@ -168,10 +240,12 @@ export async function createPaymentIntent(
       booking_id: bookingId,
       tenant_id: tenantId,
       amount_stroops: amountStroops.toString(), // stored as text to avoid JS bigint loss
-      currency: 'USDC',
+      amount_minor: quote.amountMinor.toString(),
+      currency: quote.currency,
+      quote_version: quote.version,
       status: 'pending',
       escrow_id: escrowId ?? null,
-      quote_hash: quoteHash ?? null,
+      quote_hash: quote.quoteHash,
       version: 1,
       last_event_hash: null,
       metadata: metadata ?? null,
@@ -190,10 +264,274 @@ export async function createPaymentIntent(
     action: 'payment.submit',
     resourceType: 'payment',
     resourceId: payment.id,
-    meta: { bookingId, amountStroops: amountStroops.toString() },
+    meta: {
+      bookingId,
+      amountStroops: amountStroops.toString(),
+      currency: quote.currency,
+      quoteVersion: quote.version,
+      quoteHash: quote.quoteHash,
+    },
   });
 
   return payment;
+}
+
+/**
+ * Compare the settled on-chain amount against the authorized quote amount.
+ *
+ * On exact match the payment is confirmed. On any mismatch (amount, currency,
+ * or quote version) the payment is quarantined to `under_review` and can never
+ * be marked paid.
+ *
+ * @param paymentId    - UUID of the payment to verify.
+ * @param settledMinor - Amount actually settled on-chain, in token minor units.
+ * @param settledCurrency - Currency of the settled transfer (defaults to quote).
+ */
+export async function markSettlementVerified(
+  paymentId: string,
+  settledMinor: bigint,
+  settledCurrency?: SupportedCurrency,
+): Promise<ServiceResponse<TransitionResult>> {
+  const payment = await getPaymentStatus(paymentId);
+  if (!payment) {
+    return { success: false, error: 'Payment not found' };
+  }
+
+  const expectedMinor = payment.amount_minor;
+  const expectedCurrency = payment.currency;
+  const actualCurrency = settledCurrency ?? expectedCurrency;
+
+  const mismatch =
+    settledMinor !== expectedMinor || actualCurrency !== expectedCurrency;
+
+  if (mismatch) {
+    const reason =
+      `Settlement mismatch: expected ${expectedMinor.toString()} ${expectedCurrency}, ` +
+      `settled ${settledMinor.toString()} ${actualCurrency}`;
+
+    const result = await transitionPaymentStatus(
+      paymentId,
+      'under_review',
+      {
+        _source: 'settlement_verification',
+        settledMinor: settledMinor.toString(),
+        settledCurrency: actualCurrency,
+        expectedMinor: expectedMinor.toString(),
+        expectedCurrency,
+        reason,
+      },
+      null,
+    );
+
+    if (result.success && result.data) {
+      await auditLogger.log({
+        action: 'payment.failed',
+        resourceType: 'payment',
+        resourceId: paymentId,
+        meta: { reason, settledMinor: settledMinor.toString(), expectedMinor: expectedMinor.toString() },
+      });
+    }
+
+    return result;
+  }
+
+  return transitionPaymentStatus(
+    paymentId,
+    'confirmed',
+    {
+      _source: 'settlement_verification',
+      settledMinor: settledMinor.toString(),
+      settledCurrency: actualCurrency,
+    },
+    null,
+  );
+}
+
+/**
+ * Create an idempotent refund request in `requested` state.
+ *
+ * The `idempotencyKey` is unique: repeated calls with the same key return the
+ * existing request without creating a duplicate or re-applying side-effects.
+ *
+ * @throws On unsupported currency, excessive precision, or database error.
+ */
+export async function createRefundRequest(
+  params: CreateRefundRequestParams,
+): Promise<RefundRequest> {
+  const {
+    paymentId,
+    bookingId,
+    amountMinor,
+    currency,
+    idempotencyKey,
+    destinationRef,
+    metadata,
+  } = params;
+
+  assertSupportedCurrency(currency);
+  if (amountMinor <= 0n) {
+    throw new Error('Refund amount must be positive');
+  }
+
+  // ── Idempotency: return existing request for the same key ─────────────────
+  const { data: existing } = await supabase
+    .from('refund_requests')
+    .select()
+    .eq('idempotency_key', idempotencyKey)
+    .maybeSingle();
+
+  if (existing) {
+    return rowToRefundRequest(existing);
+  }
+
+  const { data, error } = await supabase
+    .from('refund_requests')
+    .insert({
+      payment_id: paymentId,
+      booking_id: bookingId,
+      amount_minor: amountMinor.toString(),
+      currency,
+      state: 'requested',
+      idempotency_key: idempotencyKey,
+      destination_ref: destinationRef ?? null,
+      provider_ref: null,
+      last_event_hash: null,
+      metadata: metadata ?? null,
+    })
+    .select()
+    .single();
+
+  if (error || !data) {
+    // Unique-constraint race: another process inserted the same key first.
+    if (error?.code === '23505') {
+      const { data: raced } = await supabase
+        .from('refund_requests')
+        .select()
+        .eq('idempotency_key', idempotencyKey)
+        .single();
+      if (raced) return rowToRefundRequest(raced);
+    }
+    throw new Error(`Failed to create refund request: ${error?.message ?? 'unknown error'}`);
+  }
+
+  const refund = rowToRefundRequest(data);
+
+  await auditLogger.log({
+    action: 'payment.submit',
+    resourceType: 'payment',
+    resourceId: paymentId,
+    meta: {
+      refundRequestId: refund.id,
+      amountMinor: amountMinor.toString(),
+      currency,
+      idempotencyKey,
+    },
+  });
+
+  return refund;
+}
+
+/**
+ * Advance a refund request through its state machine with idempotency.
+ *
+ * @param refundId     - UUID of the refund request.
+ * @param newState     - Target refund state.
+ * @param eventPayload - Raw event data (used for duplicate detection).
+ * @param providerRef  - Optional provider reference to record.
+ * @param destinationRef - Optional destination reference to preserve.
+ */
+export async function transitionRefundState(
+  refundId: string,
+  newState: RefundState,
+  eventPayload: Record<string, unknown>,
+  providerRef?: string | null,
+  destinationRef?: string | null,
+): Promise<ServiceResponse<RefundRequest>> {
+  const { data: row } = await supabase
+    .from('refund_requests')
+    .select()
+    .eq('id', refundId)
+    .single();
+
+  if (!row) {
+    return { success: false, error: 'Refund request not found' };
+  }
+
+  const refund = rowToRefundRequest(row);
+  const eventHash = hashEventPayload(eventPayload);
+
+  // ── Idempotency: same event hash → replay without side-effects ────────────
+  if (refund.last_event_hash === eventHash) {
+    return { success: true, data: refund };
+  }
+
+  // ── Validate transition ────────────────────────────────────────────────────
+  let targetState: RefundState = newState;
+  let quarantineReason: string | undefined;
+
+  if (!ALLOWED_REFUND_TRANSITIONS[refund.state]?.includes(newState)) {
+    targetState = 'manual_review';
+    quarantineReason = `Disallowed refund transition: ${refund.state} → ${newState}`;
+  }
+
+  const updatePayload: Record<string, unknown> = {
+    state: targetState,
+    last_event_hash: eventHash,
+    updated_at: new Date().toISOString(),
+  };
+  if (providerRef !== undefined && providerRef !== null) {
+    updatePayload.provider_ref = providerRef;
+  }
+  // Preserve destination reference across retries; never overwrite with null.
+  if (destinationRef !== undefined && destinationRef !== null) {
+    updatePayload.destination_ref = destinationRef;
+  }
+  if (quarantineReason) {
+    updatePayload.metadata = {
+      ...(refund.metadata ?? {}),
+      quarantine_reason: quarantineReason,
+      quarantined_at: new Date().toISOString(),
+    };
+  }
+
+  const { data, error } = await supabase
+    .from('refund_requests')
+    .update(updatePayload)
+    .eq('id', refundId)
+    .eq('last_event_hash', refund.last_event_hash) // optimistic concurrency guard
+    .select()
+    .single();
+
+  if (error || !data) {
+    return {
+      success: false,
+      error: `Concurrent refund transition conflict for ${refundId}: ${error?.message ?? 'version mismatch'}`,
+    };
+  }
+
+  const updated = rowToRefundRequest(data);
+
+  await auditLogger.log({
+    action: targetState === 'confirmed' ? ('payment.confirmed' as const) : ('payment.failed' as const),
+    resourceType: 'payment',
+    resourceId: refund.payment_id,
+    meta: {
+      refundRequestId: refundId,
+      fromState: refund.state,
+      toState: targetState,
+      providerRef,
+      quarantineReason,
+    },
+  });
+
+  if (targetState === 'manual_review') {
+    console.error(
+      `[Refund] MANUAL REVIEW refundId=${refundId} reason="${quarantineReason}" payload=%j`,
+      eventPayload,
+    );
+  }
+
+  return { success: true, data: updated };
 }
 
 /**
@@ -377,7 +715,9 @@ function rowToPayment(row: any): Payment {
     booking_id:       row.booking_id,
     tenant_id:        row.tenant_id,
     amount_stroops:   BigInt(row.amount_stroops ?? row.amount_usdc ?? 0),
-    currency:         row.currency ?? 'USDC',
+    amount_minor:     BigInt(row.amount_minor ?? row.amount_stroops ?? row.amount_usdc ?? 0),
+    currency:         (row.currency ?? 'USDC') as SupportedCurrency,
+    quote_version:    row.quote_version ?? null,
     stellar_tx_hash:  row.stellar_tx_hash ?? null,
     escrow_id:        row.escrow_id ?? null,
     quote_hash:       row.quote_hash ?? null,
@@ -387,5 +727,27 @@ function rowToPayment(row: any): Payment {
     created_at:       row.created_at,
     updated_at:       row.updated_at,
     metadata:         row.metadata ?? null,
+  };
+}
+
+/**
+ * Map a raw Supabase refund_requests row to a typed RefundRequest.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: raw Supabase row
+function rowToRefundRequest(row: any): RefundRequest {
+  return {
+    id:                row.id,
+    payment_id:        row.payment_id,
+    booking_id:        row.booking_id,
+    amount_minor:      BigInt(row.amount_minor ?? 0),
+    currency:          (row.currency ?? 'USDC') as SupportedCurrency,
+    state:             row.state as RefundState,
+    idempotency_key:   row.idempotency_key,
+    destination_ref:   row.destination_ref ?? null,
+    provider_ref:      row.provider_ref ?? null,
+    last_event_hash:   row.last_event_hash ?? null,
+    created_at:        row.created_at,
+    updated_at:        row.updated_at,
+    metadata:          row.metadata ?? null,
   };
 }

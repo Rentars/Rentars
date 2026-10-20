@@ -313,11 +313,50 @@ export async function createBooking(req: Request, res: Response): Promise<void> 
 }
 
 /**
+ * GET /api/v1/bookings/:id/cancellation-preview
+ *
+ * Returns the refund calculation the tenant would receive if they cancelled
+ * now, computed from the refund policy snapshot captured at booking time and
+ * canonical timestamps. Shown to the user before they confirm cancellation.
+ * Only the booking tenant may preview a cancellation.
+ */
+export async function previewCancellation(req: Request, res: Response): Promise<void> {
+  const authUser = (req as Request & { user?: { id: string; role?: string } }).user;
+  if (!authUser) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const result = await bookingService.previewCancellation(req.params.id, authUser.id, new Date(), authUser.role);
+
+  if (!result.success) {
+    const statusCode =
+      result.statusCode ??
+      (result.error === 'Booking not found'
+        ? 404
+        : result.error?.startsWith('Forbidden')
+          ? 403
+          : result.error === 'Booking is already cancelled' ||
+              result.error === 'Cannot cancel a completed booking' ||
+              result.error === 'Cannot cancel a disputed booking. Resolve the dispute first.'
+            ? 409
+            : 400);
+
+    res.status(statusCode).json({ error: result.error });
+    return;
+  }
+
+  res.json(result.data);
+}
+
+/**
  * POST /api/v1/bookings/:id/cancel
  *
  * Cancels a booking as the tenant. The refund amount is computed from the
- * configured refund policy, the escrow is settled accordingly, and both the
- * tenant and host are notified. Only the tenant may cancel.
+ * booking-time refund policy snapshot, an idempotent refund request is created,
+ * and its settlement state is tracked. The response includes the refund request
+ * state and reconciliation state so pending, failed, or manual-review refunds
+ * are never described as complete. Only the tenant may cancel.
  */
 export async function cancelBooking(req: Request, res: Response): Promise<void> {
   const authUser = (req as Request & { user?: { id: string; role?: string } }).user;
