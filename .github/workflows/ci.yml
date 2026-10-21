@@ -429,11 +429,22 @@ jobs:
             exit 1
           fi
 
+      - name: Generate build manifest (#879)
+        working-directory: apps/contracts
+        run: |
+          chmod +x scripts/generate-wasm-manifest.sh
+          scripts/generate-wasm-manifest.sh \
+            target/wasm32-unknown-unknown/release \
+            target/wasm32-unknown-unknown/release/manifest.json \
+            "${{ github.sha }}"
+
       - name: Upload WASM artifacts
         uses: actions/upload-artifact@v4
         with:
           name: wasm-contracts
-          path: apps/contracts/target/wasm32-unknown-unknown/release/*.wasm
+          path: |
+            apps/contracts/target/wasm32-unknown-unknown/release/*.wasm
+            apps/contracts/target/wasm32-unknown-unknown/release/manifest.json
           if-no-files-found: error
           retention-days: 14
 
