@@ -282,8 +282,39 @@ export async function createNotification(
     .from('notifications')
     .insert(insertPayload)
     .select()
+    .eq('user_id', userId)
+    .eq('idempotency_key', idempotencyKey!)
     .single();
+  if (lookupError || !existing) {
+    return { success: false, error: lookupError?.message ?? 'Idempotent notification could not be loaded' };
+  }
+  return { success: true, data: existing as Notification };
+}
 
+export async function enqueueNotificationOutbox(
+  userId: string,
+  type: NotificationType,
+  data: Record<string, unknown>,
+  dedupeKey: string,
+): Promise<ServiceResponse<void>> {
+  if (!userId || !dedupeKey) {
+    return { success: false, error: 'userId and dedupeKey are required' };
+  }
+  if (!VALID_NOTIFICATION_TYPES.includes(type)) {
+    return { success: false, error: `Unknown notification type: ${type}` };
+  }
+
+  const { error } = await supabase
+    .from('notification_outbox')
+    .upsert(
+      {
+        recipient_id: userId,
+        notification_type: type,
+        data,
+        dedupe_key: dedupeKey,
+      },
+      { onConflict: 'recipient_id,dedupe_key', ignoreDuplicates: true },
+    );
   if (error) return { success: false, error: error.message };
 
   // Invalidate the notification cache so the next list request sees the new row.
@@ -297,6 +328,7 @@ export async function getNotifications(
   page = 1,
   pageSize = 20,
   category?: NotificationCategory | null,
+  unreadOnly?: boolean,
 ): Promise<ServiceResponse<PaginatedResult<Notification>>> {
   let query = supabase
     .from('notifications')
@@ -306,6 +338,12 @@ export async function getNotifications(
 
   if (category && VALID_NOTIFICATION_CATEGORIES.includes(category)) {
     query = query.eq('category', category);
+  }
+
+  // Optional filter: only return unread notifications.
+  // Idempotent — calling with unreadOnly=false returns all notifications.
+  if (unreadOnly === true) {
+    query = query.eq('read', false);
   }
 
   const response = await executePaginatedQuery(query, page, Math.min(Math.max(1, pageSize), 100));
@@ -322,16 +360,18 @@ export async function getNotifications(
  * Sort key: (created_at DESC, id DESC) — stable even under concurrent inserts.
  * We fetch limit+1 rows so we can detect whether a next page exists.
  *
- * @param userId   - The authenticated user's ID
- * @param cursor   - Opaque cursor returned from a previous call (omit for first page)
- * @param limit    - Page size, default 20, max 100
- * @param category - Optional category filter
+ * @param userId     - The authenticated user's ID
+ * @param cursor     - Opaque cursor returned from a previous call (omit for first page)
+ * @param limit      - Page size, default 20, max 100
+ * @param category   - Optional category filter
+ * @param unreadOnly - When true, only unread notifications are returned
  */
 export async function getNotificationsCursor(
   userId: string,
   cursor?: string | null,
   limit = 20,
   category?: NotificationCategory | null,
+  unreadOnly?: boolean,
 ): Promise<ServiceResponse<CursorPaginatedResult<Notification>>> {
   // Reject non-finite or fractional limits so the service never passes an
   // unexpected page size to Supabase. Valid integers are clamped to [1, 100].
@@ -354,6 +394,10 @@ export async function getNotificationsCursor(
     query = query.eq('category', category);
   }
 
+  if (unreadOnly === true) {
+    query = query.eq('read', false);
+  }
+
   if (decoded) {
     // Keyset filter: rows strictly after the cursor position
     // (created_at < cursor.created_at) OR (created_at = cursor.created_at AND id < cursor.id)
@@ -373,6 +417,38 @@ export async function getNotificationsCursor(
   const sanitizedData = page.data.map(sanitizeNotificationForList);
 
   return { success: true, data: { ...page, data: sanitizedData } };
+}
+
+/**
+ * Fetch a single notification by ID, scoped to the authenticated user.
+ *
+ * Authorization: the `eq('user_id', userId)` filter means another user
+ * fetching a notification they don't own gets a 404 (not a 403) so we
+ * don't confirm the existence of other users' notifications.
+ *
+ * The full data payload (including sensitive keys) is returned here because
+ * this is a detail view, not a list — the caller has navigated to a specific
+ * notification and may need all fields to render correctly.
+ *
+ * Deep-link safety: the `deep_link` field is returned as-is. The client
+ * must verify the linked resource still exists and belongs to the user
+ * before rendering it. Use `resolveDeepLink` in the controller to validate.
+ */
+export async function getNotificationById(
+  notificationId: string,
+  userId: string,
+): Promise<ServiceResponse<Notification>> {
+  const { data, error } = await supabase
+    .from('notifications')
+    .select('*')
+    .eq('id', notificationId)
+    .eq('user_id', userId)        // ownership scope — prevents cross-user access
+    .maybeSingle();
+
+  if (error) return { success: false, error: error.message };
+  if (!data) return { success: false, error: 'Notification not found' };
+
+  return { success: true, data: data as Notification };
 }
 
 export async function markAsRead(

@@ -136,6 +136,7 @@ export interface SimulationResult {
   latestLedger: number;
   error?: string;
   recoverable?: boolean;
+  errorClass?: SimulationErrorClass;
   events?: string[];
 }
 
@@ -148,35 +149,71 @@ interface SimulationCacheEntry {
 const simulationCache = new Map<string, SimulationCacheEntry>();
 
 /**
- * Derive a stable cache key from a transaction's intent (source, ops, seq).
+ * Derive a stable cache key from a transaction's intent (source, ops, seq)
+ * plus the network it targets. Including the network passphrase prevents a
+ * simulation run against one network (e.g. testnet) from being served back
+ * for an otherwise-identical transaction intent on another network (e.g.
+ * mainnet) that happens to share the same source/sequence/ops shape.
  */
 function simulationCacheKey(tx: Transaction): string {
   const ops = tx.operations
     .map((op) => JSON.stringify(op))
     .join('|');
-  return `${tx.source}|${tx.sequence}|${ops}`;
+  return `${NETWORK_PASSPHRASE}|${tx.source}|${tx.sequence}|${ops}`;
 }
+
+/**
+ * Coarse classification of a preflight simulation failure, so callers (and
+ * the UI) can show a useful, specific reason instead of a raw RPC error
+ * string.
+ *
+ * - `auth`: the transaction/contract invocation was not properly authorized
+ *   (missing/invalid signature, auth entry, or allowance).
+ * - `resource_limit`: the operation would exceed Soroban resource limits
+ *   (CPU instructions, memory, ledger entry read/write limits, tx size).
+ * - `balance`: insufficient balance or trustline to cover the operation.
+ * - `network`: the simulation itself could not be completed (RPC/timeout).
+ * - `unknown`: a recognized-but-unclassified contract error.
+ */
+export type SimulationErrorClass =
+  | 'auth'
+  | 'resource_limit'
+  | 'balance'
+  | 'network'
+  | 'unknown';
 
 /**
  * Parse simulation diagnostics into a safe, non-throwing summary.
  */
 function parseSimulationDiagnostics(
   simResult: rpc.Api.SimulateTransactionResponse,
-): { error?: string; recoverable: boolean } {
+): { error?: string; recoverable: boolean; errorClass: SimulationErrorClass } {
   if (!rpc.Api.isSimulationError(simResult)) {
-    return { recoverable: false };
+    return { recoverable: false, errorClass: 'unknown' };
   }
 
   const errResponse = simResult as rpc.Api.SimulateTransactionErrorResponse;
   const raw = errResponse.error ?? 'unknown simulation error';
 
-  // Contract errors are typically recoverable (e.g. insufficient balance,
-  // authorization failures) and should be surfaced to the user preflight.
-  const recoverable =
-    /contract|auth|balance|trustline|allowance/i.test(raw) ||
-    errResponse.events?.some((e) => e.type === 'contract') === true;
+  let errorClass: SimulationErrorClass = 'unknown';
+  if (/resource.?limit|instructions exceed|memory exceed|read.?byte|write.?byte|tx too large|exceeds the limit/i.test(raw)) {
+    errorClass = 'resource_limit';
+  } else if (/auth|signature|not authorized|invalid.*auth|missing.*entry/i.test(raw)) {
+    errorClass = 'auth';
+  } else if (/balance|trustline|allowance|underfunded/i.test(raw)) {
+    errorClass = 'balance';
+  } else if (/timeout|network|connection|unavailable/i.test(raw)) {
+    errorClass = 'network';
+  } else if (/contract/i.test(raw) || errResponse.events?.some((e) => e.type === 'contract')) {
+    errorClass = 'unknown';
+  }
 
-  return { error: raw, recoverable };
+  // Contract/auth/resource/balance failures are typically recoverable (the
+  // user can fix the underlying input and re-simulate); network failures are
+  // transient and should prompt a retry rather than a hard stop.
+  const recoverable = errorClass !== 'network';
+
+  return { error: raw, recoverable, errorClass };
 }
 
 /**
@@ -215,7 +252,7 @@ export async function simulateTransaction(
   const simResult = await server.simulateTransaction(tx);
 
   if (rpc.Api.isSimulationError(simResult)) {
-    const { error, recoverable } = parseSimulationDiagnostics(simResult);
+    const { error, recoverable, errorClass } = parseSimulationDiagnostics(simResult);
     const result: SimulationResult = {
       success: false,
       estimatedFee: '0',
@@ -223,6 +260,7 @@ export async function simulateTransaction(
       latestLedger,
       error,
       recoverable,
+      errorClass,
     };
     simulationCache.set(key, {
       result,
@@ -268,8 +306,9 @@ export async function assertSimulationSafe(
   const result = await simulateTransaction(server, tx);
 
   if (!result.success) {
+    const classLabel = result.errorClass ? ` [${result.errorClass}]` : '';
     throw new TransactionError(
-      `Preflight simulation failed: ${result.error ?? 'unknown error'}`,
+      `Preflight simulation failed${classLabel}: ${result.error ?? 'unknown error'}`,
     );
   }
 

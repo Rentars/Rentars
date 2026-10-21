@@ -93,6 +93,13 @@ WHERE search_vector @@ plainto_tsquery('english', 'beach') AND deleted_at IS NUL
 
 Then smoke-test the API: a text query, a nearby query, and an autocomplete request.
 
+A scripted version of these checks (PostGIS, columns, indexes-via-functions, remaining
+backfill count) is available at `apps/backend/scripts/validate-search-schema.ts` (run
+with `bun run validate:search-schema` from `apps/backend`, pointed at the environment
+being validated). It is read-only and safe to run repeatedly; it does not replace the
+manual rehearsal/apply/backfill steps above, which still require someone with database
+access to execute (#876).
+
 ## Recovery
 
 | Symptom | Cause | Action |

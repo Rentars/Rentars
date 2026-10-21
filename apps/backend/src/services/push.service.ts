@@ -41,6 +41,21 @@ export async function savePushSubscription(
   userId: string,
   subscription: PushSubscription
 ): Promise<ServiceResponse<StoredPushSubscription>> {
+  // A browser push endpoint can only ever belong to one account at a time.
+  // If this endpoint is currently owned by a different user (e.g. a previous
+  // login on this device/browser that never explicitly unsubscribed), drop
+  // that stale ownership first so the old account stops receiving pushes to
+  // this device as soon as a new account registers it.
+  const { error: reassignError } = await supabase
+    .from('push_subscriptions')
+    .delete()
+    .eq('endpoint', subscription.endpoint)
+    .neq('user_id', userId);
+
+  if (reassignError) return { success: false, error: reassignError.message };
+
+  // Only persist the fields required to send a push — never store anything
+  // beyond endpoint + keys.
   const { data, error } = await supabase
     .from('push_subscriptions')
     .upsert(
@@ -50,13 +65,27 @@ export async function savePushSubscription(
         p256dh: subscription.keys.p256dh,
         auth: subscription.keys.auth,
       },
-      { onConflict: 'user_id,endpoint' }
+      { onConflict: 'endpoint' }
     )
     .select()
     .single();
 
   if (error) return { success: false, error: error.message };
   return { success: true, data: data as StoredPushSubscription };
+}
+
+/**
+ * Remove every push subscription owned by a user. Call this on logout and on
+ * account deletion so a previous account/session cannot keep receiving
+ * notifications on devices it is no longer signed into.
+ */
+export async function removeAllPushSubscriptionsForUser(
+  userId: string
+): Promise<ServiceResponse<void>> {
+  const { error } = await supabase.from('push_subscriptions').delete().eq('user_id', userId);
+
+  if (error) return { success: false, error: error.message };
+  return { success: true };
 }
 
 export async function getUserPushSubscriptions(

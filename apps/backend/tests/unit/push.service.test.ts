@@ -26,6 +26,7 @@ const supabaseMod = await import('../../src/config/supabase.js');
 import {
   type PushSubscription,
   getUserPushSubscriptions,
+  removeAllPushSubscriptionsForUser,
   removePushSubscription,
   savePushSubscription,
   sendPushToUser,
@@ -63,6 +64,11 @@ describe('push.service', () => {
       };
 
       mockFrom.mockImplementation((_: string) => ({
+        delete: mock(() => ({
+          eq: mock(() => ({
+            neq: mock(async () => ({ data: null, error: null })),
+          })),
+        })),
         upsert: mock(() => ({
           select: mock(() => ({
             single: mock(async () => ({ data: stored, error: null })),
@@ -77,6 +83,11 @@ describe('push.service', () => {
 
     it('should return error when upsert fails', async () => {
       mockFrom.mockImplementation((_: string) => ({
+        delete: mock(() => ({
+          eq: mock(() => ({
+            neq: mock(async () => ({ data: null, error: null })),
+          })),
+        })),
         upsert: mock(() => ({
           select: mock(() => ({
             single: mock(async () => ({ data: null, error: { message: 'DB error' } })),
@@ -87,6 +98,68 @@ describe('push.service', () => {
       const result = await savePushSubscription('u1', mockSubscription);
       expect(result.success).toBe(false);
       expect(result.error).toBe('DB error');
+    });
+
+    it('should return error when reassigning endpoint ownership fails', async () => {
+      mockFrom.mockImplementation((_: string) => ({
+        delete: mock(() => ({
+          eq: mock(() => ({
+            neq: mock(async () => ({ data: null, error: { message: 'Reassign failed' } })),
+          })),
+        })),
+      }));
+
+      const result = await savePushSubscription('u1', mockSubscription);
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('Reassign failed');
+    });
+
+    it('upserts by endpoint only, reassigning ownership away from a previous account on the same device', async () => {
+      // Regression test for issue #797: a browser endpoint must map to exactly
+      // one user. When a different account (e.g. after logout + login as
+      // another user on the same browser) registers the same endpoint, the
+      // previous owner's row must be dropped before the new row is written,
+      // so the old account can never keep receiving pushes on that device.
+      const calls: string[] = [];
+      let reassignArgs: { endpoint?: string; notUserId?: string } = {};
+      let upsertArgs: { onConflict?: string; userId?: string } = {};
+
+      mockFrom.mockImplementation((_: string) => ({
+        delete: mock(() => {
+          calls.push('delete');
+          return {
+            eq: mock((field: string, value: string) => {
+              if (field === 'endpoint') reassignArgs.endpoint = value;
+              return {
+                neq: mock(async (field2: string, value2: string) => {
+                  if (field2 === 'user_id') reassignArgs.notUserId = value2;
+                  return { data: null, error: null };
+                }),
+              };
+            }),
+          };
+        }),
+        upsert: mock((row: Record<string, unknown>, opts: { onConflict?: string }) => {
+          calls.push('upsert');
+          upsertArgs = { onConflict: opts.onConflict, userId: row.user_id as string };
+          return {
+            select: mock(() => ({
+              single: mock(async () => ({
+                data: { id: 's2', ...row },
+                error: null,
+              })),
+            })),
+          };
+        }),
+      }));
+
+      const result = await savePushSubscription('u2', mockSubscription);
+
+      expect(result.success).toBe(true);
+      // Reassignment (delete of any other owner) must happen before the upsert.
+      expect(calls).toEqual(['delete', 'upsert']);
+      expect(reassignArgs).toEqual({ endpoint: mockSubscription.endpoint, notUserId: 'u2' });
+      expect(upsertArgs).toEqual({ onConflict: 'endpoint', userId: 'u2' });
     });
   });
 
@@ -165,6 +238,38 @@ describe('push.service', () => {
       }));
 
       const result = await removePushSubscription('u1', mockSubscription.endpoint);
+      expect(result.success).toBe(false);
+    });
+  });
+
+  // ── removeAllPushSubscriptionsForUser (logout / account deletion) ───────────
+
+  describe('removeAllPushSubscriptionsForUser', () => {
+    it('removes every subscription owned by the user on logout', async () => {
+      let deletedUserId: string | undefined;
+
+      mockFrom.mockImplementation((_: string) => ({
+        delete: mock(() => ({
+          eq: mock(async (field: string, value: string) => {
+            if (field === 'user_id') deletedUserId = value;
+            return { data: null, error: null };
+          }),
+        })),
+      }));
+
+      const result = await removeAllPushSubscriptionsForUser('u1');
+      expect(result.success).toBe(true);
+      expect(deletedUserId).toBe('u1');
+    });
+
+    it('returns error when the delete fails', async () => {
+      mockFrom.mockImplementation((_: string) => ({
+        delete: mock(() => ({
+          eq: mock(async () => ({ data: null, error: { message: 'Delete failed' } })),
+        })),
+      }));
+
+      const result = await removeAllPushSubscriptionsForUser('u1');
       expect(result.success).toBe(false);
     });
   });
@@ -393,6 +498,40 @@ describe('push.service', () => {
   });
 
   // ── validatePushSubscription ────────────────────────────────────────────
+
+  describe('savePushSubscription field restriction', () => {
+    it('only persists endpoint, p256dh, and auth — never extra client-supplied fields', async () => {
+      // Regression test: storage must stay restricted to what's needed to
+      // send a push, even if the client sends extra fields on the payload.
+      let persistedRow: Record<string, unknown> = {};
+
+      mockFrom.mockImplementation((_: string) => ({
+        delete: mock(() => ({
+          eq: mock(() => ({
+            neq: mock(async () => ({ data: null, error: null })),
+          })),
+        })),
+        upsert: mock((row: Record<string, unknown>) => {
+          persistedRow = row;
+          return {
+            select: mock(() => ({
+              single: mock(async () => ({ data: { id: 's1', ...row }, error: null })),
+            })),
+          };
+        }),
+      }));
+
+      const subscriptionWithExtras = {
+        ...mockSubscription,
+        expirationTime: 123456,
+        extraField: 'should-not-be-stored',
+      } as unknown as PushSubscription;
+
+      await savePushSubscription('u1', subscriptionWithExtras);
+
+      expect(Object.keys(persistedRow).sort()).toEqual(['auth', 'endpoint', 'p256dh', 'user_id']);
+    });
+  });
 
   describe('validatePushSubscription', () => {
     it('should accept a valid HTTPS subscription', () => {

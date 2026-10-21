@@ -57,8 +57,11 @@ export async function walletSimulate(req: Request, res: Response): Promise<void>
       success: result.success,
       estimatedFeeStroops: result.estimatedFee,
       minResourceFeeStroops: result.minResourceFee,
+      latestLedger: result.latestLedger,
       events: result.events,
       error: result.error,
+      errorClass: result.errorClass,
+      recoverable: result.recoverable,
     });
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });

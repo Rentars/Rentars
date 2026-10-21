@@ -22,6 +22,8 @@
     "test:performance": "bun test tests/integration/booking-performance.test.ts",
     "test:journey": "bun test tests/integration/booking-journey.test.ts",
     "validate:migrations": "bun run scripts/validate-migrations.ts",
+    "check:migration-checksums": "bun run scripts/check-migration-checksums.ts",
+    "validate:search-schema": "bun run scripts/validate-search-schema.ts",
     "db:seed": "bun run database/seed.ts"
   },
   "dependencies": {
