@@ -95,5 +95,6 @@
   "00067_enhance_review_moderation_workflow.sql": "5e6e599af87f2014835d1cac4abcfc430976897ea521f5a40d5f8fdb8a644c8e",
   "00067_saved_search_filter_version.sql": "71c17830fa9329239d2190a7526803369a5785210b82c05efd6ff920b7cef235",
   "00067_search_rollout.sql": "27e36415c66b3e9920399ca0b7cf02360f20ce25aa4d4dfa66e9dc3504cc875d",
-  "00068_create_moderation_policy.sql": "f6eebd51c451b14a9dc774f0d093d685fc7e7b1f7563c1af15ca97f5bf54f24c"
+  "00068_create_moderation_policy.sql": "f6eebd51c451b14a9dc774f0d093d685fc7e7b1f7563c1af15ca97f5bf54f24c",
+  "00069_escrow_reconciliation_durability.sql": "1b7b6e6d4b70e238d70b1a053c0872d09da7d478eb44e18503bd61a4c5c7deb3"
 }

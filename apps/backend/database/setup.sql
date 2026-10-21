@@ -81,3 +81,4 @@
 \i migrations/00062_booking_modifications_snapshot.sql
 \i migrations/00063_idempotency_keys_status.sql
 \i migrations/00064_property_versions.sql
+\i migrations/00069_escrow_reconciliation_durability.sql
