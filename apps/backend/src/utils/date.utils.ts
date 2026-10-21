@@ -86,6 +86,16 @@ function toUtcMidnight(date: CalendarDate): Date {
 }
 
 /**
+ * Epoch seconds for a canonical calendar date's UTC midnight instant. Used
+ * where a calendar date must be passed to a chain/contract call expecting a
+ * Unix timestamp — always the same instant regardless of the caller's local
+ * timezone or any DST transition.
+ */
+export function calendarDateToEpochSeconds(date: CalendarDate): bigint {
+  return BigInt(Math.floor(toUtcMidnight(date).getTime() / 1000));
+}
+
+/**
  * Number of nights between two canonical calendar dates (checkout - checkin),
  * counted as whole calendar days — immune to DST, since both endpoints are
  * UTC midnights representing calendar days, never wall-clock instants in a
