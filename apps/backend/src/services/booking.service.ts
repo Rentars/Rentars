@@ -6,6 +6,7 @@
 
 import { StrKey } from '@stellar/stellar-sdk';
 import { supabase } from '@/config/supabase.js';
+import { normalizeStayRange } from '@/utils/date.utils.js';
 import { env } from '@/config/env.js';
 import {
   checkAvailability,
@@ -479,19 +480,14 @@ export class BookingService {
       };
     }
 
-    const checkInDate = new Date(check_in);
-    const checkOutDate = new Date(check_out);
-
-    if (isNaN(checkInDate.getTime()) || isNaN(checkOutDate.getTime())) {
-      return {
-        success: false,
-        error: 'check_in and check_out must be valid dates',
-      };
+    // Normalize to canonical property-local calendar dates once, here at the
+    // API boundary (see apps/backend/src/utils/date.utils.ts). This avoids
+    // DST/leap-day drift from diffing raw Date instants in milliseconds.
+    const stayRange = normalizeStayRange(check_in, check_out);
+    if ('error' in stayRange) {
+      return { success: false, error: stayRange.error };
     }
-
-    if (checkInDate >= checkOutDate) {
-      return { success: false, error: 'check_in must be before check_out' };
-    }
+    const { checkIn: normalizedCheckIn, checkOut: normalizedCheckOut, nights } = stayRange;
 
     // 1. Fetch property + owner (include capacity and stay-length limits)
     const { data: property, error: propertyError } = await supabase
@@ -545,8 +541,7 @@ export class BookingService {
       };
     }
 
-    // Stay-length check
-    const nights = Math.round((checkOutDate.getTime() - checkInDate.getTime()) / (1000 * 60 * 60 * 24));
+    // Stay-length check (nights computed above from canonical calendar dates)
     const minNights = prop.min_nights ?? 1;
     if (nights < minNights) {
       return {
@@ -568,7 +563,7 @@ export class BookingService {
         .from('bookings')
         .select('id')
         .eq('property_id', property_id)
-        .eq('check_out', check_in)
+        .eq('check_out', normalizedCheckIn)
         .neq('status', 'Cancelled')
         .maybeSingle();
 
@@ -585,8 +580,8 @@ export class BookingService {
     //     funds are authorised. The server total is what gets charged.
     const priceCheck = await assertQuotedTotal({
       propertyId: property_id,
-      checkIn: check_in,
-      checkOut: check_out,
+      checkIn: normalizedCheckIn,
+      checkOut: normalizedCheckOut,
       clientTotal: total_price,
       quoteToken: input.quote_token,
     });
@@ -637,8 +632,8 @@ export class BookingService {
       {
         p_property_id: property_id,
         p_tenant_id: tenant_id,
-        p_check_in: check_in,
-        p_check_out: check_out,
+        p_check_in: normalizedCheckIn,
+        p_check_out: normalizedCheckOut,
         p_total_price: chargedTotal,
         p_guest_count: guest_count,
         p_rules_acknowledged_at: rules_acknowledged_at ?? null,
