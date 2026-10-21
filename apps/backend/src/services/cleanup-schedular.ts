@@ -34,6 +34,14 @@ let reconciliationBackoffMs = INITIAL_BACKOFF_MS;
 /** Guard: prevent two full retention runs from overlapping. */
 let retentionRunning = false;
 
+/**
+ * Guard: prevent two booking-expiry sweeps from overlapping in-process. The
+ * underlying write is already claim-based and safe across processes/replicas
+ * (see `transitionStatus` in booking.service.ts), but skipping an overlapping
+ * tick here avoids doing the same read work twice if a sweep runs long.
+ */
+let bookingExpiryRunning = false;
+
 async function runSync(): Promise<void> {
   const propertiesResult = await syncAllProperties();
   if (propertiesResult.success) {
@@ -173,14 +181,33 @@ async function runIdempotencyCleanup(): Promise<void> {
 }
 
 async function runBookingExpiryCleanup(): Promise<void> {
-  const result = await bookingService.expireStaleBookings();
-  if (result.success) {
-    const { expired, failed } = result.data ?? { expired: 0, failed: 0 };
-    if (expired > 0 || failed > 0) {
-      console.log(`[expiry] Expired ${expired} booking(s), ${failed} failure(s)`);
+  if (bookingExpiryRunning) {
+    console.log('[expiry] Skipping tick — previous sweep still in progress');
+    return;
+  }
+  bookingExpiryRunning = true;
+  try {
+    const warnResult = await bookingService.sendExpiryWarnings();
+    if (warnResult.success) {
+      const { warned, failed } = warnResult.data ?? { warned: 0, failed: 0 };
+      if (warned > 0 || failed > 0) {
+        console.log(`[expiry] Warned ${warned} booking(s) of imminent expiry, ${failed} failure(s)`);
+      }
+    } else {
+      console.error(`[expiry] Warning pass failed: ${warnResult.error}`);
     }
-  } else {
-    console.error(`[expiry] Cleanup failed: ${result.error}`);
+
+    const result = await bookingService.expireStaleBookings();
+    if (result.success) {
+      const { expired, failed } = result.data ?? { expired: 0, failed: 0 };
+      if (expired > 0 || failed > 0) {
+        console.log(`[expiry] Expired ${expired} booking(s), ${failed} failure(s)`);
+      }
+    } else {
+      console.error(`[expiry] Cleanup failed: ${result.error}`);
+    }
+  } finally {
+    bookingExpiryRunning = false;
   }
 }
 

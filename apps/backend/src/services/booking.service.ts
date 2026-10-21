@@ -269,14 +269,33 @@ export class BookingService {
 
     const payload: Record<string, unknown> = { status: toStatus, ...extra };
 
+    // Condition the write on the expected current status ("optimistic claim").
+    // Without this, two concurrent callers racing on the same booking (e.g. an
+    // expiry sweep and a payment-confirmation webhook both acting on a
+    // Pending booking) would both succeed, double-writing history/notifications
+    // and letting whichever write lands last silently clobber the other's
+    // outcome. With it, only the caller that still sees the expected
+    // `fromStatus` wins; the loser's update matches zero rows and is reported
+    // back as a (non-error) no-op so retries and reruns stay idempotent.
     const { data, error } = await supabase
       .from('bookings')
       .update(payload)
       .eq('id', bookingId)
+      .eq('status', fromStatus)
       .select()
-      .single();
+      .maybeSingle();
 
     if (error) return { success: false, error: error.message };
+
+    if (!data) {
+      return {
+        success: false,
+        error: `Booking was already moved out of '${fromStatus}' by another operation`,
+        statusCode: 409,
+        code: 'STALE_TRANSITION',
+        conflict: true,
+      };
+    }
 
     supabase
       .from('booking_status_history')
@@ -298,8 +317,18 @@ export class BookingService {
   /**
    * Expire all Pending bookings whose expires_at has passed.
    *
-   * Safe to rerun — each booking is only expired once. Checks payment state
-   * before expiring so a confirmed payment is never silently discarded.
+   * Safe to rerun and safe under concurrent schedulers:
+   *  - Each expiry write is conditioned on the booking still being `Pending`
+   *    (see `transitionStatus`), so a second runner — or a payment webhook
+   *    racing this sweep — can never double-process or clobber a booking
+   *    another caller already moved on.
+   *  - Before expiring, the booking's real escrow/payment status is checked
+   *    on-chain/with the payment provider. A payment that actually cleared
+   *    (funded/released) just after the hold window closed is treated as a
+   *    "late confirmation": the booking is moved to Confirmed instead of
+   *    Expired, and the tenant/host are notified of the outcome either way.
+   *    This is what prevents a late, legitimate payment from being silently
+   *    discarded by the sweep.
    */
   async expireStaleBookings(): Promise<ServiceResponse<{ expired: number; failed: number }>> {
     const { data: stale, error } = await supabase
@@ -316,6 +345,43 @@ export class BookingService {
 
     for (const b of stale ?? []) {
       try {
+        // Check the real payment state before releasing inventory. A booking
+        // whose escrow actually funded/released in the gap between the hold
+        // expiring and this sweep running must NOT be silently expired —
+        // that would discard a legitimate payment.
+        let paymentCleared = false;
+        if (b.escrow_id) {
+          try {
+            const escrowStatus = await trustlessWorkClient.getEscrowStatus(b.escrow_id);
+            paymentCleared = escrowStatus.status === 'funded' || escrowStatus.status === 'released';
+          } catch (e) {
+            console.warn('[expiry] Could not verify escrow status for', b.id, '— treating as unpaid:', e);
+          }
+        }
+
+        if (paymentCleared) {
+          // Late confirmation: honor the payment instead of expiring the hold.
+          const confirmResult = await this.transitionStatus(
+            b.id,
+            'Pending',
+            'Confirmed',
+            'system',
+            'Payment cleared after the expiry sweep ran — hold honored instead of expired',
+          );
+
+          // A STALE_TRANSITION (already moved by another caller, e.g. the
+          // normal confirmation webhook) is an expected, idempotent no-op here.
+          if (!confirmResult.success && confirmResult.code !== 'STALE_TRANSITION') {
+            failed++;
+            continue;
+          }
+
+          if (confirmResult.success && b.tenant_id) {
+            createNotification(b.tenant_id, 'booking_late_confirmation', { booking_id: b.id }).catch(() => {});
+          }
+          continue;
+        }
+
         // Release escrow back to tenant (non-fatal)
         if (b.escrow_id) {
           await trustlessWorkClient.cancelEscrow(b.escrow_id).catch((e: unknown) =>
@@ -332,6 +398,8 @@ export class BookingService {
         );
 
         if (!result.success) {
+          // Another runner/webhook already claimed this booking — not a failure.
+          if (result.code === 'STALE_TRANSITION') continue;
           failed++;
           continue;
         }
@@ -348,6 +416,63 @@ export class BookingService {
     }
 
     return { success: true, data: { expired, failed } };
+  }
+
+  /**
+   * Notify tenants (and hosts) of Pending bookings whose hold is about to
+   * expire, so they get a chance to complete payment before the slot is
+   * released. Each booking is warned at most once: the claim is atomic
+   * (`expiry_warning_sent_at IS NULL` in both the WHERE and the write), so
+   * rerunning this on every scheduler tick never sends duplicate warnings.
+   *
+   * @param windowMinutes - how soon (from now) a booking must expire to warn.
+   */
+  async sendExpiryWarnings(
+    windowMinutes = 15,
+  ): Promise<ServiceResponse<{ warned: number; failed: number }>> {
+    const horizon = new Date(Date.now() + windowMinutes * 60 * 1000).toISOString();
+
+    const { data: candidates, error } = await supabase
+      .from('bookings')
+      .select('id, tenant_id, property_id, expires_at')
+      .eq('status', 'Pending')
+      .is('expiry_warning_sent_at', null)
+      .not('expires_at', 'is', null)
+      .lt('expires_at', horizon)
+      .gt('expires_at', new Date().toISOString());
+
+    if (error) return { success: false, error: error.message };
+
+    let warned = 0;
+    let failed = 0;
+
+    for (const b of candidates ?? []) {
+      // Atomic claim: only the caller that flips expiry_warning_sent_at from
+      // NULL wins. A second concurrent tick sees zero rows updated and skips.
+      const { data: claimed, error: claimError } = await supabase
+        .from('bookings')
+        .update({ expiry_warning_sent_at: new Date().toISOString() })
+        .eq('id', b.id)
+        .is('expiry_warning_sent_at', null)
+        .select('id')
+        .maybeSingle();
+
+      if (claimError) {
+        failed++;
+        continue;
+      }
+      if (!claimed) continue; // already warned by another runner
+
+      if (b.tenant_id) {
+        createNotification(b.tenant_id, 'booking_hold_expiring_soon', {
+          booking_id: b.id,
+          expires_at: b.expires_at,
+        }).catch(() => {});
+      }
+      warned++;
+    }
+
+    return { success: true, data: { warned, failed } };
   }
 
   // ── Read ───────────────────────────────────────────────────────────────────
