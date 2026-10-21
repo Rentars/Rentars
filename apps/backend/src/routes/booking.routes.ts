@@ -13,6 +13,8 @@ import {
   getBookingReceipt,
   getBookingStatusHistory,
   getCalendarFeedToken,
+  rotateCalendarFeedToken,
+  revokeCalendarFeedToken,
   listUserBookings,
   raiseDispute,
   requestModification,
@@ -52,9 +54,16 @@ const bookingCreationLimiter = createUserRateLimiter({
 // GET /api/v1/bookings — list current user's bookings (cursor pagination)
 router.get('/', authenticate, validatePagination, listUserBookings);
 
-// GET /api/v1/bookings/calendar-feed-token — returns signed URL for the user's calendar feed
+// GET /api/v1/bookings/calendar-feed-token — get (or create) the user's calendar feed token
 // Must be registered BEFORE /:id to avoid being swallowed by the param route.
 router.get('/calendar-feed-token', authenticate, getCalendarFeedToken);
+
+// POST /api/v1/bookings/calendar-feed-token/rotate — revoke old token, issue new one
+router.post('/calendar-feed-token/rotate', authenticate, rotateCalendarFeedToken);
+
+// DELETE /api/v1/bookings/calendar-feed-token — revoke a specific token
+// Body: { token: string }
+router.delete('/calendar-feed-token', authenticate, revokeCalendarFeedToken);
 
 // GET /api/v1/bookings/:id
 router.get('/:id', authenticate, getBooking);
@@ -92,9 +101,18 @@ router.post('/:id/complete', authenticate, completeBooking);
 router.post('/:id/dispute', authenticate, disputeBooking);
 
 // POST /api/v1/bookings/:id/cancel
-// Tenant cancels a booking → refund computed per policy → escrow settled → both parties notified
+// Tenant cancels a booking → refund computed from booking-time snapshot → escrow settled → both parties notified
 // Body (optional): { reason?: string }
 router.post('/:id/cancel', authenticate, validateBody(cancelBookingSchema), cancelBooking);
+
+// GET /api/v1/bookings/:id/refund-preview
+// Shows the refund calculation from the booking-time policy snapshot *before*
+// the tenant confirms cancellation.  Does not modify any state. (#769)
+router.get('/:id/refund-preview', authenticate, getRefundPreviewHandler);
+
+// GET /api/v1/bookings/:id/refund
+// Returns the current refund request status (requested/submitted/confirmed/failed/manual_review). (#769)
+router.get('/:id/refund', authenticate, getRefundStatusHandler);
 
 // POST /api/v1/bookings/:id/dispute
 router.post('/:id/dispute', authenticate, validateBody(raiseDisputeSchema), raiseDispute);
