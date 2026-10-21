@@ -6,7 +6,7 @@
 
 import { StrKey } from '@stellar/stellar-sdk';
 import { supabase } from '@/config/supabase.js';
-import { normalizeStayRange } from '@/utils/date.utils.js';
+import { normalizeStayRange, calendarDateToEpochSeconds } from '@/utils/date.utils.js';
 import { env } from '@/config/env.js';
 import {
   checkAvailability,
@@ -246,17 +246,32 @@ export class BookingService {
 
     if (error) return { success: false, error: error.message };
 
-    supabase
-      .from('booking_status_history')
-      .insert({
+    // Durable audit trail: await the history write (rather than fire-and-forget)
+    // so a crash between these two statements is the only way to lose a history
+    // record, not an ordinary async scheduling race. The status transition has
+    // already committed above; a history-write failure is logged loudly but does
+    // not roll back or fail the caller, since the booking/payment state must
+    // stay the source of truth even if the audit insert needs manual backfill.
+    try {
+      const { error: historyError } = await supabase.from('booking_status_history').insert({
         booking_id: bookingId,
         from_status: fromStatus,
         status: toStatus,
         changed_by: actorId || null,
         reason: reason ?? null,
-      })
-      .then(() => {})
-      .catch((e: unknown) => console.warn('[BookingService] History insert failed:', e));
+      });
+      if (historyError) {
+        console.error(
+          `[BookingService] CRITICAL: history insert failed for booking=${bookingId} ${fromStatus}->${toStatus}:`,
+          historyError,
+        );
+      }
+    } catch (e) {
+      console.error(
+        `[BookingService] CRITICAL: history insert threw for booking=${bookingId} ${fromStatus}->${toStatus}:`,
+        e,
+      );
+    }
 
     return { success: true, data: data as Booking };
   }
@@ -672,8 +687,8 @@ export class BookingService {
 
     // 5. Check on-chain availability (advisory; non-blocking on error).
     if (prop.on_chain_id !== undefined && prop.on_chain_id !== null) {
-      const checkInTs = BigInt(Math.floor(checkInDate.getTime() / 1000));
-      const checkOutTs = BigInt(Math.floor(checkOutDate.getTime() / 1000));
+      const checkInTs = calendarDateToEpochSeconds(normalizedCheckIn);
+      const checkOutTs = calendarDateToEpochSeconds(normalizedCheckOut);
 
       loggingService.logBlockchainOperation('checkAvailability', {
         propertyId: property_id,
@@ -798,8 +813,8 @@ export class BookingService {
 
     // 8. Create on-chain booking record (non-fatal on failure).
     if (prop.on_chain_id !== undefined && prop.on_chain_id !== null) {
-      const checkInTs = BigInt(Math.floor(checkInDate.getTime() / 1000));
-      const checkOutTs = BigInt(Math.floor(checkOutDate.getTime() / 1000));
+      const checkInTs = calendarDateToEpochSeconds(normalizedCheckIn);
+      const checkOutTs = calendarDateToEpochSeconds(normalizedCheckOut);
 
       loggingService.logBlockchainOperation('createBookingOnChain', {
         bookingId: booking.id,
