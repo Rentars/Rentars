@@ -5,6 +5,7 @@ import { useDashboard, type BookingStatus, type BookingSort, type BookingOrder }
 import BookingHistory from '@/components/dashboard/BookingHistory';
 import Analytics from '@/components/dashboard/Analytics';
 import NotificationSystem from '@/components/dashboard/NotificationSystem';
+import { BookingListSkeleton, ErrorState, SkeletonRegion } from '@/components/ui';
 import WalletTransaction from './components/WalletTransaction';
 import BookingPreferences from './components/BookingPreferences';
 import ExportBookingsButton from './components/ExportBookingsButton';
@@ -17,7 +18,7 @@ export default function TenantDashboard() {
   const sort = (searchParams.get('sort') as BookingSort) ?? 'created';
   const order = (searchParams.get('order') as BookingOrder) ?? 'desc';
 
-  const { bookings, isLoading, error } = useDashboard(20, statusFilter, sort, order);
+  const { bookings, isLoading, error, refetch } = useDashboard(20, statusFilter, sort, order);
 
   function updateParam(key: string, value: string | null) {
     const params = new URLSearchParams(searchParams.toString());
@@ -79,18 +80,25 @@ export default function TenantDashboard() {
           </div>
         </div>
 
-        {/* Error State */}
+        {/* Error State — "the request failed", not "you have no bookings".
+            Announced via role="alert"; the retry button cannot double-fire
+            (ErrorState's ref guard + useDashboard's in-flight guard), and the
+            URL-backed filters/sort are untouched by a retry. */}
         {error && (
-          <div className="bg-red-50 border border-red-200 rounded-lg p-4 text-red-700">
-            {error}
-          </div>
+          <ErrorState
+            message={`We couldn't load your bookings: ${error}`}
+            onRetry={refetch}
+            retryLabel="Try again"
+          />
         )}
 
-        {/* Loading State */}
+        {/* Loading State — fixed-dimension booking-card skeleton, announced
+            politely; swapping to content afterwards doesn't shift the page
+            (the heading stays in place either way). */}
         {isLoading && (
-          <div className="text-center py-8 text-gray-500">
-            Loading your dashboard...
-          </div>
+          <SkeletonRegion label="Loading your bookings">
+            <BookingListSkeleton count={3} />
+          </SkeletonRegion>
         )}
 
         {/* Content */}

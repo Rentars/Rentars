@@ -61,8 +61,10 @@ export function usePropertySearch(options: UseSearchOptions = {}) {
   const abortControllerRef = useRef<AbortController | null>(null);
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const requestIdRef = useRef<number>(0);
+  const inFlightRef = useRef(false);
   const lastFiltersRef = useRef<Partial<FilterState>>({});
   const lastQueryRef = useRef<string>('');
+  const lastPageRef = useRef<number>(1);
 
   function buildParams(query: string, filters: Partial<FilterState>, pageNum: number): URLSearchParams {
     const params = new URLSearchParams();
@@ -90,10 +92,12 @@ export function usePropertySearch(options: UseSearchOptions = {}) {
       requestIdRef.current += 1;
       const currentRequestId = requestIdRef.current;
 
+      inFlightRef.current = true;
       setLoading(true);
       setError(null);
       lastQueryRef.current = query;
       lastFiltersRef.current = filters;
+      lastPageRef.current = pageNum;
 
       try {
         const params = buildParams(query, filters, pageNum);
@@ -119,13 +123,19 @@ export function usePropertySearch(options: UseSearchOptions = {}) {
         if (currentRequestId !== requestIdRef.current) return;
 
         setError(err instanceof Error ? err.message : 'Search error');
-        setResults([]);
-        setTotal(0);
-        setHasMore(false);
-        setZeroResultSuggestions([]);
-        setHistogram(null);
+        // A failed *first* page means we have nothing to show. A failed
+        // "load more" keeps the already-rendered results so the user does not
+        // lose their place — the inline error is rendered above the list.
+        if (pageNum <= 1) {
+          setResults([]);
+          setTotal(0);
+          setHasMore(false);
+          setZeroResultSuggestions([]);
+          setHistogram(null);
+        }
       } finally {
         if (currentRequestId === requestIdRef.current) {
+          inFlightRef.current = false;
           setLoading(false);
         }
       }
@@ -134,11 +144,22 @@ export function usePropertySearch(options: UseSearchOptions = {}) {
   );
 
   const loadMore = useCallback(async () => {
-    if (!hasMore) return;
+    // Guard: repeated clicks while a page is in flight must not queue
+    // duplicate requests (buttons can lag a frame behind the click).
+    if (!hasMore || inFlightRef.current) return;
 
     const nextPage = page + 1;
     await search(lastQueryRef.current, lastFiltersRef.current, nextPage);
   }, [hasMore, page, search]);
+
+  /**
+   * Re-run the last search with the same query/filters/page. Safe to call from
+   * an error state's "Try again" button — the underlying request de-duplication
+   * (abort + monotonic request id) guarantees only the latest response lands.
+   */
+  const retry = useCallback(async () => {
+    await search(lastQueryRef.current, lastFiltersRef.current, lastPageRef.current);
+  }, [search]);
 
   const searchByBounds = useCallback(
     (bounds: LatLngBounds, filters: Partial<FilterState> = {}) => {
@@ -151,6 +172,7 @@ export function usePropertySearch(options: UseSearchOptions = {}) {
         requestIdRef.current += 1;
         const currentRequestId = requestIdRef.current;
 
+        inFlightRef.current = true;
         setLoading(true);
         setError(null);
 
@@ -187,10 +209,12 @@ export function usePropertySearch(options: UseSearchOptions = {}) {
           if (err instanceof Error && err.name === 'AbortError') return;
           if (currentRequestId !== requestIdRef.current) return;
 
+          // Keep the previously rendered markers/results on a failed bounds
+          // refresh — surface the error instead of blanking the map.
           setError(err instanceof Error ? err.message : 'Search error');
-          setResults([]);
         } finally {
           if (currentRequestId === requestIdRef.current) {
+            inFlightRef.current = false;
             setLoading(false);
           }
         }
@@ -255,6 +279,7 @@ export function usePropertySearch(options: UseSearchOptions = {}) {
     histogram,
     search,
     loadMore,
+    retry,
     searchByBounds,
     getSuggestions,
     getTrending,

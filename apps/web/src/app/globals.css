@@ -77,3 +77,17 @@
     outline-offset: 2px;
   }
 }
+
+/* ── Keyboard-accessible map pins ──────────────────────────────────────────── */
+/* Leaflet creates marker icon elements imperatively; make sure a focused pin
+   is unmistakably visible (and drawn above neighbouring pins) for keyboard
+   users. The container keeps panning/zooming untouched. */
+.leaflet-marker-icon:focus-visible {
+  outline: 3px solid hsl(var(--ring));
+  outline-offset: 3px;
+  border-radius: 6px;
+  z-index: 1000 !important;
+}
+.leaflet-container .leaflet-interactive:focus {
+  outline: none; /* suppress the default outline in favour of :focus-visible above */
+}

@@ -1,13 +1,18 @@
 'use client';
 
-import { Marker } from 'react-leaflet';
+import { useMemo } from 'react';
 import L from 'leaflet';
 import type { Property } from '@/types/property';
+import AccessibleMarker from './AccessibleMarker';
+import { pinAccessibleName } from './PropertyMapPin';
 import PropertyMapPopup from './PropertyMapPopup';
 
 interface PriceMarkerProps {
   property: Property & { lat: number; lng: number };
+  /** Selected state — synchronised with the results list via aria-pressed. */
   active?: boolean;
+  /** Fired when the pin is activated (click, Enter, or Space). */
+  onSelect?: (source: 'pointer' | 'keyboard') => void;
   onClick?: () => void;
 }
 
@@ -33,13 +38,32 @@ function makeIcon(price: number, active: boolean) {
   });
 }
 
-export default function PriceMarker({ property, active = false, onClick }: PriceMarkerProps) {
+export default function PriceMarker({
+  property,
+  active = false,
+  onSelect,
+  onClick,
+}: PriceMarkerProps) {
+  // Memoised so Leaflet does not rebuild (and replace) the icon element on
+  // every render — which would also discard the pin's ARIA attributes.
+  const icon = useMemo(
+    () => makeIcon(property.price_per_night, active),
+    [property.price_per_night, active],
+  );
+
+  // Visible text stays the price pill; screen readers get the full name.
+  const label = `${pinAccessibleName(property)}, ${property.price_per_night} USDC per night`;
+
   return (
-    <Marker
+    <AccessibleMarker
       position={[property.lat, property.lng]}
-      icon={makeIcon(property.price_per_night, active)}
+      icon={icon}
+      label={label}
+      selected={active}
+      onSelect={onSelect}
+      eventHandlers={onClick ? { click: () => onClick() } : undefined}
     >
       <PropertyMapPopup property={property} onClick={onClick} />
-    </Marker>
+    </AccessibleMarker>
   );
 }

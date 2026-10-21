@@ -12,9 +12,33 @@ export function WalletStatusBadge({ showAddress = true, className = '' }: Wallet
 
     if (state.isLoading) {
         return (
-            <div className={`flex items-center gap-2 text-sm text-gray-500 ${className}`}>
-                <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-gray-500"></div>
+            <div
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+                className={`flex items-center gap-2 text-sm text-gray-500 ${className}`}
+            >
+                <div
+                    className="animate-spin rounded-full h-4 w-4 border-b-2 border-gray-500"
+                    aria-hidden="true"
+                ></div>
                 <span>Loading wallet...</span>
+            </div>
+        );
+    }
+
+    // Surface wallet errors here too — previously they were invisible unless
+    // a page happened to render WalletErrorDisplay separately.
+    if (state.error) {
+        return (
+            <div
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+                className={`flex items-center gap-2 px-3 py-1 bg-red-50 border border-red-200 rounded-full ${className}`}
+            >
+                <span className="relative inline-flex rounded-full h-2 w-2 bg-red-500" aria-hidden="true"></span>
+                <span className="text-xs font-medium text-red-700">Wallet error</span>
             </div>
         );
     }

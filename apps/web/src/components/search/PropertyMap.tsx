@@ -5,6 +5,7 @@ import dynamic from 'next/dynamic';
 import type { LatLngBounds, Map as LeafletMap } from 'leaflet';
 import type { Property } from '@/types/property';
 import { useGeolocation, type GeoPosition } from '@/hooks/useGeolocation';
+import MapResultsList from './MapResultsList';
 
 // ── Dynamic imports (no SSR) ──────────────────────────────────────────────────
 const MapContainer = dynamic(() => import('react-leaflet').then((m) => m.MapContainer), {
@@ -15,6 +16,10 @@ const MarkerClusterGroup = dynamic(() => import('react-leaflet-cluster'), { ssr:
 const PriceMarker = dynamic(() => import('./PriceMarker'), { ssr: false });
 const BoundsListener = dynamic(() => import('./BoundsListener'), { ssr: false });
 const UserLocationMarker = dynamic(() => import('./UserLocationMarker'), { ssr: false });
+const MapSelectionController = dynamic(() => import('./MapSelectionController'), { ssr: false });
+
+/** Where a selection originated — drives focus management in the list. */
+export type MapSelectSource = 'map-pointer' | 'map-keyboard' | 'list';
 
 export interface PropertyMapProps {
   properties: Property[];
@@ -22,6 +27,14 @@ export interface PropertyMapProps {
   onBoundsChanged?: (bounds: LatLngBounds) => void;
   /** Highlighted property id (e.g. hovered card) */
   activePropertyId?: string;
+  /** Selected listing, synchronised with the accessible results list below. */
+  selectedPropertyId?: string;
+  /**
+   * Fired when a listing is selected from the map (pin activation) or the
+   * results list. Keyboard-driven pin activation reports `map-keyboard` so the
+   * caller can move focus to the matching list item.
+   */
+  onSelectProperty?: (id: string, source: MapSelectSource) => void;
   /**
    * Called when "use my location" resolves both coordinates and a readable label.
    * Use this to populate the search field and trigger a radius search.
@@ -35,11 +48,18 @@ export default function PropertyMap({
   onPropertyClick,
   onBoundsChanged,
   activePropertyId,
+  selectedPropertyId,
+  onSelectProperty,
   onUserLocation,
 }: PropertyMapProps) {
   const [center, setCenter] = useState<[number, number]>([40.7128, -74.006]);
   const [mapKey, setMapKey] = useState(0);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Focus request forwarded to the results list when a keyboard user
+  // activates a pin (nonce changes → the list item receives DOM focus).
+  const [focusRequest, setFocusRequest] = useState<{ id: string; nonce: number } | null>(null);
+  const focusNonceRef = useRef(0);
 
   // Stable callback reference — rebuild only when parent's onUserLocation changes.
   const handleLocation = useCallback(
@@ -64,6 +84,24 @@ export default function PropertyMap({
     [properties],
   );
 
+  const selectedId = selectedPropertyId ?? activePropertyId;
+
+  const selectedPosition = useMemo<[number, number] | null>(() => {
+    const match = validProperties.find((p) => p.id === selectedId);
+    return match ? [match.lat, match.lng] : null;
+  }, [validProperties, selectedId]);
+
+  const handlePinSelect = useCallback(
+    (id: string, source: 'pointer' | 'keyboard') => {
+      onSelectProperty?.(id, source === 'keyboard' ? 'map-keyboard' : 'map-pointer');
+      if (source === 'keyboard') {
+        focusNonceRef.current += 1;
+        setFocusRequest({ id, nonce: focusNonceRef.current });
+      }
+    },
+    [onSelectProperty],
+  );
+
   // Fit map to property bounds when list changes.
   useEffect(() => {
     if (validProperties.length === 0) return;
@@ -82,94 +120,121 @@ export default function PropertyMap({
   };
 
   return (
-    <div className="relative w-full h-[450px] rounded-xl overflow-hidden shadow-md bg-gray-200">
-      {/* Geolocation button */}
-      <button
-        onClick={locate}
-        disabled={geoLoading}
-        title="Use my location"
-        className="absolute top-3 right-3 z-[1000] bg-white border border-gray-300 rounded-lg p-2 shadow hover:bg-gray-50 disabled:opacity-50 transition"
-        aria-label={geoLoading ? 'Finding your location…' : 'Find properties near me'}
+    <div>
+      <div
+        className="relative w-full h-[450px] rounded-xl overflow-hidden shadow-md bg-gray-200"
+        role="group"
+        aria-label="Search results map"
       >
-        {geoLoading ? (
-          <svg
-            className="w-5 h-5 animate-spin text-blue-600"
-            viewBox="0 0 24 24"
-            fill="none"
-            aria-hidden="true"
-          >
-            <circle
-              className="opacity-25"
-              cx="12"
-              cy="12"
-              r="10"
-              stroke="currentColor"
-              strokeWidth="4"
-            />
-            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
-          </svg>
-        ) : (
-          <svg
-            className="w-5 h-5 text-blue-600"
-            fill="none"
-            viewBox="0 0 24 24"
-            stroke="currentColor"
-            strokeWidth={2}
-            aria-hidden="true"
-          >
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              d="M12 2a7 7 0 017 7c0 5.25-7 13-7 13S5 14.25 5 9a7 7 0 017-7z"
-            />
-            <circle cx="12" cy="9" r="2.5" fill="currentColor" />
-          </svg>
-        )}
-      </button>
-
-      {/* Geo-error banner — only shown after a failed locate() */}
-      {geoError && (
-        <div
-          role="alert"
-          className="absolute top-14 right-3 z-[1000] max-w-xs bg-red-50 border border-red-200 text-red-700 text-xs rounded-lg px-3 py-2 shadow"
+        <p className="sr-only">
+          This map is optional. An equivalent list of every mapped property, with
+          price and availability, follows below the map.
+        </p>
+        {/* Geolocation button */}
+        <button
+          onClick={locate}
+          disabled={geoLoading}
+          title="Use my location"
+          className="absolute top-3 right-3 z-[1000] bg-white border border-gray-300 rounded-lg p-2 shadow hover:bg-gray-50 disabled:opacity-50 transition"
+          aria-label={geoLoading ? 'Finding your location…' : 'Find properties near me'}
         >
-          {geoError}
-        </div>
-      )}
+          {geoLoading ? (
+            <svg
+              className="w-5 h-5 animate-spin text-blue-600"
+              viewBox="0 0 24 24"
+              fill="none"
+              aria-hidden="true"
+            >
+              <circle
+                className="opacity-25"
+                cx="12"
+                cy="12"
+                r="10"
+                stroke="currentColor"
+                strokeWidth="4"
+              />
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
+            </svg>
+          ) : (
+            <svg
+              className="w-5 h-5 text-blue-600"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+              strokeWidth={2}
+              aria-hidden="true"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                d="M12 2a7 7 0 017 7c0 5.25-7 13-7 13S5 14.25 5 9a7 7 0 017-7z"
+              />
+              <circle cx="12" cy="9" r="2.5" fill="currentColor" />
+            </svg>
+          )}
+        </button>
 
-      <MapContainer
-        key={mapKey}
-        center={center}
-        zoom={validProperties.length > 0 ? 11 : 3}
-        style={{ height: '100%', width: '100%' }}
-        zoomControl
-      >
-        <TileLayer
-          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-        />
+        {/* Geo-error banner — only shown after a failed locate() */}
+        {geoError && (
+          <div
+            role="alert"
+            className="absolute top-14 right-3 z-[1000] max-w-xs bg-red-50 border border-red-200 text-red-700 text-xs rounded-lg px-3 py-2 shadow"
+          >
+            {geoError}
+          </div>
+        )}
 
-        {onBoundsChanged && <BoundsListener onBoundsChanged={handleBoundsChanged} />}
+        <MapContainer
+          key={mapKey}
+          center={center}
+          zoom={validProperties.length > 0 ? 11 : 3}
+          style={{ height: '100%', width: '100%' }}
+          zoomControl
+        >
+          <TileLayer
+            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+          />
 
-        {position && <UserLocationMarker position={position} />}
+          {onBoundsChanged && <BoundsListener onBoundsChanged={handleBoundsChanged} />}
 
-        <MarkerClusterGroup chunkedLoading>
-          {validProperties.map((property) => (
-            <PriceMarker
-              key={property.id}
-              property={property}
-              active={property.id === activePropertyId}
-              onClick={() => onPropertyClick?.(property.id)}
-            />
-          ))}
-        </MarkerClusterGroup>
-      </MapContainer>
+          {selectedPosition && <MapSelectionController position={selectedPosition} />}
 
-      {validProperties.length === 0 && (
-        <div className="absolute inset-0 flex items-center justify-center bg-gray-100/80 text-gray-500 text-sm pointer-events-none">
-          No properties with location data
-        </div>
-      )}
+          {position && <UserLocationMarker position={position} />}
+
+          <MarkerClusterGroup chunkedLoading>
+            {validProperties.map((property) => (
+              <PriceMarker
+                key={property.id}
+                property={property}
+                active={property.id === selectedId}
+                onSelect={(source) => handlePinSelect(property.id, source)}
+                onClick={() => onPropertyClick?.(property.id)}
+              />
+            ))}
+          </MarkerClusterGroup>
+        </MapContainer>
+
+        {validProperties.length === 0 && (
+          <div
+            role="status"
+            className="absolute inset-0 flex items-center justify-center bg-gray-100/80 text-gray-500 text-sm pointer-events-none"
+          >
+            No properties with location data
+          </div>
+        )}
+      </div>
+
+      {/* Non-map path: full property/price/availability list, kept in sync
+          with the pins above (selection, focus, and live announcements). */}
+      <MapResultsList
+        properties={validProperties}
+        selectedId={selectedId}
+        onSelect={(id, source) => onSelectProperty?.(id, source === 'list' ? 'list' : 'map-keyboard')}
+        onOpen={onPropertyClick ? (id) => onPropertyClick(id) : undefined}
+        focusRequest={focusRequest}
+        className="mt-4"
+      />
     </div>
   );
 }

@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import type { Booking } from '@/types/booking';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
@@ -44,10 +44,16 @@ export function useBookingActions(
   const [pendingAction, setPendingAction] = useState<ActionType | null>(null);
   const [actionError, setActionError]     = useState<string | null>(null);
 
+  // Synchronous re-entry guard: state updates land after the current tick, so
+  // a second click before re-render must be rejected here or two POSTs fire.
+  const inFlightRef = useRef(false);
+
   const clearError = useCallback(() => setActionError(null), []);
 
   const call = useCallback(
     async (action: ActionType, body?: Record<string, unknown>): Promise<Booking | null> => {
+      if (inFlightRef.current) return null;
+      inFlightRef.current = true;
       setPendingAction(action);
       setActionError(null);
 
@@ -73,6 +79,7 @@ export function useBookingActions(
         setActionError(err instanceof Error ? err.message : `Failed to ${action} booking`);
         return null;
       } finally {
+        inFlightRef.current = false;
         setPendingAction(null);
       }
     },
