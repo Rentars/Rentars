@@ -10,11 +10,15 @@ export interface PushSubscription {
   };
 }
 
+export type PushPermissionState = 'granted' | 'denied' | 'default' | 'unsupported';
+
 export interface UsePushNotificationsReturn {
   isSupported: boolean;
   isSubscribed: boolean;
   isLoading: boolean;
   error: string | null;
+  /** Explicit browser notification permission state, surfaced for the UI. */
+  permission: PushPermissionState;
   subscribe: () => Promise<void>;
   unsubscribe: () => Promise<void>;
 }
@@ -24,12 +28,18 @@ export function usePushNotifications(): UsePushNotificationsReturn {
   const [isSubscribed, setIsSubscribed] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [permission, setPermission] = useState<PushPermissionState>('unsupported');
 
   useEffect(() => {
     const checkSupport = async () => {
       if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
         setIsSupported(false);
+        setPermission('unsupported');
         return;
+      }
+
+      if ('Notification' in window) {
+        setPermission(Notification.permission as PushPermissionState);
       }
 
       try {
@@ -55,6 +65,14 @@ export function usePushNotifications(): UsePushNotificationsReturn {
     setError(null);
 
     try {
+      if ('Notification' in window) {
+        const result = await Notification.requestPermission();
+        setPermission(result as PushPermissionState);
+        if (result !== 'granted') {
+          throw new Error('Notification permission was not granted');
+        }
+      }
+
       const registration = await navigator.serviceWorker.ready;
       const vapidPublicKey = process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY;
 
@@ -136,6 +154,7 @@ export function usePushNotifications(): UsePushNotificationsReturn {
     isSubscribed,
     isLoading,
     error,
+    permission,
     subscribe,
     unsubscribe,
   };

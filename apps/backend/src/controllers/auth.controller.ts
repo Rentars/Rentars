@@ -13,6 +13,7 @@ import { consumeRefreshToken, revokeRefreshToken, revokeAllUserRefreshTokens } f
 import { securityLogger } from '@/services/logging.service.js';
 import { markUserSessionsRevoked } from '@/services/sessionRevocation.service.js';
 import { auditLogger } from '@/services/auditLogger.service.js';
+import { removeAllPushSubscriptionsForUser } from '@/services/push.service.js';
 import { env } from '@/config/env.js';
 import { AuthError } from '@/types/errors.js';
 
@@ -187,6 +188,8 @@ export async function logoutAllDevices(req: Request, res: Response): Promise<voi
   await revokeAllUserRefreshTokens(userId);
   // Access tokens are stateless, so also reject every token already issued to this user.
   await markUserSessionsRevoked(userId);
+  // Stop push delivery to every device this account was registered on.
+  await removeAllPushSubscriptionsForUser(userId);
 
   await auditLogger.log({
     actorId: userId,
