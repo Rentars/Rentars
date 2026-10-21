@@ -13,6 +13,8 @@ import {
   getBookingReceipt,
   getBookingStatusHistory,
   getCalendarFeedToken,
+  rotateCalendarFeedToken,
+  revokeCalendarFeedToken,
   listUserBookings,
   raiseDispute,
   requestModification,
@@ -52,9 +54,16 @@ const bookingCreationLimiter = createUserRateLimiter({
 // GET /api/v1/bookings — list current user's bookings (cursor pagination)
 router.get('/', authenticate, validatePagination, listUserBookings);
 
-// GET /api/v1/bookings/calendar-feed-token — returns signed URL for the user's calendar feed
+// GET /api/v1/bookings/calendar-feed-token — get (or create) the user's calendar feed token
 // Must be registered BEFORE /:id to avoid being swallowed by the param route.
 router.get('/calendar-feed-token', authenticate, getCalendarFeedToken);
+
+// POST /api/v1/bookings/calendar-feed-token/rotate — revoke old token, issue new one
+router.post('/calendar-feed-token/rotate', authenticate, rotateCalendarFeedToken);
+
+// DELETE /api/v1/bookings/calendar-feed-token — revoke a specific token
+// Body: { token: string }
+router.delete('/calendar-feed-token', authenticate, revokeCalendarFeedToken);
 
 // GET /api/v1/bookings/:id
 router.get('/:id', authenticate, getBooking);

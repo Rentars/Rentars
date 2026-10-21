@@ -11,13 +11,13 @@
  *              Exact coordinates are revealed so they can navigate to the
  *              property for their upcoming or active stay.
  *
- *   host     — The property owner (host) or a platform admin.
+ *   host     — The property owner (host) or a platform admin/moderator.
  *              Always receives exact coordinates.
  *
  * Tiers are evaluated in the controller via viewerHasExactLocationAccess and
  * enforced by redactExactCoordinates / toApproximateLocation.
  * Logs and data-exports must never include exact coordinates for public-tier
- * viewers; strip them before writing to any external sink.
+ * viewers; call sanitizePropertyForExport() before writing to any external sink.
  */
 
 /** Approximate radius shown on public map, in metres */
@@ -98,4 +98,73 @@ export function redactExactCoordinates<
     latitude: undefined,
     longitude: undefined,
   };
+}
+
+/**
+ * Strip exact coordinates from a property object before writing it to any
+ * external sink (logs, exports, analytics pipelines).
+ *
+ * This is distinct from redactExactCoordinates: it removes the fields
+ * entirely rather than replacing them with approximations, so downstream
+ * consumers cannot reconstruct even an approximate position from the output.
+ *
+ * Call this before:
+ *   - Passing property data to a structured logger
+ *   - Writing CSV / JSON exports for non-owner recipients
+ *   - Sending property details to third-party analytics APIs
+ */
+export function sanitizePropertyForExport<
+  T extends { latitude?: unknown; longitude?: unknown },
+>(property: T): Omit<T, 'latitude' | 'longitude'> {
+  const { latitude: _lat, longitude: _lng, ...safe } = property;
+  void _lat;
+  void _lng;
+  return safe as Omit<T, 'latitude' | 'longitude'>;
+}
+
+/**
+ * Return the location precision tier for a viewer.
+ *
+ * Roles that receive 'host' tier (exact coordinates):
+ *   - The property's own owner
+ *   - Platform admins and moderators (need exact locations for dispute resolution)
+ *
+ * 'booking' tier (exact coordinates for navigation):
+ *   - Tenants with a Pending or Confirmed booking on the property
+ *
+ * Everyone else gets 'public' tier (approximate only).
+ *
+ * @param propertyId   - UUID of the property being viewed
+ * @param ownerId      - owner_id from the property row
+ * @param viewerUserId - authenticated user's ID (undefined = anonymous)
+ * @param viewerRole   - JWT role claim of the viewer (undefined = not set)
+ * @param supabaseClient - Supabase client for the booking check
+ */
+export async function resolveLocationTier(
+  propertyId: string,
+  ownerId: string | undefined,
+  viewerUserId: string | undefined,
+  viewerRole: string | undefined,
+  supabaseClient: import('@supabase/supabase-js').SupabaseClient,
+): Promise<LocationPrecisionTier> {
+  if (!viewerUserId) return 'public';
+
+  // Host tier 1: property owner
+  if (ownerId && viewerUserId === ownerId) return 'host';
+
+  // Host tier 2: platform admin or moderator
+  if (viewerRole === 'admin' || viewerRole === 'moderator') return 'host';
+
+  // Booking tier: tenants with an active or upcoming booking
+  const { data } = await supabaseClient
+    .from('bookings')
+    .select('id')
+    .eq('property_id', propertyId)
+    .eq('tenant_id', viewerUserId)
+    .in('status', ['Pending', 'Confirmed'])
+    .limit(1);
+
+  if (Array.isArray(data) && data.length > 0) return 'booking';
+
+  return 'public';
 }

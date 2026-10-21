@@ -21,6 +21,9 @@ import {
   rejectReviewHandler,
   getReviewResponseHistory,
   moderateHostResponseHandler,
+  getRepairQueueHandler,
+  reconcileReviewsHandler,
+  resolveRepairTaskHandler,
 } from '../controllers/review.controller.js';
 import { validateBody } from '../validators/booking.validator.js';
 import {
@@ -37,83 +40,130 @@ import { validatePagination } from '../validators/pagination.validator.js';
 
 const router = Router();
 
-// POST /api/v1/reviews
+// ─── Public / tenant routes ───────────────────────────────────────────────────
+
+// POST /api/v1/reviews — submit a review (tenant only; service checks booking ownership)
 router.post('/', authenticate, validateBody(createReviewSchema), createReview);
 
-// GET /api/v1/reviews/property/:id
+// GET /api/v1/reviews/property/:id — list approved reviews for a property
 router.get('/property/:id', validatePagination, getPropertyReviews);
 
-// GET /api/v1/reviews/user/:id
+// GET /api/v1/reviews/user/:id — list approved reviews targeting a user
 router.get('/user/:id', validatePagination, getUserReviews);
 
-// GET /api/v1/reviews/user/:id/average
+// GET /api/v1/reviews/user/:id/average — average rating for a user
 router.get('/user/:id/average', getUserAverageRating);
 
-// POST /api/reviews/:id/response — host creates or edits their response
-router.post('/:id/response', authenticate, respondToReview);
+// ─── Host response channel ────────────────────────────────────────────────────
+//
+// Rules (enforced jointly by route + service):
+//   - Only authenticated users with role 'host' may attempt a response.
+//   - The service further checks that the caller is the current property owner.
+//   - One visible response per review; edits are allowed within the 48-hour
+//     edit window; removed responses cannot be edited.
 
-// GET /api/reviews/:id/response/history — admin: full edit history
-router.get('/:id/response/history', authenticate, requireRole('admin'), getReviewResponseHistory);
+// POST /api/v1/reviews/:id/response — host submits or edits their response
+router.post('/:id/response', authenticate, requireRole('host', 'admin'), respondToReview);
 
-// PATCH /api/reviews/:id/response/moderate — admin/moderator: approve, reject, or remove
-router.patch('/:id/response/moderate', authenticate, requireRole('admin'), moderateHostResponseHandler);
+// GET /api/v1/reviews/:id/response/history — full edit history (admin only)
+router.get(
+  '/:id/response/history',
+  authenticate,
+  requireRole('admin', 'moderator'),
+  getReviewResponseHistory,
+);
 
-// POST /api/reviews/:id/flag — report a review for moderation
-router.post('/:id/flag', authenticate, validateBody(flagReviewSchema), reportReview);
+// PATCH /api/v1/reviews/:id/response/moderate — approve / reject / remove (admin/moderator)
+router.patch(
+  '/:id/response/moderate',
+  authenticate,
+  requireRole('admin', 'moderator'),
+  moderateHostResponseHandler,
+);
 
-// GET /api/reviews/moderation/flagged — list flagged reviews (admin)
-router.get('/moderation/flagged', authenticate, requireRole('admin'), listFlaggedReviews);
+// ─── Reporting ────────────────────────────────────────────────────────────────
 
-// GET /api/v1/reviews/moderation/pending — list pending reviews (admin)
-router.get('/moderation/pending', authenticate, requireRole('admin'), listPendingReviews);
-
-// GET /api/v1/reviews/moderation/queue — moderation queue (admin)
-router.get('/moderation/queue', authenticate, requireRole('admin'), listModerationQueue);
-
-// GET /api/v1/reviews/moderation/appeals — pending appeals (admin)
-router.get('/moderation/appeals', authenticate, requireRole('admin'), listPendingAppeals);
-
-// ─── Sync / repair queue routes (admin) ──────────────────────────────────────
-
-// GET /api/v1/reviews/sync/repair-queue — list repair queue tasks (admin)
-router.get('/sync/repair-queue', authenticate, requireRole('admin'), getRepairQueueHandler);
-
-// POST /api/v1/reviews/sync/reconcile — trigger reconciliation (admin)
-router.post('/sync/reconcile', authenticate, requireRole('admin'), reconcileReviewsHandler);
-
-// POST /api/v1/reviews/sync/repair/:id/resolve — resolve repair task (admin)
-router.post('/sync/repair/:id/resolve', authenticate, requireRole('admin'), validateBody(resolveRepairTaskSchema), resolveRepairTaskHandler);
-
-// ─── Per-review routes ─────────────────────────────────────────────────────────
-
-// POST /api/v1/reviews/:id/response — host replies to a review
-router.post('/:id/response', authenticate, respondToReview);
-
-// POST /api/v1/reviews/:id/flag — legacy flag a review for moderation
+// POST /api/v1/reviews/:id/flag — legacy flag (any authenticated user)
 router.post('/:id/flag', authenticate, validateBody(flagReviewSchema), reportReview);
 
 // POST /api/v1/reviews/:id/report — structured report with policy reason code
 router.post('/:id/report', authenticate, validateBody(reportReviewSchema), reportReviewStructured);
 
-// PATCH /api/v1/reviews/:id/moderate — approve or reject (admin)
-router.patch('/:id/moderate', authenticate, requireRole('admin'), moderateReviewHandler);
+// ─── Appeals ─────────────────────────────────────────────────────────────────
 
-// POST /api/v1/reviews/:id/approve — approve a review (admin)
-router.post('/:id/approve', authenticate, requireRole('admin'), approveReviewHandler);
-
-// POST /api/v1/reviews/:id/reject — reject with reason and policy (admin)
-router.post('/:id/reject', authenticate, requireRole('admin'), validateBody(rejectReviewSchema), rejectReviewHandler);
-
-// PATCH /api/v1/reviews/:id/moderation/start — start moderation review (admin)
-router.patch('/:id/moderation/start', authenticate, requireRole('admin'), startModerationHandler);
-
-// POST /api/v1/reviews/:id/moderation-action — hide/remove/keep (admin)
-router.post('/:id/moderation-action', authenticate, requireRole('admin'), validateBody(moderationActionSchema), moderationActionHandler);
-
-// POST /api/v1/reviews/:id/appeal — submit appeal (reviewer only)
+// POST /api/v1/reviews/:id/appeal — submit an appeal (review author only; enforced in service)
 router.post('/:id/appeal', authenticate, validateBody(submitAppealSchema), submitAppealHandler);
 
-// PATCH /api/v1/reviews/:id/appeal/resolve — resolve appeal (admin)
-router.patch('/:id/appeal/resolve', authenticate, requireRole('admin'), validateBody(resolveAppealSchema), resolveAppealHandler);
+// PATCH /api/v1/reviews/:id/appeal/resolve — resolve a pending appeal (admin)
+router.patch(
+  '/:id/appeal/resolve',
+  authenticate,
+  requireRole('admin', 'moderator'),
+  validateBody(resolveAppealSchema),
+  resolveAppealHandler,
+);
+
+// ─── Moderation queue (admin / moderator) ─────────────────────────────────────
+
+// GET /api/v1/reviews/moderation/flagged
+router.get('/moderation/flagged', authenticate, requireRole('admin', 'moderator'), listFlaggedReviews);
+
+// GET /api/v1/reviews/moderation/pending
+router.get('/moderation/pending', authenticate, requireRole('admin', 'moderator'), listPendingReviews);
+
+// GET /api/v1/reviews/moderation/queue
+router.get('/moderation/queue', authenticate, requireRole('admin', 'moderator'), listModerationQueue);
+
+// GET /api/v1/reviews/moderation/appeals
+router.get('/moderation/appeals', authenticate, requireRole('admin', 'moderator'), listPendingAppeals);
+
+// PATCH /api/v1/reviews/:id/moderate — simple approve/reject toggle (admin)
+router.patch('/:id/moderate', authenticate, requireRole('admin', 'moderator'), moderateReviewHandler);
+
+// POST /api/v1/reviews/:id/approve
+router.post('/:id/approve', authenticate, requireRole('admin', 'moderator'), approveReviewHandler);
+
+// POST /api/v1/reviews/:id/reject
+router.post(
+  '/:id/reject',
+  authenticate,
+  requireRole('admin', 'moderator'),
+  validateBody(rejectReviewSchema),
+  rejectReviewHandler,
+);
+
+// PATCH /api/v1/reviews/:id/moderation/start
+router.patch(
+  '/:id/moderation/start',
+  authenticate,
+  requireRole('admin', 'moderator'),
+  startModerationHandler,
+);
+
+// POST /api/v1/reviews/:id/moderation-action — hide / remove / keep
+router.post(
+  '/:id/moderation-action',
+  authenticate,
+  requireRole('admin', 'moderator'),
+  validateBody(moderationActionSchema),
+  moderationActionHandler,
+);
+
+// ─── Sync / repair queue (admin) ──────────────────────────────────────────────
+
+// GET /api/v1/reviews/sync/repair-queue
+router.get('/sync/repair-queue', authenticate, requireRole('admin'), getRepairQueueHandler);
+
+// POST /api/v1/reviews/sync/reconcile
+router.post('/sync/reconcile', authenticate, requireRole('admin'), reconcileReviewsHandler);
+
+// POST /api/v1/reviews/sync/repair/:id/resolve
+router.post(
+  '/sync/repair/:id/resolve',
+  authenticate,
+  requireRole('admin'),
+  validateBody(resolveRepairTaskSchema),
+  resolveRepairTaskHandler,
+);
 
 export default router;

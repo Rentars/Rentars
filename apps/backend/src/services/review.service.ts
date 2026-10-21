@@ -282,6 +282,14 @@ export async function addHostResponse(
   const isFirstResponse = !r.host_response;
   const now = new Date();
 
+  // ── Removed response guard ───────────────────────────────────────────────────
+  // A removed response cannot be re-submitted. The host must contact support
+  // if they believe the removal was in error (they can file an appeal on the
+  // review). This prevents a removed response from being silently replaced.
+  if (r.host_response_mod_status === 'removed') {
+    return { success: false, error: 'This response has been removed by a moderator and cannot be resubmitted' };
+  }
+
   // ── Edit window enforcement ──────────────────────────────────────────────────
   if (!isFirstResponse) {
     if (!r.host_response_edit_deadline) {
@@ -292,10 +300,6 @@ export async function addHostResponse(
         success: false,
         error: `Responses can only be edited within ${RESPONSE_EDIT_WINDOW_HOURS} hours of posting`,
       };
-    }
-    // Removed responses cannot be edited
-    if (r.host_response_mod_status === 'removed') {
-      return { success: false, error: 'This response has been removed by a moderator' };
     }
   }
 

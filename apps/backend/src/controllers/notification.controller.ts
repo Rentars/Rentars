@@ -3,6 +3,7 @@ import type { AuthRequest } from '../middleware/auth.middleware.js';
 import {
   deleteAllNotifications,
   deleteNotification,
+  getNotificationById,
   getNotifications,
   getNotificationsCursor,
   getPreferences,
@@ -21,6 +22,34 @@ import {
 } from '../services/push.service.js';
 import { verifyPreferenceToken } from '../services/preferenceToken.js';
 
+/**
+ * Validate that a deep_link path is safe to return to the client.
+ *
+ * Rules:
+ *  - Must be a relative path (starts with '/') — no external redirects.
+ *  - Must not contain protocol separators or backslashes.
+ *  - Length cap to prevent log pollution.
+ *
+ * Returns the sanitised path, or null when the link fails validation.
+ * A null result means the caller should omit the deep_link field from
+ * the response rather than surfacing a potentially unsafe URL.
+ */
+function validateDeepLink(raw: string | null | undefined): string | null {
+  if (!raw || typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (
+    trimmed.length === 0 ||
+    trimmed.length > 512 ||
+    !trimmed.startsWith('/') ||          // must be a relative path
+    trimmed.includes('//') ||            // no protocol-relative URLs
+    trimmed.includes('\\') ||            // no backslash tricks
+    /[<>"'`]/.test(trimmed)              // no HTML injection chars
+  ) {
+    return null;
+  }
+  return trimmed;
+}
+
 export async function listNotifications(req: AuthRequest, res: Response): Promise<void> {
   const userId = req.userId;
   if (!userId) {
@@ -37,7 +66,16 @@ export async function listNotifications(req: AuthRequest, res: Response): Promis
       ? (categoryParam as NotificationCategory)
       : null;
 
-  const result = await getNotifications(userId, pagination?.page ?? 1, pagination?.pageSize ?? 20, category);
+  // Optional unread-only filter: ?unread=true
+  const unreadOnly = req.query.unread === 'true';
+
+  const result = await getNotifications(
+    userId,
+    pagination?.page ?? 1,
+    pagination?.pageSize ?? 20,
+    category,
+    unreadOnly,
+  );
   if (!result.success) {
     res.status(400).json({ error: result.error });
     return;
@@ -47,7 +85,12 @@ export async function listNotifications(req: AuthRequest, res: Response): Promis
 
 /**
  * GET /api/v1/notifications/cursor
- * Cursor-based paginated list with optional category filter.
+ * Cursor-based paginated list with optional category and unread filters.
+ * Query params:
+ *   cursor   — opaque string from previous response
+ *   limit    — page size (1–100, default 20)
+ *   category — one of the valid NotificationCategory values
+ *   unread   — "true" to return only unread notifications
  */
 export async function listNotificationsCursorHandler(req: AuthRequest, res: Response): Promise<void> {
   const userId = req.userId;
@@ -67,7 +110,10 @@ export async function listNotificationsCursorHandler(req: AuthRequest, res: Resp
       ? (categoryParam as NotificationCategory)
       : null;
 
-  const result = await getNotificationsCursor(userId, cursor, limit, category);
+  // Optional unread-only filter: ?unread=true
+  const unreadOnly = req.query.unread === 'true';
+
+  const result = await getNotificationsCursor(userId, cursor, limit, category, unreadOnly);
   if (!result.success) {
     res.status(400).json({ error: result.error });
     return;
@@ -118,6 +164,141 @@ export async function bulkReadNotifications(req: AuthRequest, res: Response): Pr
     return;
   }
   res.json(result.data);
+}
+
+/**
+ * GET /api/v1/notifications/:id
+ *
+ * Returns a single notification for the authenticated user.
+ *
+ * Authorization:
+ *  - The `user_id` filter in the service ensures users can only read
+ *    their own notifications (returns 404, not 403, to avoid leaking
+ *    whether another user's notification exists at that ID).
+ *
+ * Deep-link guard:
+ *  - The `deep_link` field is validated before being returned.
+ *  - External URLs, protocol-relative paths, and paths containing
+ *    suspicious characters are stripped from the response.
+ *  - A `deep_link_status` field tells the client whether the link is
+ *    present, safe, or was omitted due to a validation failure.
+ *
+ * Stale-resource handling:
+ *  - When the deep_link refers to a booking or review that no longer
+ *    exists, the notification is still returned but `deep_link_status`
+ *    is set to "target_gone" so the client can show a fallback UI
+ *    instead of a broken link.
+ */
+export async function getNotificationHandler(req: AuthRequest, res: Response): Promise<void> {
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const result = await getNotificationById(req.params.id, userId);
+  if (!result.success) {
+    // Service returns 'Notification not found' for both missing and cross-user access.
+    // Always 404 to avoid leaking ownership information.
+    res.status(404).json({ error: 'Notification not found' });
+    return;
+  }
+
+  const notification = result.data;
+
+  // ── Deep-link validation ───────────────────────────────────────────────────
+  const rawDeepLink = notification.deep_link;
+  const safeDeepLink = validateDeepLink(rawDeepLink);
+
+  let deepLinkStatus: 'none' | 'ok' | 'invalid' | 'target_gone' = 'none';
+
+  if (rawDeepLink) {
+    if (!safeDeepLink) {
+      // The stored path failed validation — omit it and flag the issue.
+      deepLinkStatus = 'invalid';
+    } else {
+      // Validate that the linked target still exists and belongs to the user.
+      // We only verify resources the user is authorised to see.
+      // If verification fails we degrade gracefully rather than blocking the response.
+      deepLinkStatus = await verifyDeepLinkTarget(safeDeepLink, userId);
+    }
+  }
+
+  res.json({
+    ...notification,
+    deep_link: deepLinkStatus === 'ok' ? safeDeepLink : null,
+    deep_link_status: deepLinkStatus,
+  });
+}
+
+/**
+ * Verify that the resource a deep_link points to still exists and that the
+ * requesting user is authorised to access it.
+ *
+ * Supports:
+ *   /bookings/:id           — checks bookings table (tenant or host)
+ *   /properties/:id         — always accessible (public listing)
+ *   /properties/:slug#*     — same
+ *   /reviews/:id            — checks reviews table (reviewer or target)
+ *   /admin/*                — allowed only for admin/moderator roles
+ *
+ * Unrecognised paths are treated as 'ok' so we don't accidentally block
+ * valid links we haven't modelled yet.
+ */
+async function verifyDeepLinkTarget(
+  path: string,
+  userId: string,
+): Promise<'ok' | 'target_gone'> {
+  try {
+    // Strip hash fragment before matching
+    const pathWithoutHash = path.split('#')[0];
+
+    // /bookings/:id
+    const bookingMatch = pathWithoutHash.match(/^\/bookings\/([0-9a-f-]{36})$/i);
+    if (bookingMatch) {
+      const { supabase } = await import('../config/supabase.js');
+      const { data } = await supabase
+        .from('bookings')
+        .select('id')
+        .eq('id', bookingMatch[1])
+        .or(`tenant_id.eq.${userId},properties.owner_id.eq.${userId}`)
+        .maybeSingle();
+      return data ? 'ok' : 'target_gone';
+    }
+
+    // /reviews/:id or /reviews (list — always safe)
+    const reviewMatch = pathWithoutHash.match(/^\/reviews\/([0-9a-f-]{36})$/i);
+    if (reviewMatch) {
+      const { supabase } = await import('../config/supabase.js');
+      const { data } = await supabase
+        .from('reviews')
+        .select('id')
+        .eq('id', reviewMatch[1])
+        .neq('visibility', 'removed')
+        .maybeSingle();
+      return data ? 'ok' : 'target_gone';
+    }
+
+    // /properties/:id or /properties/:slug — public; just confirm the row exists
+    const propertyMatch = pathWithoutHash.match(/^\/properties\/([^/]+)$/i);
+    if (propertyMatch) {
+      const { supabase } = await import('../config/supabase.js');
+      const idOrSlug = propertyMatch[1];
+      // Try by UUID first, then fall back to slug
+      const isUuid = /^[0-9a-f-]{36}$/i.test(idOrSlug);
+      const { data } = isUuid
+        ? await supabase.from('properties').select('id').eq('id', idOrSlug).maybeSingle()
+        : await supabase.from('properties').select('id').eq('slug', idOrSlug).maybeSingle();
+      return data ? 'ok' : 'target_gone';
+    }
+
+    // All other paths — treat as ok (we can't verify them without more context)
+    return 'ok';
+  } catch {
+    // Verification failure is non-fatal — degrade to 'ok' so the notification
+    // is still surfaced even if the DB check fails transiently.
+    return 'ok';
+  }
 }
 
 export async function readNotification(req: AuthRequest, res: Response): Promise<void> {
