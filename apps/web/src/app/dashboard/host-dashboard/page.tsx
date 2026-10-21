@@ -2,10 +2,17 @@
 
 import { useState } from 'react';
 import Link from 'next/link';
-import { Plus, AlertCircle, RefreshCw } from 'lucide-react';
+import { Plus } from 'lucide-react';
 import { useHostDashboard } from '@/hooks/useHostDashboard';
 import DashboardSummaryCards from '@/components/dashboard/DashboardSummaryCards';
 import HostPropertiesTable from '@/components/dashboard/HostPropertiesTable';
+import {
+  DashboardSummarySkeleton,
+  EmptyState,
+  ErrorState,
+  SkeletonRegion,
+  TableRowsSkeleton,
+} from '@/components/ui';
 import BookingStats from './components/BookingStats';
 import EarningsSummary from './components/EarningsSummary';
 import PaymentMethods from './components/PaymentMethods';
@@ -74,24 +81,30 @@ export default function HostDashboard() {
         </div>
 
         {/* ── Real API: Dashboard Summary ────────────────────────────────── */}
+        {/* Loading / error / empty / success are four distinct states: the
+            skeleton mirrors the real cards' dimensions (no layout shift),
+            errors are announced and retry-safe, and "no data" is never
+            reported as an error. */}
         {isLoadingSummary ? (
-          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4 animate-pulse">
-            {[1, 2, 3, 4].map((i) => (
-              <div key={i} className="h-28 bg-gray-200 dark:bg-gray-800 rounded-xl" />
-            ))}
-          </div>
+          <SkeletonRegion label="Loading dashboard summary" className="min-h-0">
+            <DashboardSummarySkeleton />
+          </SkeletonRegion>
         ) : summaryError ? (
-          <div className="flex items-center gap-3 p-4 bg-red-50 dark:bg-red-950 rounded-xl border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300 text-sm">
-            <AlertCircle size={18} />
-            <span>Could not load dashboard summary: {summaryError}</span>
-            <button onClick={refetchSummary} className="ml-auto flex items-center gap-1 hover:underline">
-              <RefreshCw size={14} />
-              Retry
-            </button>
-          </div>
+          <ErrorState
+            variant="inline"
+            message={`Could not load dashboard summary: ${summaryError}`}
+            onRetry={refetchSummary}
+            retryLabel="Retry"
+            retrying={isLoadingSummary}
+          />
         ) : summary ? (
           <DashboardSummaryCards summary={summary} />
-        ) : null}
+        ) : (
+          <EmptyState
+            title="No summary data yet"
+            description="Once your property gets bookings, revenue and occupancy totals will appear here."
+          />
+        )}
 
         {/* Available Balance (kept from existing earnings flow) */}
         <AvailableBalance
@@ -140,20 +153,17 @@ export default function HostDashboard() {
           </div>
 
           {isLoadingProperties ? (
-            <div className="space-y-2 animate-pulse">
-              {[1, 2, 3].map((i) => (
-                <div key={i} className="h-16 bg-gray-200 dark:bg-gray-800 rounded-xl" />
-              ))}
-            </div>
+            <SkeletonRegion label="Loading your properties">
+              <TableRowsSkeleton rows={3} />
+            </SkeletonRegion>
           ) : propertiesError ? (
-            <div className="flex items-center gap-3 p-4 bg-red-50 dark:bg-red-950 rounded-xl border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300 text-sm">
-              <AlertCircle size={18} />
-              <span>{propertiesError}</span>
-              <button onClick={refetchProperties} className="ml-auto flex items-center gap-1 hover:underline">
-                <RefreshCw size={14} />
-                Retry
-              </button>
-            </div>
+            <ErrorState
+              variant="inline"
+              message={propertiesError}
+              onRetry={refetchProperties}
+              retryLabel="Retry"
+              retrying={isLoadingProperties}
+            />
           ) : (
             <HostPropertiesTable
               properties={properties}

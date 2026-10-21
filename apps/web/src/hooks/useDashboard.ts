@@ -32,13 +32,22 @@ export function useDashboard(
 
   const initialFetched = useRef(false);
   const isLoadingMoreRef = useRef(false);
+  // Synchronous in-flight flag for first-page loads. `isLoading` state lands a
+  // tick late, so a retry double-click could otherwise start two identical
+  // requests; the flag is set before fetchPage's first await.
+  const firstPageInFlightRef = useRef(false);
 
   const fetchPage = useCallback(
     async (cursor: string | null, isFirst: boolean) => {
+      if (isFirst) firstPageInFlightRef.current = true;
+
       const token = localStorage.getItem('token');
       if (!token) {
         setError('Not authenticated');
-        if (isFirst) setIsLoading(false);
+        if (isFirst) {
+          firstPageInFlightRef.current = false;
+          setIsLoading(false);
+        }
         return;
       }
 
@@ -97,8 +106,10 @@ export function useDashboard(
         const message = err instanceof Error ? err.message : 'Failed to load bookings';
         setError(message);
       } finally {
-        if (isFirst) setIsLoading(false);
-        else {
+        if (isFirst) {
+          firstPageInFlightRef.current = false;
+          setIsLoading(false);
+        } else {
           setIsLoadingMore(false);
           isLoadingMoreRef.current = false;
         }
@@ -121,6 +132,9 @@ export function useDashboard(
   }, [hasMore, nextCursor, fetchPage]);
 
   const refetch = useCallback(() => {
+    // Safe retry: reject while a first-page load is already in flight so a
+    // double click (or retry + effect overlap) cannot duplicate the request.
+    if (firstPageInFlightRef.current) return;
     initialFetched.current = false;
     fetchPage(null, true);
   }, [fetchPage]);

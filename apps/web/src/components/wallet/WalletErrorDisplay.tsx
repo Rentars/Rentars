@@ -65,7 +65,10 @@ export function WalletErrorDisplay({ className = '', onDismiss }: WalletErrorDis
     };
 
     return (
-        <div className={`rounded-lg border p-4 ${getBgColor()} ${className}`}>
+        <div
+            role="alert"
+            className={`rounded-lg border p-4 ${getBgColor()} ${className}`}
+        >
             <div className="flex items-start gap-3">
                 <div className="flex-shrink-0">{getIcon()}</div>
                 <div className="flex-1 min-w-0">
@@ -74,9 +77,10 @@ export function WalletErrorDisplay({ className = '', onDismiss }: WalletErrorDis
                 {onDismiss && (
                     <button
                         onClick={onDismiss}
+                        aria-label="Dismiss wallet error"
                         className="flex-shrink-0 text-gray-400 hover:text-gray-600 transition-colors"
                     >
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
                         </svg>
                     </button>

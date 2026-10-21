@@ -4,11 +4,13 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { Loader2, AlertCircle, ChevronDown } from 'lucide-react';
 import FilterSidebar, { type FilterState } from '@/components/search/FilterSidebar';
-import PropertyMap from '@/components/search/PropertyMap';
+import PropertyMap, { type MapSelectSource } from '@/components/search/PropertyMap';
 import PropertyGrid from '@/components/search/PropertyGrid';
 import { usePropertySearch, type ZeroResultSuggestion } from '@/hooks/usePropertySearch';
 import { useGeolocation, type GeoPosition } from '@/hooks/useGeolocation';
+import { useOnlineStatus } from '@/hooks/useOnlineStatus';
 import { useNearbyProperties, geocodeAddress } from '@/hooks/useLocationSearch';
+import { ErrorState } from '@/components/ui/async-states';
 import type { LatLngBounds } from 'leaflet';
 
 // ─── URL ↔ filter helpers ─────────────────────────────────────────────────────
@@ -97,7 +99,9 @@ export default function SearchPage() {
   const [filters, setFilters] = useState<FilterState>(() => paramsToFilters(searchParams));
   const [searchQuery, setSearchQuery] = useState(() => searchParams.get('q') ?? '');
   const [showMap, setShowMap] = useState(false);
-  const [activePropertyId, setActivePropertyId] = useState<string | undefined>();
+  // Selected listing — synchronised between map pins and the accessible
+  // results list (and announced via the list's live region).
+  const [selectedPropertyId, setSelectedPropertyId] = useState<string | undefined>();
 
   // Searchbar input value (may lag behind searchQuery while user types)
   const [inputValue, setInputValue] = useState(searchQuery);
@@ -111,9 +115,12 @@ export default function SearchPage() {
     zeroResultSuggestions,
     search,
     loadMore,
+    retry,
     searchByBounds,
     applyZeroResultSuggestion,
   } = usePropertySearch();
+
+  const { isOnline } = useOnlineStatus();
 
   // ── Nearby search (GPS) ────────────────────────────────────────────────────
   const [nearbyParams, setNearbyParams] = useState<{
@@ -185,6 +192,15 @@ export default function SearchPage() {
   // Decide which result set to display
   const displayResults = nearbyParams ? nearbyProps : results;
   const displayLoading = nearbyParams ? nearbyLoading : loading;
+  const displayError = nearbyParams ? null : error;
+
+  // Map-driven selection: pin activation (keyboard or pointer) and list
+  // activation both funnel here so the pin, the list, and the details stay
+  // synchronised. Pointer selections leave focus alone; keyboard selections
+  // are reflected in the pin's aria-pressed state and announced by the list.
+  const handleSelectProperty = useCallback((id: string, _source: MapSelectSource | 'list') => {
+    setSelectedPropertyId(id);
+  }, []);
 
   return (
     <main id="main-content" className="min-h-screen bg-gray-50 dark:bg-gray-950">
@@ -306,10 +322,24 @@ export default function SearchPage() {
           <div className="mb-6">
             <PropertyMap
               properties={displayResults as any[]}
-              activePropertyId={activePropertyId}
+              selectedPropertyId={selectedPropertyId}
+              onSelectProperty={handleSelectProperty}
               onPropertyClick={(id) => { router.push(`/property/${id}`); }}
               onBoundsChanged={handleBoundsChanged}
               onUserLocation={handleUserLocation}
+            />
+          </div>
+        )}
+
+        {/* Offline notice — search terms and filters are preserved; retry is
+            guarded so an impatient double click cannot fire two requests. */}
+        {!isOnline && (
+          <div className="mb-4">
+            <ErrorState
+              variant="inline"
+              message="You appear to be offline. Your search terms and filters are preserved — retry when your connection returns."
+              onRetry={retry}
+              retryLabel="Retry now"
             />
           </div>
         )}
@@ -326,7 +356,7 @@ export default function SearchPage() {
           <div className="lg:col-span-3 space-y-6">
 
             {/* Zero-result suggestions */}
-            {!displayLoading && !error && displayResults.length === 0 && (
+            {!displayLoading && !displayError && displayResults.length === 0 && (
               <ZeroResultSuggestions
                 suggestions={zeroResultSuggestions}
                 filters={filters}
@@ -334,11 +364,14 @@ export default function SearchPage() {
               />
             )}
 
+            {/* Loading / empty / error / success are all handled inside the
+                grid: skeletons keep stable dimensions, empty is distinct from
+                error, and the retry button cannot double-fire. */}
             <PropertyGrid
               properties={displayResults as any[]}
               loading={displayLoading}
-              error={error}
-              onRetry={() => search(searchQuery, filters, 1)}
+              error={displayError}
+              onRetry={retry}
             />
 
             {/* Load more */}

@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
 const BASE = `${API_URL}/api/v1/host`;
@@ -41,7 +41,17 @@ export function useHostDashboard() {
   const [summaryError, setSummaryError] = useState<string | null>(null);
   const [propertiesError, setPropertiesError] = useState<string | null>(null);
 
+  // Synchronous in-flight guards: the loading state lands a tick late, so
+  // retries (button + effect overlap, or a double click) could otherwise
+  // stack identical requests. The Set scopes the status-update guard per
+  // property so toggling one listing never blocks another.
+  const summaryInFlightRef = useRef(false);
+  const propertiesInFlightRef = useRef(false);
+  const updatingIdsRef = useRef<Set<string>>(new Set());
+
   const fetchSummary = useCallback(async () => {
+    if (summaryInFlightRef.current) return;
+    summaryInFlightRef.current = true;
     setIsLoadingSummary(true);
     setSummaryError(null);
     try {
@@ -52,11 +62,14 @@ export function useHostDashboard() {
     } catch (err) {
       setSummaryError(err instanceof Error ? err.message : 'Failed to load summary');
     } finally {
+      summaryInFlightRef.current = false;
       setIsLoadingSummary(false);
     }
   }, []);
 
   const fetchProperties = useCallback(async (page = 1, limit = 20) => {
+    if (propertiesInFlightRef.current) return;
+    propertiesInFlightRef.current = true;
     setIsLoadingProperties(true);
     setPropertiesError(null);
     try {
@@ -69,6 +82,7 @@ export function useHostDashboard() {
     } catch (err) {
       setPropertiesError(err instanceof Error ? err.message : 'Failed to load properties');
     } finally {
+      propertiesInFlightRef.current = false;
       setIsLoadingProperties(false);
     }
   }, []);
@@ -78,6 +92,10 @@ export function useHostDashboard() {
       propertyId: string,
       status: 'draft' | 'published' | 'unpublished',
     ): Promise<boolean> => {
+      // Re-entry guard: a double click on the same toggle must not fire two
+      // PATCHes (which could flip the status back and forth).
+      if (updatingIdsRef.current.has(propertyId)) return false;
+      updatingIdsRef.current.add(propertyId);
       try {
         const res = await fetch(`${BASE}/properties/${propertyId}/status`, {
           method: 'PATCH',
@@ -90,6 +108,8 @@ export function useHostDashboard() {
         return true;
       } catch {
         return false;
+      } finally {
+        updatingIdsRef.current.delete(propertyId);
       }
     },
     [fetchProperties],

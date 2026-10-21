@@ -23,8 +23,16 @@ export function WalletRequiredGuard({
     // Still loading
     if (!isReady || state.isLoading) {
         return (
-            <div className={`flex items-center justify-center p-8 ${className}`}>
-                <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
+            <div
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+                className={`flex items-center justify-center p-8 ${className}`}
+            >
+                <div
+                    className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"
+                    aria-hidden="true"
+                ></div>
                 <span className="ml-3 text-gray-600">Checking wallet connection...</span>
             </div>
         );

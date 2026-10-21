@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import {
   connectFreighterWallet,
   getWalletStatus,
@@ -69,17 +69,31 @@ export function useWallet(): UseWalletReturn {
     return () => window.removeEventListener('storage', handleStorageChange);
   }, []);
 
+  // Synchronous re-entry guard: the 2s status poll, focus listener, and
+  // storage events can all fire while a wallet round-trip is still in flight.
+  // State updates land a tick late, so the "isLoading" flag alone cannot
+  // reject overlapping calls — this ref can.
+  const inFlightRef = useRef(false);
+
   const checkStatus = useCallback(async () => {
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
     setState((prev) => ({ ...prev, isLoading: true }));
-    // Pass apiUrl so getWalletStatus can run the three-way network check.
-    const status = await getWalletStatus(expectedNetwork, API_URL);
-    setState({
-      ...status,
-      isLoading: false,
-    });
+    try {
+      // Pass apiUrl so getWalletStatus can run the three-way network check.
+      const status = await getWalletStatus(expectedNetwork, API_URL);
+      setState({
+        ...status,
+        isLoading: false,
+      });
+    } finally {
+      inFlightRef.current = false;
+    }
   }, [expectedNetwork]);
 
   const connect = useCallback(async () => {
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
     setState((prev) => ({ ...prev, isLoading: true, error: null }));
 
     try {
@@ -130,6 +144,8 @@ export function useWallet(): UseWalletReturn {
       }));
 
       throw error;
+    } finally {
+      inFlightRef.current = false;
     }
   }, [expectedNetwork]);
 

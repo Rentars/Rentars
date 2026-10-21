@@ -23,6 +23,12 @@ interface BookingFormProps {
   onSubmit: (data: { checkIn: Date; checkOut: Date; guestCount: number; totalPrice: number }) => void;
   isLoading?: boolean;
   /**
+   * Externally-imposed block on submitting (e.g. house rules or terms not yet
+   * acknowledged). Renders the submit button as genuinely disabled instead of
+   * letting the click silently no-op in the parent's guard.
+   */
+  disabled?: boolean;
+  /**
    * A payment-flow error to display after the booking form is submitted and the
    * wallet / payment step fails. When provided, PaymentErrorDisplay is rendered
    * below the submit button with the correct classified messaging and actions.
@@ -55,6 +61,7 @@ export default function BookingForm({
   maxStay,
   onSubmit,
   isLoading = false,
+  disabled = false,
   paymentError,
   currentPaymentStatus,
   onRetryPayment,
@@ -123,8 +130,27 @@ export default function BookingForm({
     }
   };
 
+  /**
+   * Submit with a synchronous re-entry guard: the availability check below
+   * runs *before* the parent's `isLoading` flips, so without this guard a
+   * fast double submit (double click, or Enter + click) could fire two
+   * availability checks and even two booking requests. User input is never
+   * cleared on this path.
+   */
+  const isSubmittingRef = useRef(false);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmittingRef.current) return;
+    isSubmittingRef.current = true;
+    try {
+      await performSubmit();
+    } finally {
+      isSubmittingRef.current = false;
+    }
+  };
+
+  const performSubmit = async () => {
     setDateError('');
     setGuestError('');
     setAvailabilityError('');
@@ -506,10 +532,10 @@ export default function BookingForm({
 
       <button
         type="submit"
-        disabled={isLoading || nights <= 0 || !pricing || !!guestError || isOverCapacity || stayViolation}
+        disabled={disabled || isLoading || nights <= 0 || !pricing || !!guestError || isOverCapacity || stayViolation}
         className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 dark:disabled:bg-gray-600 text-white font-medium py-2 px-4 rounded-lg transition min-h-[44px]"
         aria-busy={isLoading}
-        aria-disabled={isLoading || nights <= 0 || !pricing || !!guestError || isOverCapacity || stayViolation}
+        aria-disabled={disabled || isLoading || nights <= 0 || !pricing || !!guestError || isOverCapacity || stayViolation}
       >
         {isLoading ? t('processing') : t('bookNow')}
       </button>

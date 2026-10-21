@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { Loader2, AlertTriangle } from 'lucide-react';
 import { useWallet } from '@/hooks/useWallet';
 import { useEscrowTransaction } from '@/hooks/useEscrowTransaction';
@@ -40,7 +40,14 @@ export default function USDCEscrowFlow({
 
   const label = phase === 'fund' ? 'Sign & Fund Escrow' : 'Sign & Release Payment';
 
+  // Synchronous re-entry guard: signing requests are expensive (wallet popup)
+  // and duplicate submissions can double-fund an escrow. Reject clicks that
+  // land before React re-renders the disabled button.
+  const isSubmittingRef = useRef(false);
+
   const handleSubmit = async () => {
+    if (isSubmittingRef.current) return;
+    isSubmittingRef.current = true;
     try {
       reset();
       const res = await submit({
@@ -53,6 +60,8 @@ export default function USDCEscrowFlow({
       setTxHash(res.txHash);
     } catch (err) {
       // Error is already handled by the hook
+    } finally {
+      isSubmittingRef.current = false;
     }
   };
 
@@ -128,8 +137,13 @@ export default function USDCEscrowFlow({
       {walletState.isConnected && !walletState.networkMismatch && canContinue && !txHash && (
         <>
           {getStatusMessage() && (
-            <div className="text-sm text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-950 border border-blue-200 dark:border-blue-800 rounded-lg p-3 flex items-center gap-2">
-              <Loader2 className="animate-spin" size={16} />
+            <div
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+              className="text-sm text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-950 border border-blue-200 dark:border-blue-800 rounded-lg p-3 flex items-center gap-2"
+            >
+              <Loader2 className="animate-spin" size={16} aria-hidden="true" />
               {getStatusMessage()}
             </div>
           )}
@@ -153,12 +167,16 @@ export default function USDCEscrowFlow({
       )}
 
       {error && canRetry && (
-        <div className="text-sm text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-800 rounded-lg p-3">
+        <div
+          role="alert"
+          className="text-sm text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-800 rounded-lg p-3"
+        >
           <div className="font-medium mb-1">Error</div>
           <div className="text-xs mb-2">{error}</div>
           <button
             onClick={handleSubmit}
-            className="text-xs underline hover:no-underline"
+            disabled={status === 'waiting_signature' || status === 'submitting'}
+            className="text-xs underline hover:no-underline disabled:opacity-50 disabled:no-underline"
           >
             Retry
           </button>
@@ -166,13 +184,16 @@ export default function USDCEscrowFlow({
       )}
 
       {error && !canRetry && (
-        <div className="text-sm text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-800 rounded-lg p-3">
+        <div
+          role="alert"
+          className="text-sm text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-800 rounded-lg p-3"
+        >
           {error}
         </div>
       )}
 
       {txHash && (
-        <div className="text-sm text-gray-700 dark:text-gray-300">
+        <div role="status" aria-live="polite" className="text-sm text-gray-700 dark:text-gray-300">
           <div className="font-semibold mb-1">Transaction submitted</div>
           <div className="font-mono break-all text-xs mb-2">{txHash}</div>
           <a
