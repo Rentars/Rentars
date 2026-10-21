@@ -206,6 +206,16 @@ async function runBookingExpiryCleanup(): Promise<void> {
     } else {
       console.error(`[expiry] Cleanup failed: ${result.error}`);
     }
+
+    const modResult = await bookingService.expireStaleModifications();
+    if (modResult.success) {
+      const { expired, failed } = modResult.data ?? { expired: 0, failed: 0 };
+      if (expired > 0 || failed > 0) {
+        console.log(`[expiry] Expired ${expired} modification proposal(s), ${failed} failure(s)`);
+      }
+    } else {
+      console.error(`[expiry] Modification cleanup failed: ${modResult.error}`);
+    }
   } finally {
     bookingExpiryRunning = false;
   }

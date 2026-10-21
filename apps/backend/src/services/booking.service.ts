@@ -47,6 +47,9 @@ import { auditLogger } from './auditLogger.service.js';
  */
 const PG_EXCLUSION_VIOLATION = '23P01';
 
+/** How long a host has to act on a booking-modification proposal before it auto-expires. */
+const MODIFICATION_PROPOSAL_TTL_MS = 72 * 60 * 60 * 1000; // 72 hours
+
 /** True when a Supabase/Postgres error is an exclusion-constraint conflict. */
 function isExclusionViolation(error: unknown): boolean {
   const code = (error as { code?: string } | null)?.code;
@@ -58,6 +61,21 @@ function isExclusionViolation(error: unknown): boolean {
  * includes the identity or details of the other booking/tenant holding the
  * conflicting dates — only that the requested interval is no longer free.
  */
+/**
+ * True when a 'pending' modification proposal's TTL has passed but the
+ * cleanup sweep hasn't yet flipped its status to 'expired'. Callers must
+ * treat this the same as an already-expired proposal: a host cannot approve
+ * or decline a proposal whose window has closed, even in the gap before the
+ * sweep runs.
+ */
+function isLazilyExpiredModification(modification: BookingModification): boolean {
+  return (
+    modification.status === 'pending' &&
+    !!modification.expires_at &&
+    new Date(modification.expires_at).getTime() < Date.now()
+  );
+}
+
 function dateConflictResponse(): ServiceResponse<never> {
   return {
     success: false,
@@ -152,6 +170,8 @@ export interface BookingModification {
   requires_additional_payment?: boolean;
   /** Full JSON snapshot of the booking row at request time — immutable audit record. */
   booking_snapshot?: Record<string, unknown> | null;
+  /** When an unacted-on proposal auto-expires; null for legacy rows created before this existed. */
+  expires_at?: string | null;
   created_at?: string;
   updated_at?: string;
 }
@@ -473,6 +493,59 @@ export class BookingService {
     }
 
     return { success: true, data: { warned, failed } };
+  }
+
+  /**
+   * Expire booking-modification proposals the host never acted on.
+   *
+   * Only the proposal row changes — the underlying booking's dates, price,
+   * and history are untouched, so an expired proposal leaves the original
+   * booking exactly as it was (no hold to release, since modification
+   * proposals never mutate the booking until accepted).
+   *
+   * The write is conditioned on `status = 'pending'` so this is safe to
+   * rerun and safe against a host accepting/declining the same proposal in
+   * the same instant: whichever write lands first wins, the other is a
+   * harmless no-op.
+   */
+  async expireStaleModifications(): Promise<ServiceResponse<{ expired: number; failed: number }>> {
+    const { data: stale, error } = await supabase
+      .from('booking_modifications')
+      .select('id, booking_id, requested_by')
+      .eq('status', 'pending')
+      .lt('expires_at', new Date().toISOString())
+      .not('expires_at', 'is', null);
+
+    if (error) return { success: false, error: error.message };
+
+    let expired = 0;
+    let failed = 0;
+
+    for (const m of stale ?? []) {
+      const { data: updated, error: updateError } = await supabase
+        .from('booking_modifications')
+        .update({ status: 'expired', updated_at: new Date().toISOString() })
+        .eq('id', m.id)
+        .eq('status', 'pending') // atomic claim — mirrors transitionStatus's booking guard
+        .select('id')
+        .maybeSingle();
+
+      if (updateError) {
+        failed++;
+        continue;
+      }
+      if (!updated) continue; // already accepted/declined/expired by another caller
+
+      if (m.requested_by) {
+        createNotification(m.requested_by, 'booking_modification_expired', {
+          booking_id: m.booking_id,
+          modification_id: m.id,
+        }).catch(() => {});
+      }
+      expired++;
+    }
+
+    return { success: true, data: { expired, failed } };
   }
 
   // ── Read ───────────────────────────────────────────────────────────────────
@@ -1968,6 +2041,10 @@ export class BookingService {
         reason: reason ?? null,
         original_total_price: booking.total_price ?? null,
         booking_snapshot: bookingSnapshot as Record<string, unknown>,
+        // Proposals the host never acts on must not linger indefinitely —
+        // give the host a bounded window to approve/decline before the
+        // proposal auto-expires (see expireStaleModifications).
+        expires_at: new Date(Date.now() + MODIFICATION_PROPOSAL_TTL_MS).toISOString(),
       })
       .select()
       .single();
@@ -2043,6 +2120,16 @@ export class BookingService {
     }
 
     const modification = modificationData as BookingModification;
+
+    if (isLazilyExpiredModification(modification)) {
+      return {
+        success: false,
+        error: 'This modification proposal has expired — the original booking is unchanged',
+        conflict: true,
+        statusCode: 409,
+        code: 'MODIFICATION_EXPIRED',
+      };
+    }
 
     if (modification.status !== 'pending') {
       return {
@@ -2190,6 +2277,16 @@ export class BookingService {
     }
 
     const modification = modificationData as BookingModification;
+
+    if (isLazilyExpiredModification(modification)) {
+      return {
+        success: false,
+        error: 'This modification proposal has expired — the original booking is unchanged',
+        conflict: true,
+        statusCode: 409,
+        code: 'MODIFICATION_EXPIRED',
+      };
+    }
 
     if (modification.status !== 'pending') {
       return {
