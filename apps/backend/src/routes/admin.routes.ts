@@ -41,6 +41,7 @@ import {
   activateProperty,
   // Bookings
   listAdminBookings,
+  getEscrowReconciliationHandler,
   // Disputes
   listDisputes,
   resolveDispute,
@@ -88,6 +89,11 @@ router.delete('/properties/:id/featured', requireScope('admin:properties:feature
 // ── Bookings (admin view) ─────────────────────────────────────────────────────
 // Scope: admin:bookings:read → admin, moderator, support, finance
 router.get('/bookings', requireScope('admin:bookings:read'), listAdminBookings);
+router.get(
+  '/bookings/:id/escrow-reconciliation',
+  requireScope('admin:reconciliation:read'),
+  getEscrowReconciliationHandler,
+);
 
 // ── Disputes ──────────────────────────────────────────────────────────────────
 // Scope: admin:disputes:read    → admin, moderator, support, finance
@@ -124,5 +130,12 @@ router.use('/email', emailAdminRoutes);
 // Scoped sub-router — all routes inside require admin:notifications:read
 // Mounted at /api/v1/admin/notifications/*
 router.use('/notifications', notificationMonitorRoutes);
+
+// ── Reconciliation operations (#772) ─────────────────────────────────────────
+// Scoped sub-router — read requires admin:reconciliation:read,
+//                     write requires admin:reconciliation:write
+// Mounted at /api/v1/admin/reconciliation/*
+import reconciliationRoutes from './reconciliation.routes.js';
+router.use('/reconciliation', reconciliationRoutes);
 
 export default router;

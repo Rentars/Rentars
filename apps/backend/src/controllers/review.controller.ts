@@ -19,6 +19,8 @@ import {
   getPendingReviews,
   moderateHostResponse,
   getResponseHistory,
+  getModerationQueue,
+  getPendingAppeals,
 } from '../services/review.service.js';
 import {
   getReviewRepairQueue,

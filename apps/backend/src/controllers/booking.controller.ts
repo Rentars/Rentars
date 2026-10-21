@@ -1,20 +1,20 @@
-import { createHmac, timingSafeEqual } from 'crypto';
 import type { Request, Response } from 'express';
 import { BookingService } from '@/services/booking.service.js';
 import { getPropertyById } from '@/services/property.service.js';
 import { generateIcs, generateIcsFeed } from '@/utils/ics.js';
 import type { IcsEventInput } from '@/utils/ics.js';
 import { supabase } from '@/config/supabase.js';
-import { env } from '@/config/env.js';
 import type { AuthRequest } from '@/middleware/auth.middleware.js';
 import type { BookingModification } from '@/services/booking.service.js';
 import type { BookingActor } from '@/services/bookingAuthorization.service.js';
 import { lookup, store, lockKey, completeKey, releaseKey, hashRequestBody } from '@/services/idempotency.service.js';
 import { fetchReceiptData, generateReceiptPdf } from '@/services/receipt.service.js';
-
-function calendarFeedSecret(): string {
-  return env.CALENDAR_FEED_SECRET ?? env.JWT_SECRET;
-}
+import {
+  getOrCreateToken,
+  rotateToken as rotateCalendarToken,
+  validateToken as validateCalendarToken,
+  revokeToken as revokeCalendarToken,
+} from '@/services/calendarToken.service.js';
 
 /**
  * The authenticated caller, from the JWT populated by `authenticate`. Returns
@@ -23,22 +23,6 @@ function calendarFeedSecret(): string {
 function bookingActor(req: Request): BookingActor | undefined {
   const user = (req as Request & { user?: { id: string; role?: string } }).user;
   return user?.id ? { id: user.id, role: user.role } : undefined;
-}
-
-function generateFeedToken(userId: string): string {
-  return createHmac('sha256', calendarFeedSecret()).update(userId).digest('hex');
-}
-
-function validateFeedToken(token: string, userId: string): boolean {
-  try {
-    const expected = generateFeedToken(userId);
-    const a = Buffer.from(expected, 'hex');
-    const b = Buffer.from(token, 'hex');
-    if (a.length !== b.length) return false;
-    return timingSafeEqual(a, b);
-  } catch {
-    return false;
-  }
 }
 
 const bookingService = new BookingService();
@@ -345,7 +329,10 @@ export async function cancelBooking(req: Request, res: Response): Promise<void> 
     return;
   }
 
-  res.json(result.data);
+  res.json({
+    ...result.data,
+    ...(result.warning ? { warning: result.warning } : {}),
+  });
 }
 
 export async function confirmBooking(req: Request, res: Response): Promise<void> {
@@ -488,18 +475,22 @@ export async function getBookingCalendar(req: Request, res: Response): Promise<v
     return;
   }
 
-  // Fetch property for location, title, and host ID check
+  // Fetch property for location, title, timezone, and host ID check
   let propertyTitle = 'Rental Stay';
   let propertyLocation = '';
+  let propertyTimezone: string | undefined;
   let hostOwnerId: string | undefined;
   if (booking.property_id) {
     const propResult = await getPropertyById(booking.property_id);
     if (propResult.success && propResult.data) {
-      const p = propResult.data;
+      const p = propResult.data as typeof propResult.data & { timezone?: string };
       propertyTitle = p.title ?? propertyTitle;
       const parts = [p.address, p.city, p.country].filter(Boolean);
       propertyLocation = parts.join(', ');
       hostOwnerId = p.owner_id;
+      // Use the property's stored timezone (added in migration 00069).
+      // Fall back to UTC when not set so existing rows are safe.
+      propertyTimezone = p.timezone && p.timezone !== 'UTC' ? p.timezone : undefined;
     }
   }
 
@@ -531,6 +522,7 @@ export async function getBookingCalendar(req: Request, res: Response): Promise<v
     created: booking.created_at,
     status: isCancelled ? 'CANCELLED' : 'CONFIRMED',
     sequence: isCancelled ? 1 : 0,
+    timezone: propertyTimezone,
   });
 
   res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
@@ -541,9 +533,9 @@ export async function getBookingCalendar(req: Request, res: Response): Promise<v
 /**
  * GET /api/v1/bookings/calendar-feed-token
  *
- * Returns an HMAC-signed token and a ready-to-subscribe calendar feed URL
- * for the authenticated user. The URL is safe to share with calendar apps
- * because the token prevents enumeration of other users' feeds.
+ * Returns a persistent, rotatable token and a ready-to-subscribe calendar
+ * feed URL for the authenticated user. The token is stored in the DB so it
+ * can be individually revoked via the rotate or revoke endpoints.
  */
 export async function getCalendarFeedToken(req: Request, res: Response): Promise<void> {
   const authUser = (req as Request & { user?: { id: string } }).user;
@@ -552,42 +544,108 @@ export async function getCalendarFeedToken(req: Request, res: Response): Promise
     return;
   }
 
-  const token = generateFeedToken(authUser.id);
-  const baseUrl = (req.headers['x-forwarded-proto'] ?? req.protocol) + '://' + req.headers.host;
-  const feedUrl = `${baseUrl}/api/v1/calendar/feed/${authUser.id}/${token}.ics`;
+  const result = await getOrCreateToken(authUser.id);
+  if (!result.success) {
+    res.status(500).json({ error: 'Failed to generate calendar feed token' });
+    return;
+  }
 
-  res.json({ token, feed_url: feedUrl });
+  const baseUrl = (req.headers['x-forwarded-proto'] ?? req.protocol) + '://' + req.headers.host;
+  const feedUrl = `${baseUrl}/api/v1/calendar/feed/${result.data.token}.ics`;
+
+  res.json({ token: result.data.token, feed_url: feedUrl });
 }
 
 /**
- * GET /api/v1/calendar/feed/:userId/:token.ics  (public — no auth middleware)
+ * POST /api/v1/bookings/calendar-feed-token/rotate
  *
- * Validates the HMAC token, then returns a full iCalendar feed containing all
- * bookings (tenant and host) for the given user. Cancelled and expired bookings
- * are included with STATUS:CANCELLED so calendar clients remove them cleanly.
+ * Revokes the existing token and issues a fresh one. Calendar apps that
+ * cached the old subscription URL will receive 403 and must re-subscribe.
+ * Use this when a token is believed to have been compromised.
+ */
+export async function rotateCalendarFeedToken(req: Request, res: Response): Promise<void> {
+  const authUser = (req as Request & { user?: { id: string } }).user;
+  if (!authUser) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const result = await rotateCalendarToken(authUser.id);
+  if (!result.success) {
+    res.status(500).json({ error: 'Failed to rotate calendar feed token' });
+    return;
+  }
+
+  const baseUrl = (req.headers['x-forwarded-proto'] ?? req.protocol) + '://' + req.headers.host;
+  const feedUrl = `${baseUrl}/api/v1/calendar/feed/${result.data.token}.ics`;
+
+  res.json({ token: result.data.token, feed_url: feedUrl });
+}
+
+/**
+ * DELETE /api/v1/bookings/calendar-feed-token
+ *
+ * Revokes the current token entirely. The user's calendar feed will return
+ * 403 until they create a new token via GET /calendar-feed-token.
+ * Body: { token: string }
+ */
+export async function revokeCalendarFeedToken(req: Request, res: Response): Promise<void> {
+  const authUser = (req as Request & { user?: { id: string } }).user;
+  if (!authUser) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const { token } = req.body as { token?: string };
+  if (!token || typeof token !== 'string') {
+    res.status(400).json({ error: 'token is required' });
+    return;
+  }
+
+  const result = await revokeCalendarToken(token, authUser.id);
+  if (!result.success) {
+    res.status(500).json({ error: 'Failed to revoke calendar feed token' });
+    return;
+  }
+
+  res.status(204).send();
+}
+
+/**
+ * GET /api/v1/calendar/feed/:token.ics  (public — no auth middleware)
+ *
+ * Validates the persistent DB token, then returns a full iCalendar feed
+ * containing all bookings (tenant and host) for the token's owner.
+ * Cancelled and expired bookings are included with STATUS:CANCELLED so
+ * calendar clients remove them cleanly.
+ *
+ * Property timezone is embedded in every event so dates survive DST changes.
  */
 export async function getCalendarFeed(req: Request, res: Response): Promise<void> {
-  const { userId, token } = req.params as { userId: string; token: string };
+  const { token } = req.params as { token: string };
 
   // Strip .ics suffix if present (Express won't strip it automatically)
   const cleanToken = token.replace(/\.ics$/, '');
 
-  if (!validateFeedToken(cleanToken, userId)) {
-    res.status(403).json({ error: 'Invalid or expired calendar feed token' });
+  const validation = await validateCalendarToken(cleanToken);
+  if (!validation.success || !validation.data) {
+    res.status(403).json({ error: 'Invalid or revoked calendar feed token' });
     return;
   }
 
-  // Fetch all bookings where the user is tenant
+  const userId = validation.data.user_id;
+
+  // Fetch all bookings where the user is tenant — include property timezone
   const { data: tenantBookings } = await supabase
     .from('bookings')
-    .select('*, properties(title, address, city, country)')
+    .select('*, properties(title, address, city, country, timezone)')
     .eq('tenant_id', userId)
     .order('check_in', { ascending: true });
 
   // Fetch all bookings for properties the user owns
   const { data: hostBookings } = await supabase
     .from('bookings')
-    .select('*, properties!inner(title, address, city, country, owner_id)')
+    .select('*, properties!inner(title, address, city, country, timezone, owner_id)')
     .eq('properties.owner_id', userId)
     .neq('tenant_id', userId)
     .order('check_in', { ascending: true });
@@ -600,10 +658,19 @@ export async function getCalendarFeed(req: Request, res: Response): Promise<void
   const events: IcsEventInput[] = allBookings
     .filter((b) => b.check_in && b.check_out)
     .map((b) => {
-      const prop = b.properties as { title?: string; address?: string; city?: string; country?: string } | null;
+      const prop = b.properties as {
+        title?: string;
+        address?: string;
+        city?: string;
+        country?: string;
+        timezone?: string;
+      } | null;
       const title = prop?.title ?? 'Rental Stay';
       const location = [prop?.address, prop?.city, prop?.country].filter(Boolean).join(', ');
       const isCancelled = b.status === 'Cancelled' || b.status === 'Expired';
+      // Only set timezone when it is a meaningful non-UTC value so that
+      // properties with no timezone set still produce valid UTC events.
+      const timezone = prop?.timezone && prop.timezone !== 'UTC' ? prop.timezone : undefined;
       return {
         uid: `booking-${b.id}@rentars.app`,
         summary: `Stay at ${title}`,
@@ -619,6 +686,7 @@ export async function getCalendarFeed(req: Request, res: Response): Promise<void
         created: b.created_at as string | undefined,
         status: isCancelled ? 'CANCELLED' : ('CONFIRMED' as const),
         sequence: isCancelled ? 1 : 0,
+        timezone,
       };
     });
 
@@ -626,7 +694,7 @@ export async function getCalendarFeed(req: Request, res: Response): Promise<void
 
   res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
   res.setHeader('Content-Disposition', `attachment; filename="rentars-calendar.ics"`);
-  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
   res.send(ics);
 }
 
@@ -762,4 +830,104 @@ export async function resolveDispute(req: Request, res: Response): Promise<void>
   }
 
   res.json(result.data);
+}
+
+/**
+ * GET /api/v1/bookings/:id/refund-preview
+ *
+ * Shows the refund calculation from the booking-time policy snapshot *before*
+ * the tenant confirms cancellation.  Does not modify any state. (#769)
+ *
+ * Returns: { tier, refundPct, refundAmount, totalPrice, hoursUntilCheckIn, policy }
+ */
+export async function getRefundPreviewHandler(req: AuthRequest, res: Response): Promise<void> {
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  // Load the booking to get check_in
+  const bookingResult = await bookingService.getBookingById(req.params.id);
+  if (!bookingResult.success || !bookingResult.data) {
+    res.status(404).json({ error: 'Booking not found' });
+    return;
+  }
+
+  const booking = bookingResult.data;
+
+  // Only the tenant or admin can preview a refund
+  if (booking.tenant_id !== userId && req.user?.role !== 'admin') {
+    res.status(403).json({ error: 'Forbidden' });
+    return;
+  }
+
+  if (!booking.check_in) {
+    res.status(422).json({ error: 'Booking is missing check-in date' });
+    return;
+  }
+
+  const result = await getRefundPreview(req.params.id, booking.check_in, new Date());
+  if (!result.success || !result.data) {
+    res.status(400).json({ error: result.error ?? 'Failed to compute refund preview' });
+    return;
+  }
+
+  res.json({
+    tier: result.data.tier,
+    refundPct: result.data.refundPct,
+    refundAmount: result.data.refundAmount,
+    totalPrice: result.data.totalPrice,
+    hoursUntilCheckIn: result.data.hoursUntilCheckIn,
+    policy: result.data.policy,
+    snapshotId: result.data.snapshotId,
+  });
+}
+
+/**
+ * GET /api/v1/bookings/:id/refund
+ *
+ * Returns the current refund request status for a booking. (#769)
+ * Settlement states: requested, submitted, confirmed, failed, manual_review.
+ */
+export async function getRefundStatusHandler(req: AuthRequest, res: Response): Promise<void> {
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const result = await getRefundRequestByBooking(req.params.id);
+  if (!result.success) {
+    res.status(400).json({ error: result.error });
+    return;
+  }
+
+  if (!result.data) {
+    res.status(404).json({ error: 'No refund request found for this booking' });
+    return;
+  }
+
+  const refund = result.data;
+
+  // Only the tenant, host, or admin can view the refund status
+  if (refund.tenant_id !== userId && refund.host_id !== userId && req.user?.role !== 'admin') {
+    res.status(403).json({ error: 'Forbidden' });
+    return;
+  }
+
+  res.json({
+    id: refund.id,
+    bookingId: refund.booking_id,
+    status: refund.status,
+    refundAmount: refund.refund_amount,
+    refundTier: refund.refund_tier,
+    refundPolicyPct: refund.refund_policy_pct,
+    currency: refund.currency,
+    txHash: refund.tx_hash,
+    errorMessage: refund.error_message,
+    attemptCount: refund.attempt_count,
+    createdAt: refund.created_at,
+    updatedAt: refund.updated_at,
+  });
 }

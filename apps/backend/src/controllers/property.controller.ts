@@ -25,63 +25,33 @@ import {
 import { trackSearch, getSearchSuggestions, getTrendingSearches, trackSuggestionEvent } from '@/services/searchAnalytics.service.js';
 import { computeZeroResultSuggestions, getPriceHistogram } from '@/services/propertySearch.service.js';
 import { supabase } from '@/config/supabase.js';
-import { redactExactCoordinates } from '@/utils/locationPrivacy.js';
+import { redactExactCoordinates, resolveLocationTier } from '@/utils/locationPrivacy.js';
 import type { AuthRequest } from '@/middleware/auth.middleware.js';
 
 // ─── Location-privacy helpers ─────────────────────────────────────────────────
 
 /**
- * Check whether a viewer is entitled to see exact coordinates for a property.
- *
- * Returns true when the viewer is:
- *  1. The property's owner/host
- *  2. A tenant with a Confirmed booking on the property
- */
-/**
- * Determine the location precision tier for a viewer.
- *
- * - host   : property owner or platform admin — full exact coordinates
- * - booking: tenant with a Pending or Confirmed booking — exact coordinates
- *            so they can navigate to the property for their upcoming/active stay
- * - public : everyone else — approximate coordinates only
- */
-async function viewerHasExactLocationAccess(
-  propertyId: string,
-  ownerId: string | undefined,
-  viewerUserId: string | undefined,
-): Promise<boolean> {
-  if (!viewerUserId) return false;
-  // Host tier: property owner always sees exact coordinates.
-  if (ownerId && viewerUserId === ownerId) return true;
-
-  // Booking tier: tenants with an active or upcoming booking see exact coords.
-  // Pending is included so tenants can navigate before host confirmation.
-  const { data } = await supabase
-    .from('bookings')
-    .select('id')
-    .eq('property_id', propertyId)
-    .eq('tenant_id', viewerUserId)
-    .in('status', ['Pending', 'Confirmed'])
-    .limit(1);
-
-  return Array.isArray(data) && data.length > 0;
-}
-
-/**
  * Apply location privacy to a single property.
- * Exact coordinates are removed unless the viewer has access.
+ *
+ * Precision tiers (see locationPrivacy.ts for full policy):
+ *  - host    : property owner, platform admin, or moderator → exact coordinates
+ *  - booking : tenant with Pending/Confirmed booking → exact coordinates
+ *  - public  : everyone else → approximate coordinates (~500 m grid)
  */
 async function applyLocationPrivacy(
   property: Property,
   viewerUserId: string | undefined,
+  viewerRole: string | undefined,
 ): Promise<Record<string, unknown>> {
-  const hasAccess = await viewerHasExactLocationAccess(
+  const tier = await resolveLocationTier(
     property.id,
     property.owner_id,
     viewerUserId,
+    viewerRole,
+    supabase,
   );
 
-  if (hasAccess) {
+  if (tier === 'host' || tier === 'booking') {
     return property as unknown as Record<string, unknown>;
   }
 
@@ -172,7 +142,9 @@ export async function getFeatured(_req: Request, res: Response): Promise<void> {
 // ─── Single property ──────────────────────────────────────────────────────────
 
 export async function getProperty(req: Request, res: Response): Promise<void> {
-  const viewerUserId = (req as AuthRequest).userId;
+  const authReq = req as AuthRequest;
+  const viewerUserId = authReq.userId;
+  const viewerRole = authReq.user?.role;
 
   const result = await getPropertyById(req.params.id);
   if (!result.success) {
@@ -180,7 +152,7 @@ export async function getProperty(req: Request, res: Response): Promise<void> {
     return;
   }
 
-  const masked = await applyLocationPrivacy(result.data, viewerUserId);
+  const masked = await applyLocationPrivacy(result.data, viewerUserId, viewerRole);
   res.json(masked);
 }
 
@@ -195,7 +167,9 @@ export async function getProperty(req: Request, res: Response): Promise<void> {
  * if the URL slug is stale.
  */
 export async function getPropertyBySlugHandler(req: Request, res: Response): Promise<void> {
-  const viewerUserId = (req as AuthRequest).userId;
+  const authReq = req as AuthRequest;
+  const viewerUserId = authReq.userId;
+  const viewerRole = authReq.user?.role;
   const { slug } = req.params;
 
   if (!slug) {
@@ -209,7 +183,7 @@ export async function getPropertyBySlugHandler(req: Request, res: Response): Pro
     return;
   }
 
-  const masked = await applyLocationPrivacy(result.data, viewerUserId);
+  const masked = await applyLocationPrivacy(result.data, viewerUserId, viewerRole);
   res.json(masked);
 }
 

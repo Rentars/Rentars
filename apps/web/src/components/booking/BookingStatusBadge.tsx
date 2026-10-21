@@ -12,6 +12,8 @@ const CONFIG: Record<string, { label: string; classes: string }> = {
   completed: { label: 'Completed', classes: 'bg-green-100  text-green-800  dark:bg-green-900/40  dark:text-green-300' },
   cancelled: { label: 'Cancelled', classes: 'bg-gray-100   text-gray-600   dark:bg-gray-700/40   dark:text-gray-400'  },
   disputed:  { label: 'Disputed',  classes: 'bg-red-100    text-red-800    dark:bg-red-900/40    dark:text-red-300'   },
+  escrow_reconcile_failed: { label: 'Payment Issue', classes: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300' },
+  escrow_manual_review:    { label: 'Under Review',  classes: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300' },
 };
 
 /**
