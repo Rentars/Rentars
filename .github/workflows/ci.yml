@@ -80,6 +80,13 @@ jobs:
       - name: Validate migration filenames
         working-directory: apps/backend
         run: bun run validate:migrations
+
+      - name: Check migration checksum drift (#878)
+        working-directory: apps/backend
+        run: bun run check:migration-checksums
+        # Fails the build if a previously committed migration file's content was
+        # changed after being locked in (apps/backend/database/migrations.lock.json).
+        # New migration files must add their checksum via `--write` in the same PR.
         # This step exits 1 if any migration prefix is duplicated or out-of-order.
         # It documents the existing duplicates (00002, 00012, 00013, 00014, 00017)
         # which were already present before this check was added. Those files must
