@@ -35,6 +35,39 @@ import {
 } from './bookingAuthorization.service.js';
 import { auditLogger } from './auditLogger.service.js';
 
+// ─── Atomic availability helpers ───────────────────────────────────────────────
+
+/**
+ * Postgres exclusion-constraint violation code. Fired by `bookings_no_date_overlap`
+ * (see migration 00062_booking_date_exclusion_constraint.sql) whenever a write
+ * — whether through create_booking_atomic_v2 or a direct UPDATE such as a
+ * modification acceptance — would create two overlapping active reservations
+ * for the same property. This is the DB-level authoritative guard; any write
+ * path that mutates check_in/check_out must be prepared to receive it.
+ */
+const PG_EXCLUSION_VIOLATION = '23P01';
+
+/** True when a Supabase/Postgres error is an exclusion-constraint conflict. */
+function isExclusionViolation(error: unknown): boolean {
+  const code = (error as { code?: string } | null)?.code;
+  return code === PG_EXCLUSION_VIOLATION;
+}
+
+/**
+ * Standard, tenant-safe 409 response for a date-overlap conflict. Never
+ * includes the identity or details of the other booking/tenant holding the
+ * conflicting dates — only that the requested interval is no longer free.
+ */
+function dateConflictResponse(): ServiceResponse<never> {
+  return {
+    success: false,
+    error: 'Requested dates are no longer available — they were just reserved by another booking',
+    conflict: true,
+    statusCode: 409,
+    code: 'BOOKING_OVERLAP',
+  } as ServiceResponse<never>;
+}
+
 // ─── State machine ────────────────────────────────────────────────────────────
 
 /**
@@ -1941,6 +1974,15 @@ export class BookingService {
       .single();
 
     if (updateError || !updatedBooking) {
+      // The exclusion constraint is the authoritative, transactional guard against
+      // overlapping active bookings. `checkDateRangeAvailability` above is only a
+      // preflight read — another booking (or another accepted modification) may
+      // have claimed the requested interval in the gap between that check and this
+      // write. Translate that into the same stable, tenant-safe 409 used elsewhere,
+      // never the raw Postgres error (which can echo constraint/row internals).
+      if (isExclusionViolation(updateError)) {
+        return dateConflictResponse();
+      }
       return { success: false, error: updateError?.message ?? 'Failed to update booking dates' };
     }
 
