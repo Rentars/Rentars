@@ -352,3 +352,636 @@ Apache-2.0 — see [LICENSE](./LICENSE)
 - [OnlyDust](https://app.onlydust.com) — open-source contributor community
 - [Supabase](https://supabase.com) — backend-as-a-service
 - [Trustless Work](https://trustlesswork.com) — escrow API
+# Review Integrity and Chain Resilience: Implementation Spec
+
+Two workstreams:
+
+1. **Review integrity**: reviews reflect completed rentals only, one per eligible perspective, no manipulation.
+2. **Chain degradation**: RPC/Horizon outages never cause duplicate financial actions or take down read-only features.
+
+**Assumptions** (adjust to the stack): Postgres, TypeScript services, Stellar RPC + Horizon as chain providers, and `bookings`, `users`, `properties` tables as the source of truth.
+
+---
+
+
+
+- Booking and user records are the **only authority**. Never trust client-supplied roles, booking state, or dates.
+- Every rule is enforced **twice**: in the service (friendly errors) and in the database (hard guarantee).
+- A duplicate or ineligible attempt **fails safely**: no partial writes, no rating changes, a clear error code.
+- Eligibility is defined in **one place**, and the API and DB constraints derive from it.
+
+### 1.2 Eligibility Model
+
+A review is a `(booking_id, reviewer_role)` pair. Each booking has at most two perspectives:
+
+| Perspective | Reviewer | Subject | Affects property rating? |
+|---|---|---|---|
+| `guest_to_host` | booking guest | property/host | Yes |
+| `host_to_guest` | property host | guest | No (guest reputation only) |
+
+**Rules (all must pass):**
+
+1. **Booking completed.** The stay actually finished (see 1.3).
+2. **Participant relationship.** The reviewer is the booking's `guest_id` or the property's `host_id`, and the role matches the relationship.
+3. **Review window.** `checkout_at <= now <= checkout_at + 14 days`.
+4. **One per perspective.** One review per `(booking_id, reviewer_role)`.
+5. **Not self-dealing.** `guest_id != host_id`, and neither account is flagged as linked to the other.
+6. **Account standing.** The reviewer isn't suspended or banned.
+
+### 1.3 Booking State Eligibility Matrix
+
+Define booking statuses: `pending`, `confirmed`, `in_progress`, `completed`, `cancelled`, `refunded`, `modified`, `disputed`.
+
+| Booking state | Guest review | Host review | Notes |
+|---|---|---|---|
+| `completed` (no refund, no dispute) | ✅ | ✅ | Normal path |
+| `completed` + partial refund | ✅ | ✅ | Stay happened; refund is a settlement detail |
+| `refunded` (full, stay occurred) | ✅ flagged `refund_full` | ✅ | Allowed, excluded from rating if policy says so |
+| `refunded` (full, stay never occurred) | ❌ | ❌ | No rental happened |
+| `cancelled` before check-in | ❌ | ❌ | No rental happened |
+| `cancelled` after check-in (early checkout) | ✅ | ✅ | Eligible only if `actual_nights >= 1` |
+| `modified` | Depends | Depends | Judge by the **final** dates; the amended booking must complete |
+| `disputed` (open) | ❌ (held) | ❌ (held) | Reviews blocked until resolution |
+| `disputed` (resolved) | ✅ per outcome | ✅ per outcome | See below |
+| `pending` / `confirmed` / `in_progress` | ❌ | ❌ | Not completed |
+
+**Dispute resolution outcomes:**
+
+- `resolved_for_guest`: guest may review; host review allowed but flagged.
+- `resolved_for_host`: both may review.
+- `resolved_split`: both may review.
+- `withdrawn`: treat as underlying completed state.
+
+**Edge cases:**
+
+- A booking modified *after* checkout is not valid. Modifications are locked at `checkout_at`.
+- If a booking is refunded or disputed *after* a review exists, don't delete the review. Set `moderation_status = 'under_review'` and exclude it from aggregates until resolved.
+- Review window clock starts at **actual** checkout, not scheduled checkout, when early checkout is recorded.
+
+### 1.4 Data Model
+
+#### Migration: reviews table
+
+```sql
+-- 001_reviews.sql
+CREATE TYPE review_role AS ENUM ('guest_to_host', 'host_to_guest');
+CREATE TYPE review_moderation AS ENUM ('published', 'under_review', 'removed');
+
+CREATE TABLE reviews (
+  id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  booking_id         uuid        NOT NULL REFERENCES bookings(id) ON DELETE RESTRICT,
+  property_id        uuid        NOT NULL REFERENCES properties(id) ON DELETE RESTRICT,
+  reviewer_id        uuid        NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  subject_user_id    uuid        NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  reviewer_role      review_role NOT NULL,
+  rating             smallint    NOT NULL CHECK (rating BETWEEN 1 AND 5),
+  body               text        NOT NULL CHECK (char_length(body) BETWEEN 10 AND 4000),
+  moderation_status  review_moderation NOT NULL DEFAULT 'published',
+  flags              text[]      NOT NULL DEFAULT '{}',
+  idempotency_key    text,
+  created_at         timestamptz NOT NULL DEFAULT now(),
+  updated_at         timestamptz NOT NULL DEFAULT now(),
+
+  -- THE core guarantee: one review per perspective per booking
+  CONSTRAINT reviews_one_per_perspective UNIQUE (booking_id, reviewer_role),
+
+  -- reviewer can never review themselves
+  CONSTRAINT reviews_no_self_review CHECK (reviewer_id <> subject_user_id)
+);
+
+CREATE INDEX reviews_property_published_idx
+  ON reviews (property_id)
+  WHERE moderation_status = 'published' AND reviewer_role = 'guest_to_host';
+
+CREATE UNIQUE INDEX reviews_idempotency_idx
+  ON reviews (reviewer_id, idempotency_key)
+  WHERE idempotency_key IS NOT NULL;
+```
+
+#### Booking prerequisites
+
+```sql
+-- 002_booking_review_fields.sql
+ALTER TABLE bookings
+  ADD COLUMN IF NOT EXISTS checkout_actual_at timestamptz,
+  ADD COLUMN IF NOT EXISTS completed_at       timestamptz,
+  ADD COLUMN IF NOT EXISTS dispute_status     text
+    CHECK (dispute_status IN ('none','open','resolved_guest','resolved_host','resolved_split','withdrawn'))
+    DEFAULT 'none',
+  ADD COLUMN IF NOT EXISTS refund_kind        text
+    CHECK (refund_kind IN ('none','partial','full_after_stay','full_no_stay'))
+    DEFAULT 'none',
+  ADD COLUMN IF NOT EXISTS review_window_days smallint NOT NULL DEFAULT 14;
+```
+
+### 1.5 Database-Level Enforcement
+
+The unique constraint stops duplicates. Eligibility needs a trigger so even a direct SQL insert or a buggy service can't bypass it.
+
+```sql
+-- 003_review_eligibility_trigger.sql
+CREATE OR REPLACE FUNCTION assert_review_eligible() RETURNS trigger AS $$
+DECLARE
+  b            bookings%ROWTYPE;
+  p            properties%ROWTYPE;
+  ended_at     timestamptz;
+  window_end   timestamptz;
+BEGIN
+  SELECT * INTO b FROM bookings WHERE id = NEW.booking_id FOR SHARE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'REVIEW_BOOKING_NOT_FOUND' USING ERRCODE = 'P0001';
+  END IF;
+
+  SELECT * INTO p FROM properties WHERE id = b.property_id;
+
+  -- property consistency
+  IF NEW.property_id <> b.property_id THEN
+    RAISE EXCEPTION 'REVIEW_PROPERTY_MISMATCH' USING ERRCODE = 'P0001';
+  END IF;
+
+  -- participant relationship + role match
+  IF NEW.reviewer_role = 'guest_to_host' THEN
+    IF NEW.reviewer_id <> b.guest_id OR NEW.subject_user_id <> p.host_id THEN
+      RAISE EXCEPTION 'REVIEW_NOT_PARTICIPANT' USING ERRCODE = 'P0001';
+    END IF;
+  ELSE
+    IF NEW.reviewer_id <> p.host_id OR NEW.subject_user_id <> b.guest_id THEN
+      RAISE EXCEPTION 'REVIEW_NOT_PARTICIPANT' USING ERRCODE = 'P0001';
+    END IF;
+  END IF;
+
+  -- booking state
+  IF b.status NOT IN ('completed','cancelled','refunded','modified') THEN
+    RAISE EXCEPTION 'REVIEW_BOOKING_NOT_COMPLETED' USING ERRCODE = 'P0001';
+  END IF;
+
+  IF b.dispute_status = 'open' THEN
+    RAISE EXCEPTION 'REVIEW_BOOKING_DISPUTED' USING ERRCODE = 'P0001';
+  END IF;
+
+  IF b.refund_kind = 'full_no_stay' THEN
+    RAISE EXCEPTION 'REVIEW_NO_STAY_OCCURRED' USING ERRCODE = 'P0001';
+  END IF;
+
+  IF b.status = 'cancelled' AND b.checkout_actual_at IS NULL THEN
+    RAISE EXCEPTION 'REVIEW_NO_STAY_OCCURRED' USING ERRCODE = 'P0001';
+  END IF;
+
+  -- window
+  ended_at   := COALESCE(b.checkout_actual_at, b.checkout_at);
+  window_end := ended_at + make_interval(days => b.review_window_days);
+
+  IF now() < ended_at THEN
+    RAISE EXCEPTION 'REVIEW_TOO_EARLY' USING ERRCODE = 'P0001';
+  END IF;
+  IF now() > window_end THEN
+    RAISE EXCEPTION 'REVIEW_WINDOW_CLOSED' USING ERRCODE = 'P0001';
+  END IF;
+
+  -- flags derived from booking state, never from client
+  IF b.refund_kind = 'full_after_stay' THEN
+    NEW.flags := array_append(NEW.flags, 'refund_full');
+  END IF;
+  IF b.dispute_status = 'resolved_guest' AND NEW.reviewer_role = 'host_to_guest' THEN
+    NEW.flags := array_append(NEW.flags, 'dispute_resolved_against_reviewer');
+  END IF;
+
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER reviews_eligibility
+  BEFORE INSERT ON reviews
+  FOR EACH ROW EXECUTE FUNCTION assert_review_eligible();
+
+-- reviews are immutable in identity fields
+CREATE OR REPLACE FUNCTION reviews_immutable() RETURNS trigger AS $$
+BEGIN
+  IF NEW.booking_id <> OLD.booking_id
+     OR NEW.reviewer_id <> OLD.reviewer_id
+     OR NEW.reviewer_role <> OLD.reviewer_role
+     OR NEW.property_id <> OLD.property_id THEN
+    RAISE EXCEPTION 'REVIEW_IMMUTABLE_FIELDS' USING ERRCODE = 'P0001';
+  END IF;
+  NEW.updated_at := now();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER reviews_immutable_trg
+  BEFORE UPDATE ON reviews
+  FOR EACH ROW EXECUTE FUNCTION reviews_immutable();
+```
+
+**Consistency note:** the trigger and the service must agree. Both read from the shared eligibility function (1.6) and the same status matrix. A test (1.9) asserts they never diverge.
+
+### 1.6 Service Layer
+
+#### Single source of eligibility
+
+```ts
+// review-eligibility.ts
+export type ReviewRole = 'guest_to_host' | 'host_to_guest';
+
+export type EligibilityReason =
+  | 'ok'
+  | 'booking_not_found'
+  | 'not_participant'
+  | 'booking_not_completed'
+  | 'booking_disputed'
+  | 'no_stay_occurred'
+  | 'too_early'
+  | 'window_closed'
+  | 'already_reviewed'
+  | 'account_restricted'
+  | 'linked_accounts';
+
+export interface EligibilityResult {
+  eligible: boolean;
+  reason: EligibilityReason;
+  role?: ReviewRole;
+  flags: string[];
+  windowEndsAt?: Date;
+}
+
+export function evaluateEligibility(input: {
+  booking: BookingRecord;
+  property: PropertyRecord;
+  reviewer: UserRecord;
+  existingRoles: ReviewRole[];
+  linkedAccounts: boolean;
+  now: Date;
+}): EligibilityResult {
+  const { booking, property, reviewer, existingRoles, linkedAccounts, now } = input;
+
+  const role: ReviewRole | null =
+    reviewer.id === booking.guestId ? 'guest_to_host'
+    : reviewer.id === property.hostId ? 'host_to_guest'
+    : null;
+
+  if (!role) return deny('not_participant');
+  if (reviewer.status !== 'active') return deny('account_restricted', role);
+  if (linkedAccounts) return deny('linked_accounts', role);
+
+  if (!['completed', 'cancelled', 'refunded', 'modified'].includes(booking.status))
+    return deny('booking_not_completed', role);
+  if (booking.disputeStatus === 'open') return deny('booking_disputed', role);
+  if (booking.refundKind === 'full_no_stay') return deny('no_stay_occurred', role);
+  if (booking.status === 'cancelled' && !booking.checkoutActualAt)
+    return deny('no_stay_occurred', role);
+
+  const endedAt = booking.checkoutActualAt ?? booking.checkoutAt;
+  const windowEnd = new Date(endedAt.getTime() + booking.reviewWindowDays * 86_400_000);
+  if (now < endedAt) return deny('too_early', role);
+  if (now > windowEnd) return deny('window_closed', role);
+
+  if (existingRoles.includes(role)) return deny('already_reviewed', role);
+
+  const flags: string[] = [];
+  if (booking.refundKind === 'full_after_stay') flags.push('refund_full');
+
+  return { eligible: true, reason: 'ok', role, flags, windowEndsAt: windowEnd };
+}
+
+function deny(reason: EligibilityReason, role?: ReviewRole): EligibilityResult {
+  return { eligible: false, reason, role, flags: [] };
+}
+```
+
+#### Submission flow
+
+```ts
+// review-service.ts
+export async function submitReview(
+  ctx: { userId: string },          // from authenticated session ONLY
+  dto: { bookingId: string; rating: number; body: string },
+  idempotencyKey?: string,
+) {
+  return db.transaction(async (tx) => {
+    // Lock the booking row to serialize concurrent submissions per booking.
+    const booking = await tx.bookings.findByIdForUpdate(dto.bookingId);
+    if (!booking) throw new ReviewError('booking_not_found', 404);
+
+    const [property, reviewer, existing, linked] = await Promise.all([
+      tx.properties.findById(booking.propertyId),
+      tx.users.findById(ctx.userId),
+      tx.reviews.rolesForBooking(booking.id),
+      accountsLinked(tx, booking.guestId, booking.hostIdFor(property)),
+    ]);
+
+    const decision = evaluateEligibility({
+      booking, property, reviewer,
+      existingRoles: existing, linkedAccounts: linked, now: new Date(),
+    });
+    if (!decision.eligible) throw new ReviewError(decision.reason, statusFor(decision.reason));
+
+    try {
+      const review = await tx.reviews.insert({
+        bookingId: booking.id,
+        propertyId: property.id,
+        reviewerId: reviewer.id,
+        subjectUserId: decision.role === 'guest_to_host' ? property.hostId : booking.guestId,
+        reviewerRole: decision.role!,
+        rating: dto.rating,
+        body: sanitize(dto.body),
+        flags: decision.flags,
+        idempotencyKey,
+      });
+      await enqueueAggregateRecompute(tx, property.id);
+      return review;
+    } catch (e) {
+      // DB is the final authority. Map its errors; never leak raw SQL errors.
+      throw mapDbError(e);
+    }
+  });
+}
+```
+
+#### Error mapping
+
+```ts
+const HTTP: Record<string, number> = {
+  booking_not_found: 404,
+  not_participant: 403,
+  account_restricted: 403,
+  linked_accounts: 403,
+  booking_not_completed: 409,
+  booking_disputed: 409,
+  no_stay_occurred: 409,
+  too_early: 409,
+  window_closed: 410,
+  already_reviewed: 409,
+};
+
+function mapDbError(e: any): ReviewError {
+  if (e.code === '23505' && e.constraint === 'reviews_one_per_perspective')
+    return new ReviewError('already_reviewed', 409);
+  if (e.code === '23505' && e.constraint === 'reviews_idempotency_idx')
+    return new ReviewError('already_reviewed', 409); // replay: caller fetches original
+  if (e.message?.startsWith('REVIEW_'))
+    return new ReviewError(e.message.slice(7).toLowerCase() as EligibilityReason, 409);
+  throw e;
+}
+```
+
+#### Idempotency
+
+If the same `Idempotency-Key` repeats from the same user, return the **original review** with `200`, not an error. A genuine second attempt without the key gets `409 already_reviewed`.
+
+### 1.7 Anti-Manipulation Controls
+
+Eligibility alone doesn't stop coordinated fraud. Layer these on:
+
+- **Linked-account detection.** Flag accounts sharing payment instruments, wallet addresses, device fingerprints, or IP clusters. Block (`linked_accounts`) on strong signals; flag for moderation on weak ones.
+- **Wallet relationship check.** If guest and host wallets have transacted outside platform bookings, flag the review.
+- **Velocity limits.** More than N reviews per reviewer per 24h → hold for moderation.
+- **Booking quality signals.** Minimum stay length, minimum booking value, and booking-to-review time anomalies feed a `suspicion_score`.
+- **Held, not rejected.** Suspicious reviews insert as `under_review`, invisible to aggregates until cleared. Never tell the reviewer *why*.
+- **Aggregates count only** `moderation_status = 'published' AND reviewer_role = 'guest_to_host'`.
+
+### 1.8 API Contract
+
+#### `POST /v1/bookings/:bookingId/reviews`
+
+Request:
+
+```json
+{ "rating": 5, "body": "Clean, quiet, exactly as described." }
+```
+
+Headers: `Idempotency-Key: <uuid>` (recommended).
+
+Never accept `reviewer_id`, `role`, or `property_id` from the client.
+
+Responses:
+
+| Status | `code` | Meaning |
+|---|---|---|
+| 201 | n/a | Review created |
+| 200 | n/a | Idempotent replay |
+| 403 | `not_participant` | Not part of this booking |
+| 404 | `booking_not_found` | |
+| 409 | `already_reviewed` | Duplicate perspective |
+| 409 | `booking_not_completed` / `booking_disputed` / `no_stay_occurred` / `too_early` | |
+| 410 | `window_closed` | |
+
+#### `GET /v1/bookings/:bookingId/review-eligibility`
+
+Returns the same `EligibilityResult` for the current user, so the UI shows or hides the review prompt using the **same logic** as submission. Never compute eligibility in the frontend.
+
+### 1.9 Testing
+
+#### Unit: eligibility matrix
+
+Table-driven, one row per cell in 1.3:
+
+```ts
+test.each([
+  ['completed', 'none', 'none', 'guest_to_host', true],
+  ['completed', 'partial', 'none', 'guest_to_host', true],
+  ['refunded', 'full_no_stay', 'none', 'guest_to_host', false],
+  ['refunded', 'full_after_stay', 'none', 'guest_to_host', true],
+  ['cancelled', 'none', 'none', 'guest_to_host', false],
+  ['completed', 'none', 'open', 'host_to_guest', false],
+  ['completed', 'none', 'resolved_host', 'host_to_guest', true],
+  ['in_progress', 'none', 'none', 'guest_to_host', false],
+])('%s / refund %s / dispute %s / %s → %s', (...) => { /* ... */ });
+```
+
+#### Boundary tests
+
+- Exactly at `checkout_at` and at `window_end` (inclusive edges)
+- One second before and after each edge
+- Early checkout shifts the window
+- Timezone/DST: all comparisons in UTC
+
+#### Authorization tests
+
+- Third-party user → `403`
+- Guest submitting as `host_to_guest` → ignored/rejected (role derived, not accepted)
+- Host of a *different* property → `403`
+- Suspended reviewer → `403`
+
+#### Race and repeat tests (the important ones)
+
+```ts
+test('50 concurrent identical submissions → exactly one row', async () => {
+  const results = await Promise.allSettled(
+    Array.from({ length: 50 }, () => submitReview(guestCtx, dto)),
+  );
+  expect(results.filter(r => r.status === 'fulfilled')).toHaveLength(1);
+  expect(await countReviews(booking.id, 'guest_to_host')).toBe(1);
+  results
+    .filter(r => r.status === 'rejected')
+    .forEach(r => expect((r as any).reason.code).toBe('already_reviewed'));
+});
+
+test('guest + host submit simultaneously → two rows, one each', async () => { /* ... */ });
+
+test('booking becomes disputed mid-submission → submission serialized by row lock', async () => { /* ... */ });
+
+test('retry with same Idempotency-Key returns original review', async () => { /* ... */ });
+
+test('direct SQL insert bypassing service still rejected by trigger', async () => {
+  await expect(rawInsert({ bookingId: incompleteBooking.id, /* ... */ }))
+    .rejects.toThrow(/REVIEW_BOOKING_NOT_COMPLETED/);
+});
+
+test('service and trigger agree across the full matrix', async () => {
+  for (const scenario of allScenarios) {
+    const svc = evaluateEligibility(scenario.input).eligible;
+    const db  = await tryRawInsert(scenario.fixture);
+    expect(db.ok).toBe(svc);
+  }
+});
+```
+
+#### Safe-failure assertions
+
+After every rejected attempt: no review row, no aggregate change, no outbox event, and the transaction rolled back.
+
+### 1.10 Acceptance Checklist (Part 1)
+
+- [ ] Only the booking guest or property host can submit, in the matching role
+- [ ] Exactly one review per `(booking, role)`, enforced by a DB unique constraint
+- [ ] Refunded, cancelled, modified, and disputed bookings follow the matrix
+- [ ] Review window enforced in both service and trigger
+- [ ] Concurrent and repeated submissions fail safely with `already_reviewed`
+- [ ] Service and trigger decisions proven consistent by test
+- [ ] Aggregates exclude `under_review`/`removed` and host-to-guest reviews
+- [ ] Client never supplies role, reviewer, or property
+
+---
+
+## Part 2: Chain Degradation Handling
+
+### 2.1 Principles
+
+- **Reads degrade gracefully; writes degrade safely.** Stale data beats no data. Duplicate money movement is never acceptable.
+- **Ambiguity is a state, not an error.** A timed-out broadcast is "unknown," never "failed."
+- **Never rebroadcast without reconciling first.**
+- **Blast radius is feature-scoped.** Chain trouble must not take down browsing, search, messaging, or reviews.
+
+### 2.2 Chain Health State
+
+#### States
+
+| State | Meaning | Trigger |
+|---|---|---|
+| `healthy` | All providers OK | Default |
+| `degraded` | Partial impairment (elevated latency, one provider down, ledger lag) | Soft thresholds crossed |
+| `outage` | No usable provider | Hard thresholds crossed / all breakers open |
+| `recovering` | Providers returning, reconciliation running | Breaker half-open + pending work exists |
+
+#### Signals (per provider: RPC, Horizon)
+
+- Request success rate (rolling 60s)
+- p95 latency
+- Latest ledger age (`now - closed_at`; stale ledger means network or provider lag)
+- Consecutive failures
+- Cross-provider ledger disagreement (>N ledgers apart)
+
+```ts
+export interface ProviderHealth {
+  name: 'rpc' | 'horizon';
+  state: 'closed' | 'open' | 'half_open';  // breaker state
+  successRate: number;
+  p95Ms: number;
+  latestLedger: number | null;
+  latestLedgerAgeSec: number | null;
+  consecutiveFailures: number;
+  lastChangeAt: Date;
+}
+
+export interface ChainHealth {
+  status: 'healthy' | 'degraded' | 'outage' | 'recovering';
+  providers: ProviderHealth[];
+  since: Date;
+  pendingSubmissions: number;
+  message: string;     // user-safe
+}
+```
+
+#### State derivation
+
+```ts
+export function deriveStatus(p: ProviderHealth[], pending: number): ChainHealth['status'] {
+  const open = p.filter(x => x.state === 'open').length;
+  const halfOpen = p.some(x => x.state === 'half_open');
+
+  if (open === p.length) return 'outage';
+  if (pending > 0 && (halfOpen || open < p.length) && wasRecentlyImpaired()) return 'recovering';
+  if (open > 0 || p.some(x => x.p95Ms > 5000 || (x.latestLedgerAgeSec ?? 0) > 60))
+    return 'degraded';
+  return 'healthy';
+}
+```
+
+Use **hysteresis**: enter `degraded` fast (2-3 bad samples), leave slowly (several consecutive good samples over 30-60s) to prevent flapping.
+
+### 2.3 Circuit Breakers
+
+One breaker per provider **and** per operation class (reads vs. submits), so read failures don't open the submit breaker.
+
+```ts
+export class CircuitBreaker {
+  private state: 'closed' | 'open' | 'half_open' = 'closed';
+  private failures = 0;
+  private openedAt = 0;
+
+  constructor(
+    private readonly threshold = 5,
+    private readonly cooldownMs = 15_000,
+    private readonly halfOpenProbes = 1,
+  ) {}
+
+  async exec<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.state === 'open') {
+      if (Date.now() - this.openedAt < this.cooldownMs) throw new BreakerOpenError();
+      this.state = 'half_open';
+    }
+    try {
+      const r = await fn();
+      this.onSuccess();
+      return r;
+    } catch (e) {
+      if (isProviderFault(e)) this.onFailure();   // NOT business errors (e.g. tx_bad_seq)
+      throw e;
+    }
+  }
+
+  private onSuccess() { this.failures = 0; this.state = 'closed'; }
+  private onFailure() {
+    this.failures++;
+    if (this.state === 'half_open' || this.failures >= this.threshold) {
+      this.state = 'open';
+      this.openedAt = Date.now();
+    }
+  }
+}
+```
+
+
+
+- **Provider fault** (counts toward breaker): timeouts, 5xx, connection reset, 429, stale ledger.
+- **Business/network rejection** (does *not* count): bad sequence, insufficient balance, op failure, validation errors.
+
+**Failover:** if multiple RPC/Horizon endpoints are configured, try the next healthy provider for **reads**. For **submits**, see 2.6 (only fail over after reconciling).
+
+### 2.4 Action Classification
+
+Every chain-touching feature must be registered in one of four classes. This registry drives breakers, UI restrictions, and queue behavior.
+
+| Class | Description | Examples | Degraded | Outage |
+|---|---|---|---|---|
+| **R0: No chain** | Pure DB/product features | Browse, search, messages, reviews, profile | ✅ normal | ✅ normal |
+| **R1: Cached read** | Chain data, staleness tolerable | Balances display, property price in XLM, history | ✅ live→cache | ✅ cache + "stale" label |
+| **R2: Live read required** | Decision depends on fresh state | Pre-booking availability/escrow check, quote | ⚠️ retry/failover | ❌ disabled |
+| **W1: Safe to queue** | Idempotent, provably safe to delay | Status sync, indexer backfill, notification of tx result, metadata anchor | ✅ queue | ✅ queue |
+| **W2: Unsafe mutation** | Moves money / irreversible | Pay booking, release escrow, refund, withdraw, token transfer | ⚠️ restricted | ❌ disabled |
+
+**Rule for W1:** an operation may be queued only if (a) it's idempotent by key, (b) executing it later cannot cause financial harm, and (c) its preconditions are re-validated at execution time. **Default is W2 (unsafe)** until proven otherwise.
+
+```ts
+export const ACTION_REGISTRY = {
+  'booking.pay':            { class: 'W2', needs
