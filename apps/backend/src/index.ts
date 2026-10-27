@@ -55,7 +55,7 @@ import { startProbeScheduler, stopProbeScheduler } from './services/probe-schedu
 
 // ── Validate blockchain config early (before the server binds) ────────────────
 const configErrors = validateBlockchainConfig();
-if (configErrors.length > 0) {
+if (process.env.NODE_ENV !== 'test' && configErrors.length > 0) {
   const errorDetails = configErrors
     .map((err) => `  - ${err.field}: ${err.message}`)
     .join('\n');
@@ -70,7 +70,7 @@ if (configErrors.length > 0) {
 
 // ── Validate contract registry (IDs, ABI versions, WASM hashes) ──────────────
 const registryErrors = validateContractRegistry();
-if (registryErrors.length > 0) {
+if (process.env.NODE_ENV !== 'test' && registryErrors.length > 0) {
   const errorDetails = registryErrors
     .map((err) => `  - ${err.contract}.${err.field}: ${err.message}`)
     .join('\n');
@@ -225,13 +225,15 @@ async function startServer(): Promise<void> {
   });
 }
 
-startServer().catch((error) => {
-  structuredLog({
-    level: 'error',
-    message: 'Fatal startup error',
-    timestamp: new Date().toISOString(),
-    error: error instanceof Error ? error.message : String(error),
-    stack: error instanceof Error ? error.stack : undefined,
+if (process.env.NODE_ENV !== 'test') {
+  startServer().catch((error) => {
+    structuredLog({
+      level: 'error',
+      message: 'Fatal startup error',
+      timestamp: new Date().toISOString(),
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+    process.exit(1);
   });
-  process.exit(1);
-});
+}

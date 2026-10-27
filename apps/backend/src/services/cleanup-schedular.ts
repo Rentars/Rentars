@@ -2,6 +2,7 @@ import { syncAllBookings, syncAllProperties, reconcileAllPendingEscrows } from '
 import { purgeExpired as purgeExpiredIdempotencyKeys } from './idempotency.service.js';
 import { BookingService } from './booking.service.js';
 import { processDueAccountDeletions } from './privacy.service.js';
+import { env } from '@/config/env.js';
 
 const bookingService = new BookingService();
 
@@ -10,6 +11,7 @@ const RECONCILIATION_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const IDEMPOTENCY_CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const BOOKING_EXPIRY_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
 const ACCOUNT_DELETION_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+const NOTIFICATION_OUTBOX_INTERVAL_MS = 60 * 1000; // 1 minute
 const MAX_CONCURRENT_RECONCILIATIONS = 5;
 const INITIAL_BACKOFF_MS = 1000; // 1 second
 const MAX_BACKOFF_MS = 30000; // 30 seconds
@@ -97,6 +99,7 @@ async function runEscrowReconciliation(): Promise<void> {
 }
 
 export function startSyncScheduler(): void {
+  if (process.env.NODE_ENV === 'test') return;
   // Blockchain sync
   setInterval(() => {
     runSync().catch((err) => console.error('[sync] Scheduler error:', err));

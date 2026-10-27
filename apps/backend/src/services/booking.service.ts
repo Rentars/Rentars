@@ -42,7 +42,8 @@ import {
   escrowFailuresTotal,
 } from '@/middleware/metrics.middleware.js';
 import { checkDateRangeAvailability } from './availability.service.js';
-import { calculateRangePrice } from './pricing.service.js';
+import { calculateRangePrice, assertQuotedTotal } from './pricing.service.js';
+import { captureListingTermsSnapshot } from './property.service.js';
 import {
   bookingAuthorizationService,
   type BookingActor,

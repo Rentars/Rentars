@@ -261,7 +261,8 @@ export async function createBooking(req: Request, res: Response): Promise<void> 
       // We claimed the key — proceed and complete or release on failure.
       const claimedId = (lockData as { claimed: true; id: string }).id;
 
-      const result = await bookingService.createBooking(req.body);
+      const bookingInput = { ...req.body, tenant_id: req.body.tenant_id ?? userId };
+      const result = await bookingService.createBooking(bookingInput);
 
       if (!result.success) {
         // Release the processing lock so the caller can retry.
@@ -285,7 +286,8 @@ export async function createBooking(req: Request, res: Response): Promise<void> 
   }
 
   // ── Fallback: no idempotency key provided ───────────────────────────────────
-  const result = await bookingService.createBooking(req.body);
+  const bookingInput = { ...req.body, tenant_id: req.body.tenant_id ?? userId };
+  const result = await bookingService.createBooking(bookingInput);
 
   if (!result.success) {
     const status = result.statusCode ?? (result.conflict ? 409 : 400);

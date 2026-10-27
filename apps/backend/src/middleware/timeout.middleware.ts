@@ -55,7 +55,15 @@ export function createTimeoutMiddleware(timeoutMs?: number) {
     // Expose the signal on res.locals for downstream handlers / services
     // (also on req so it's accessible inside route handlers directly)
     res.locals.signal = controller.signal;
-    (req as Request & { signal?: AbortSignal }).signal = controller.signal;
+    try {
+      Object.defineProperty(req, 'signal', {
+        value: controller.signal,
+        configurable: true,
+        writable: true,
+      });
+    } catch {
+      // Ignore if req.signal is non-configurable
+    }
 
     // ── Timer ─────────────────────────────────────────────────────────────
     const timer = setTimeout(() => {

@@ -299,3 +299,80 @@ export async function checkDateRangeAvailability(
     },
   };
 }
+
+/**
+ * Set (replace) manual availability blocks for a property.
+ *
+ * Owners use this to block dates that should not be bookable
+ * (e.g. personal use, maintenance windows).
+ *
+ * Replaces all existing blocks for the property with the new set.
+ */
+export async function setAvailabilityRanges(
+  propertyId: string,
+  ownerId: string,
+  ranges: Array<{ start_date: string; end_date: string }>,
+): Promise<AvailabilityRange[]> {
+  // Verify ownership before mutating
+  const { data: property, error: propError } = await supabase
+    .from('properties')
+    .select('id, owner_id')
+    .eq('id', propertyId)
+    .single();
+
+  if (propError || !property) {
+    throw new Error('Property not found');
+  }
+
+  if ((property as Record<string, unknown>).owner_id !== ownerId) {
+    throw new Error('Forbidden: you do not own this property');
+  }
+
+  // Validate that all ranges are coherent
+  for (const range of ranges) {
+    if (new Date(range.end_date) <= new Date(range.start_date)) {
+      throw new Error(
+        `Invalid range: end_date (${range.end_date}) must be after start_date (${range.start_date})`,
+      );
+    }
+  }
+
+  // Delete existing blocks then insert new ones
+  const { error: deleteError } = await supabase
+    .from('availability_blocks')
+    .delete()
+    .eq('property_id', propertyId);
+
+  if (deleteError && (deleteError as { code?: string }).code !== '42P01') {
+    throw new Error(`Failed to clear existing blocks: ${deleteError.message}`);
+  }
+
+  if (ranges.length === 0) {
+    return [];
+  }
+
+  const rows = ranges.map((r) => ({
+    property_id: propertyId,
+    start_date: r.start_date,
+    end_date: r.end_date,
+  }));
+
+  const { data, error: insertError } = await supabase
+    .from('availability_blocks')
+    .insert(rows)
+    .select();
+
+  if (insertError) {
+    throw new Error(`Failed to save availability blocks: ${insertError.message}`);
+  }
+
+  return ((data ?? []) as Array<Record<string, unknown>>).map((b) => ({
+    id: (b.id as string) ?? '',
+    property_id: propertyId,
+    start_date: b.start_date as string,
+    end_date: b.end_date as string,
+    is_available: false,
+    reason: 'blocked',
+  }));
+}
+

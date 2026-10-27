@@ -14,6 +14,8 @@ export const createBookingSchema = z
       .string({ required_error: 'property_id is required' })
       .uuid('property_id must be a valid UUID'),
 
+    tenant_id: z.string().optional(),
+
     check_in: z
       .string({ required_error: 'check_in is required' })
       .date('check_in must be a valid ISO date (YYYY-MM-DD)'),
