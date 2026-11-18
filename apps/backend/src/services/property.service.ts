@@ -486,12 +486,87 @@ export async function updateProperty(
     });
   }
 
+  // Notify tenants with upcoming bookings when material fields changed.
+  const materialChanges = buildPropertyChangeSummary(before as Partial<Property>, updated);
+  if (materialChanges.length > 0) {
+    import('./notification.service.js').then(({ notifyBookedTenantsOfPropertyChange }) => {
+      notifyBookedTenantsOfPropertyChange({
+        propertyId:    updated.id,
+        propertyTitle: updated.title,
+        propertySlug:  updated.slug ?? updated.id,
+        bookingId:     '', // fan-out uses all upcoming bookings; individual IDs set inside
+        checkIn:       '',
+        checkOut:      '',
+        changeSummary: materialChanges,
+      }).catch((err) =>
+        console.error('[updateProperty] notifyBookedTenantsOfPropertyChange failed:', err),
+      );
+    });
+  }
+
   // Record a version snapshot when tracked fields changed.
   recordPropertyVersion(id, before, updated, changedBy, changeSource, changeNotes).catch((err) =>
     console.warn('[updateProperty] version record failed:', err),
   );
 
   return { success: true, data: updated };
+}
+
+// ─── Material-change detection ────────────────────────────────────────────────
+
+/**
+ * Fields whose change is material to an upcoming stay and should trigger a
+ * tenant notification.  Cosmetic or administrative fields (e.g. slug, images,
+ * average_rating, featured_until) are intentionally excluded.
+ */
+export const MATERIAL_PROPERTY_FIELDS = [
+  // Location / access
+  'address',
+  'city',
+  'country',
+  // Stay policy
+  'check_in_time',
+  'check_out_time',
+  'min_nights',
+  'max_nights',
+  'max_guests',
+  // House rules
+  'pets_allowed',
+  'smoking_allowed',
+  'events_allowed',
+  'quiet_hours_start',
+  'quiet_hours_end',
+  'additional_rules',
+  // Core offering
+  'amenities',
+] as const satisfies readonly (keyof Property)[];
+
+export type MaterialPropertyField = (typeof MATERIAL_PROPERTY_FIELDS)[number];
+
+/**
+ * Compare `before` and `after` property snapshots and return a sanitised
+ * summary of every material field that changed.
+ *
+ * The summary omits all private/internal fields (owner_id, on_chain_id, etc.)
+ * so it is safe to embed directly in a notification payload.
+ *
+ * @returns An array of `{ field, before, after }` objects, empty when nothing material changed.
+ */
+export function buildPropertyChangeSummary(
+  before: Partial<Property>,
+  after: Partial<Property>,
+): Array<{ field: MaterialPropertyField; before: unknown; after: unknown }> {
+  const changes: Array<{ field: MaterialPropertyField; before: unknown; after: unknown }> = [];
+
+  for (const field of MATERIAL_PROPERTY_FIELDS) {
+    const a = JSON.stringify(before[field] ?? null);
+    const b = JSON.stringify(after[field] ?? null);
+    if (a !== b) {
+      changes.push({ field, before: before[field] ?? null, after: after[field] ?? null });
+    }
+  }
+
+  return changes;
 }
 
 /** Listing fields a saved search can match on. */

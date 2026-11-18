@@ -33,7 +33,8 @@ export type NotificationType =
   | 'message_received'
   | 'appeal_submitted'
   | 'report_notification'
-  | 'moderation_decision';
+  | 'moderation_decision'
+  | 'property_updated';
 
 /** Coarse bucket used for filtering the notification list. */
 export type NotificationCategory =
@@ -92,6 +93,8 @@ export function categoryForType(type: NotificationType): NotificationCategory {
       return 'moderation';
     case 'new_property':
       return 'social';
+    case 'property_updated':
+      return 'booking';
     default:
       return 'system';
   }
@@ -174,6 +177,7 @@ const VALID_NOTIFICATION_TYPES: ReadonlyArray<NotificationType> = [
   'appeal_submitted',
   'report_notification',
   'moderation_decision',
+  'property_updated',
 ];
 
 /**
@@ -839,6 +843,113 @@ export async function notifyHostFollowers(
       // Log and continue — one follower's failure must not abort the fan-out
       console.error(
         `[notifyHostFollowers] Failed to notify follower ${followerId}:`,
+        err,
+      );
+    }
+  }
+
+  return { success: true, data: { notified } };
+}
+
+// ─── Property-change tenant fan-out ──────────────────────────────────────────
+
+export interface PropertyChangedNotificationData {
+  /** UUID of the property that was updated. */
+  propertyId: string;
+  /** Human-readable property title. */
+  propertyTitle: string;
+  /** URL slug for deep-linking into the property detail page. */
+  propertySlug: string;
+  /** UUID of the booking that connects the tenant to this property. */
+  bookingId: string;
+  /** ISO date strings for the booked stay — shown in the notification body. */
+  checkIn: string;
+  checkOut: string;
+  /**
+   * Sanitised before/after summary produced by buildPropertyChangeSummary().
+   * Never contains private host metadata (owner_id, internal notes, etc.).
+   */
+  changeSummary: Array<{ field: string; before: unknown; after: unknown }>;
+}
+
+/**
+ * Fan-out a `property_updated` notification to every tenant with an upcoming
+ * confirmed or pending booking for `propertyId`.
+ *
+ * Rules:
+ *  - Only bookings with status Confirmed or Pending are notified.
+ *    Cancelled, Completed, Disputed, and Expired stays are excluded.
+ *  - Each tenant receives at most one notification per update event
+ *    (deduped by eventId = `property_updated:<propertyId>:<bookingId>`).
+ *  - Notification preferences are respected; a tenant who has disabled
+ *    `property_updated` (or all booking notifications) is skipped.
+ *  - Per-tenant failures are logged and do not abort the overall fan-out.
+ *
+ * @param data - Property and change metadata.
+ * @returns Count of notifications successfully enqueued.
+ */
+export async function notifyBookedTenantsOfPropertyChange(
+  data: PropertyChangedNotificationData,
+): Promise<ServiceResponse<{ notified: number }>> {
+  const { propertyId, propertyTitle, propertySlug, checkIn, checkOut, changeSummary } = data;
+
+  // Fetch all upcoming non-terminal bookings for this property.
+  // We only load the columns we need so we never expose unrelated booking data.
+  const { data: bookings, error } = await supabase
+    .from('bookings')
+    .select('id, tenant_id, check_in, check_out, status')
+    .eq('property_id', propertyId)
+    .in('status', ['Pending', 'Confirmed'])
+    .gte('check_out', new Date().toISOString().slice(0, 10)); // future stays only
+
+  if (error) {
+    return { success: false, error: `Failed to fetch bookings for property ${propertyId}: ${error.message}` };
+  }
+
+  const rows = (bookings ?? []) as Array<{
+    id: string;
+    tenant_id: string;
+    check_in: string;
+    check_out: string;
+    status: string;
+  }>;
+
+  if (rows.length === 0) {
+    return { success: true, data: { notified: 0 } };
+  }
+
+  let notified = 0;
+
+  for (const booking of rows) {
+    const eventId = `property_updated:${propertyId}:${booking.id}`;
+
+    const payload: Record<string, unknown> = {
+      propertyId,
+      propertyTitle,
+      propertySlug,
+      bookingId: booking.id,
+      checkIn: booking.check_in,
+      checkOut: booking.check_out,
+      changeSummary,
+    };
+
+    try {
+      // Check the tenant's notification preference before writing anything.
+      const send = await shouldSendInApp(booking.tenant_id, 'property_updated');
+      if (!send) continue;
+
+      // Use the outbox for durability — the row is upserted with a dedupe key
+      // so a retry of the same update does not create a second notification.
+      const result = await enqueueNotificationOutbox(
+        booking.tenant_id,
+        'property_updated',
+        payload,
+        eventId,
+      );
+      if (result.success) notified++;
+    } catch (err) {
+      console.error(
+        `[notifyBookedTenantsOfPropertyChange] Failed for booking ${booking.id}:`,
         err,
       );
     }
