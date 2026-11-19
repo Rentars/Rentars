@@ -1,7 +1,19 @@
 import type { Request, Response } from 'express';
 import { LocationService } from '@/services/location.service.js';
+import type { ServiceResponse } from '@/services/index.js';
 
 const locationService = new LocationService();
+
+/**
+ * Send a failed ServiceResponse as an HTTP error, preserving the stable
+ * `code` discriminator so the frontend can render an actionable fallback
+ * (manual city entry, retry) instead of a generic message.
+ */
+function sendLocationError(res: Response, result: ServiceResponse<unknown>): void {
+  if (!result.success) {
+    res.status(result.statusCode || 400).json({ error: result.error, code: result.code });
+  }
+}
 
 export async function reverseGeocodeAddress(req: Request, res: Response): Promise<void> {
   const { lat, lng } = req.query;
@@ -12,7 +24,7 @@ export async function reverseGeocodeAddress(req: Request, res: Response): Promis
   );
 
   if (!result.success) {
-    res.status(result.statusCode || 400).json({ error: result.error });
+    sendLocationError(res, result);
     return;
   }
 
@@ -25,7 +37,7 @@ export async function geocodeAddress(req: Request, res: Response): Promise<void>
   const result = await locationService.geocode(address as string);
 
   if (!result.success) {
-    res.status(result.statusCode || 400).json({ error: result.error });
+    sendLocationError(res, result);
     return;
   }
 
@@ -42,7 +54,7 @@ export async function searchNearby(req: Request, res: Response): Promise<void> {
   );
 
   if (!result.success) {
-    res.status(result.statusCode || 400).json({ error: result.error });
+    sendLocationError(res, result);
     return;
   }
 
@@ -59,7 +71,7 @@ export async function getPriceComparison(req: Request, res: Response): Promise<v
   );
 
   if (!result.success) {
-    res.status(result.statusCode || 400).json({ error: result.error });
+    sendLocationError(res, result);
     return;
   }
 

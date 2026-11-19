@@ -1,5 +1,6 @@
 import { supabase } from '@/config/supabase.js';
 import type { ServiceResponse } from './index.js';
+import { getHostLedgerBalanceBreakdown } from './ledger.service.js';
 
 export interface HostDashboardSummary {
   total_properties: number;
@@ -7,6 +8,12 @@ export interface HostDashboardSummary {
   upcoming_reservations: number;
   total_revenue: number;
   net_revenue: number;
+  /** Available (withdrawable) balance from the ledger — net − paid_out − disputed. */
+  available_balance?: number;
+  /** Reserved funds from Pending bookings (in escrow, NOT withdrawable). */
+  pending_payout?: number;
+  /** Disputed-booking funds on hold (NOT withdrawable). */
+  disputed_balance?: number;
 }
 
 export interface HostProperty {
@@ -50,6 +57,9 @@ export async function getHostDashboardSummary(
         upcoming_reservations: 0,
         total_revenue: 0,
         net_revenue: 0,
+        available_balance: 0,
+        pending_payout: 0,
+        disputed_balance: 0,
       },
     };
   }
@@ -74,18 +84,34 @@ export async function getHostDashboardSummary(
     .gte('check_in', now)
     .lte('check_in', sevenDaysFromNow);
 
-  // Total revenue from completed bookings
-  const { data: revenueData } = await supabase
-    .from('bookings')
-    .select('total_price')
-    .in('property_id', propertyIds)
-    .in('status', ['Confirmed', 'Completed']);
+  // Total + net revenue are derived from the canonical append-only ledger so
+  // the dashboard reconciles with the earnings view (Feature 4). Previously
+  // this summed booking totals as cash-available, which overstated withdrawable
+  // funds by ignoring fees, refunds, payouts, and disputed holds.
+  const breakdown = await getHostLedgerBalanceBreakdown(hostId);
+  const b = breakdown.success && breakdown.data ? breakdown.data : null;
 
-  const total_revenue = (revenueData ?? []).reduce(
-    (sum: number, b: { total_price: number }) => sum + (Number(b.total_price) || 0),
-    0,
-  );
-  const net_revenue = Math.round(total_revenue * 0.95 * 100) / 100; // 5% platform fee
+  // Reserved (Pending) and held (Disputed) funds from bookings not yet settled
+  // or on hold — never presented as withdrawable.
+  const { data: heldBookings } = await supabase
+    .from('bookings')
+    .select('total_price, status')
+    .in('property_id', propertyIds)
+    .in('status', ['Pending', 'Disputed']);
+
+  let pendingPayout = 0;
+  let disputedBalance = 0;
+  for (const hb of (heldBookings ?? []) as Array<{ total_price: number | string; status: string }>) {
+    const net = (Number(hb.total_price) || 0) * 0.95;
+    if (hb.status === 'Pending') pendingPayout += net;
+    else if (hb.status === 'Disputed') disputedBalance += net;
+  }
+
+  const round2 = (n: number) => Math.round(n * 100) / 100;
+  const gross = b?.gross ?? 0;
+  const settledNet = b?.net ?? 0;
+  const paidOut = b?.paid_out ?? 0;
+  const available = round2(settledNet - paidOut - disputedBalance);
 
   return {
     success: true,
@@ -93,8 +119,11 @@ export async function getHostDashboardSummary(
       total_properties,
       active_bookings: activeCount ?? 0,
       upcoming_reservations: upcomingCount ?? 0,
-      total_revenue: Math.round(total_revenue * 100) / 100,
-      net_revenue,
+      total_revenue: round2(gross),
+      net_revenue: available,
+      available_balance: available,
+      pending_payout: round2(pendingPayout),
+      disputed_balance: round2(disputedBalance),
     },
   };
 }

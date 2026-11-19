@@ -4,6 +4,9 @@ import {
   checkAvailabilityAtomic,
   getAvailabilityRanges,
 } from '@/services/calendar.service.js';
+import { getHostCalendarIntervals } from '@/services/calendarIntervals.service.js';
+import { supabase } from '@/config/supabase.js';
+import type { AuthRequest } from '@/middleware/auth.middleware.js';
 import {
   calculateRangePrice,
   getSeasonalPricing,
@@ -101,6 +104,62 @@ export async function getAvailability(req: Request, res: Response): Promise<void
 
   if (!result.success) {
     res.status(400).json({ error: result.error });
+    return;
+  }
+
+  res.json(result.data);
+}
+
+/**
+ * GET /api/v1/calendar/:propertyId/intervals?from=&to=
+ *
+ * Host-only: returns typed unavailability intervals (confirmed bookings,
+ * pending/expired holds, personal blocks, maintenance) with safe booking
+ * context and an editable flag. The response NEVER includes tenant identity or
+ * payment details — only dates, booking status, and the hold-expiry flag.
+ */
+export async function getCalendarIntervals(req: AuthRequest, res: Response): Promise<void> {
+  const hostId = req.userId;
+  if (!hostId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const { propertyId } = req.params;
+  if (!propertyId) {
+    res.status(400).json({ error: 'propertyId is required' });
+    return;
+  }
+
+  // Ownership check — only the property owner may see typed calendar context.
+  const { data: property, error: propError } = await supabase
+    .from('properties')
+    .select('owner_id')
+    .eq('id', propertyId)
+    .maybeSingle();
+
+  if (propError || !property) {
+    res.status(404).json({ error: 'Property not found' });
+    return;
+  }
+  if ((property as { owner_id: string }).owner_id !== hostId) {
+    res.status(403).json({ error: 'Forbidden: only the property owner can view calendar intervals' });
+    return;
+  }
+
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const defaultTo = (() => {
+    const d = new Date();
+    d.setUTCDate(d.getUTCDate() + 90);
+    return d.toISOString().slice(0, 10);
+  })();
+  const from = (req.query.from as string | undefined) ?? todayStr;
+  const to = (req.query.to as string | undefined) ?? defaultTo;
+
+  const result = await getHostCalendarIntervals(propertyId, from, to);
+  if (!result.success) {
+    const status = result.error?.match(/required|Invalid|before|366/) ? 422 : 500;
+    res.status(status).json({ error: result.error });
     return;
   }
 

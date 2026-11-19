@@ -46,16 +46,72 @@ export interface GeocodedLocation {
   address: string;
 }
 
+/** Actionable geocoder failure surfaced to the UI for the manual-location fallback. */
+export interface GeocodeError {
+  message: string;
+  /** Stable code from the backend (GEOCODE_RATE_LIMITED, GEOCODE_TIMEOUT, …). */
+  code?: string;
+}
+
+export interface GeocodeResultDetail {
+  data: GeocodedLocation | null;
+  error: GeocodeError | null;
+}
+
+/** Friendly, code-aware message for a backend geocode error response. */
+function describeGeocodeError(code: string | undefined, fallback: string): string {
+  switch (code) {
+    case 'GEOCODE_RATE_LIMITED':
+      return 'The location service is busy right now. Try again in a moment, or enter a different city.';
+    case 'GEOCODE_TIMEOUT':
+      return 'The location service timed out. Try again, or enter a different city.';
+    case 'GEOCODE_PROVIDER_UNAVAILABLE':
+      return 'The location service is temporarily unavailable. Enter a city manually to search instead.';
+    case 'GEOCODE_NOT_FOUND':
+      return 'That location was not found. Try a more specific city or address.';
+    default:
+      return fallback;
+  }
+}
+
 export async function geocodeAddress(address: string): Promise<GeocodedLocation | null> {
+  const result = await geocodeAddressDetailed(address);
+  return result.data;
+}
+
+/**
+ * Forward-geocode an address and return an actionable error when the provider
+ * fails, so the UI can render a manual-entry fallback with a specific message
+ * rather than a generic "failed".
+ */
+export async function geocodeAddressDetailed(address: string): Promise<GeocodeResultDetail> {
   try {
     const res = await fetch(
       `${API_URL}/api/v1/locations/geocode?address=${encodeURIComponent(address)}`,
     );
-    if (!res.ok) return null;
-    const data = await res.json();
-    return { lat: data.latitude, lng: data.longitude, address: data.address };
+    if (!res.ok) {
+      let code: string | undefined;
+      try {
+        code = ((await res.json()) as { code?: string }).code;
+      } catch {
+        /* ignore parse failure */
+      }
+      const message = describeGeocodeError(code, 'Failed to search for that location.');
+      return { data: null, error: { message, code } };
+    }
+    const data = (await res.json()) as { latitude?: number; longitude?: number; address?: string };
+    if (data.latitude == null || data.longitude == null) {
+      return { data: null, error: { message: 'That location was not found.', code: 'GEOCODE_NOT_FOUND' } };
+    }
+    return {
+      data: { lat: data.latitude, lng: data.longitude, address: data.address ?? address },
+      error: null,
+    };
   } catch {
-    return null;
+    return {
+      data: null,
+      error: { message: 'Network error reaching the location service. Enter a city to search instead.', code: 'GEOCODE_PROVIDER_UNAVAILABLE' },
+    };
   }
 }
 

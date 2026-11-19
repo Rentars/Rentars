@@ -57,6 +57,12 @@ export interface ApproximateLocation {
   approximate_longitude: number;
   /** Radius of the uncertainty circle shown on the map, in metres */
   location_radius_m: number;
+  /**
+   * Explicit flag identifying the shown coordinates as approximate.  True on
+   * every public-tier redaction so callers never have to infer precision from
+   * the presence of `approximate_latitude`.  Exact tiers set this to false.
+   */
+  is_location_approximate: boolean;
 }
 
 /**
@@ -67,7 +73,19 @@ export function toApproximateLocation(exact: ExactLocation): ApproximateLocation
     approximate_latitude: approximateCoordinate(exact.latitude),
     approximate_longitude: approximateCoordinate(exact.longitude),
     location_radius_m: PUBLIC_LOCATION_RADIUS_M,
+    is_location_approximate: true,
   };
+}
+
+/**
+ * Mark a property response as carrying exact coordinates (host / booking tier).
+ * Counterpart to {@link redactExactCoordinates} so every response carries an
+ * explicit precision flag rather than callers inferring it from field presence.
+ */
+export function markExactLocation<
+  T extends { latitude?: number | null; longitude?: number | null },
+>(property: T): T & { is_location_approximate: false } {
+  return { ...property, is_location_approximate: false as const };
 }
 
 /**
@@ -95,6 +113,7 @@ export function redactExactCoordinates<
     approximate_latitude: 0,
     approximate_longitude: 0,
     location_radius_m: PUBLIC_LOCATION_RADIUS_M,
+    is_location_approximate: true,
     latitude: undefined,
     longitude: undefined,
   };

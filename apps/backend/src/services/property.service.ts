@@ -15,6 +15,7 @@ import { executePaginatedQuery } from '../utils/pagination.js';
 import { CANONICAL_AMENITIES } from '@/types/amenities.js';
 import { sanitizeLongText, sanitizeShortText } from '@/utils/sanitize.js';
 import { generateSlug } from '@/utils/slug.js';
+import { isFeaturedEligible, featuredExpiryTtlMs } from '../utils/featuredEligibility.js';
 
 export interface PropertyImage {
   id: string;
@@ -127,11 +128,15 @@ export const FEATURED_CAP = 6;
 
 /**
  * Returns true when a property is currently within its feature window.
- * Works purely from the in-memory object — no DB round-trip needed.
+ *
+ * Delegates to the centralized {@link isFeaturedEligible} predicate so that
+ * expiry, soft-delete, draft, and moderation-hidden rules are applied
+ * consistently across every featured code path.  Accepts a minimal row that
+ * only carries `featured_until` (and optionally the visibility fields), so the
+ * pure-timestamp call sites in tests continue to work.
  */
-export function isFeaturedNow(property: Pick<Property, 'featured_until'>): boolean {
-  if (!property.featured_until) return false;
-  return new Date(property.featured_until) > new Date();
+export function isFeaturedNow(property: Pick<Property, 'featured_until' | 'status' | 'deleted_at' | 'draft_status' | 'moderation_state'>): boolean {
+  return isFeaturedEligible(property);
 }
 
 /** Fields that are copied when duplicating a property. */
@@ -605,7 +610,14 @@ export async function getFeaturedProperties(
   if (error) return { success: false, error: error.message };
 
   const properties = (data ?? []) as Property[];
-  await cache.set(cacheKey, properties, TTL_FEATURED);
+  // Bound the cache TTL to the soonest promotion expiry so the cache can never
+  // outlive a featured window — an expired promotion is dropped on the next
+  // read rather than served stale for the full TTL.
+  const ttlSeconds = Math.max(
+    1,
+    Math.round(featuredExpiryTtlMs(properties, TTL_FEATURED * 1000) / 1000),
+  );
+  await cache.set(cacheKey, properties, ttlSeconds);
   return { success: true, data: properties };
 }
 
@@ -1000,7 +1012,9 @@ export async function advancedSearch(
       rating: p.average_rating ?? 0,
       review_count: p.review_count ?? 0,
       distance_km: Math.round(dist * 10) / 10,
-      is_featured: false,
+      // Badge derives from the centralized eligibility predicate so an expired
+      // or ineligible listing is never shown as featured.
+      is_featured: isFeaturedEligible(p),
       created_at: p.created_at,
     }));
 
@@ -1064,7 +1078,9 @@ export async function advancedSearch(
     longitude: p.longitude ?? undefined,
     rating: p.average_rating ?? 0,
     review_count: p.review_count ?? 0,
-    is_featured: false,
+    // Badge derives from the centralized eligibility predicate so an expired
+    // or ineligible listing is never shown as featured.
+    is_featured: isFeaturedEligible(p),
     created_at: p.created_at,
   }));
 

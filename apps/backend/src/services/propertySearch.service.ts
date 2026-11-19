@@ -1,6 +1,7 @@
 import { supabase } from '@/config/supabase.js';
 import type { ServiceResponse } from './index.js';
-import { isFeaturedNow, FEATURED_CAP, type Property, type AdvancedSearchFilters } from './property.service.js';
+import { FEATURED_CAP, type Property, type AdvancedSearchFilters } from './property.service.js';
+import { isFeaturedEligible } from '../utils/featuredEligibility.js';
 import { recordSearchMetric } from './searchPerformance.service.js';
 import { isSlowQuery } from '../utils/searchMetrics.js';
 
@@ -130,6 +131,7 @@ function toTsQuery(input: string) {
 export function promoteFeatureToTop(
   properties: Property[],
   cap = FEATURED_CAP,
+  now: Date = new Date(),
 ): (Property & { is_featured: boolean })[] {
   const effectiveCap = Math.min(Math.max(0, cap), FEATURED_CAP);
 
@@ -141,7 +143,10 @@ export function promoteFeatureToTop(
   const organic:            Property[] = [];
 
   for (const p of properties) {
-    if (isFeaturedNow(p)) {
+    // Use the centralized eligibility predicate so expired, soft-deleted,
+    // draft, or moderation-hidden listings are never promoted even if their
+    // featured_until is still in the future.
+    if (isFeaturedEligible(p, now)) {
       featuredCandidates.push(p);
     } else {
       organic.push(p);

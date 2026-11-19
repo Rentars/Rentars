@@ -27,6 +27,25 @@ const NEARBY_ELIGIBLE: ReadonlySet<GeolocationStatus> = new Set(['verified', 'co
  */
 export const PUBLIC_COORDINATE_DECIMALS = 2;
 
+/**
+ * Browser geolocation accuracy (metres) above which a resolved position is
+ * considered too imprecise for a precise nearby search and is flagged as
+ * approximate. 1500 m matches the public-coordinate grid order of magnitude
+ * so an approximate result is never presented as a pinpoint.
+ */
+export const APPROXIMATE_ACCURACY_THRESHOLD_M = 1500;
+
+/**
+ * Decimal places retained for user-supplied coordinates (browser geolocation)
+ * before they are sent to the search API. Rounding to 3 decimals (~110 m)
+ * keeps the search responsive without persisting a pinpoint that could
+ * identify a residential address in logs or analytics.
+ */
+export const USER_COORDINATE_DECIMALS = 3;
+
+/** Whether a coordinate-derived result should be presented as approximate. */
+export type CoordinatePrecision = 'exact' | 'approximate';
+
 export interface CoordinateCheck {
   valid: boolean;
   reason?: string;
@@ -107,6 +126,38 @@ export function roundPublicCoordinates(
   latitude: number,
   longitude: number,
   decimals = PUBLIC_COORDINATE_DECIMALS
+): { latitude: number; longitude: number } {
+  const factor = 10 ** decimals;
+  return {
+    latitude: Math.round(latitude * factor) / factor,
+    longitude: Math.round(longitude * factor) / factor,
+  };
+}
+
+/**
+ * Classify whether a browser-geolocation accuracy value (in metres) is
+ * precise enough for an exact nearby search.  Positions above the threshold
+ * are flagged `approximate` so results can be presented with an uncertainty
+ * indicator and not treated as a pinpoint.
+ *
+ * A null/undefined accuracy is treated as exact — it means the provider did
+ * not report one, not that the position is known to be coarse.
+ */
+export function classifyAccuracy(accuracyM: number | null | undefined): CoordinatePrecision {
+  if (accuracyM == null) return 'exact';
+  return accuracyM <= APPROXIMATE_ACCURACY_THRESHOLD_M ? 'exact' : 'approximate';
+}
+
+/**
+ * Round a user-supplied coordinate pair (e.g. from browser geolocation) to a
+ * privacy-safe precision before it is used in a search request or written to
+ * any log/analytics payload.  Three decimal places is ~110 m — enough for a
+ * responsive nearby search without persisting a residential pinpoint.
+ */
+export function roundUserCoordinates(
+  latitude: number,
+  longitude: number,
+  decimals = USER_COORDINATE_DECIMALS,
 ): { latitude: number; longitude: number } {
   const factor = 10 ** decimals;
   return {

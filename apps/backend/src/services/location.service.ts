@@ -37,6 +37,38 @@ export interface PriceComparison {
   price_diff_pct: number;
 }
 
+/**
+ * Map a thrown geocoder error to an actionable, code-stable ServiceResponse.
+ *
+ * The Nominatim fetch uses `AbortSignal.timeout`, so a slow provider surfaces
+ * as an `AbortError`/`TimeoutError` rather than a generic failure. Distinguishing
+ * the timeout lets the UI offer a "try again" fallback instead of reporting an
+ * opaque internal error.
+ */
+function classifyGeocodeError(error: unknown, label: string): ServiceResponse<never> {
+  const name = error instanceof Error ? error.name : '';
+  const isTimeout =
+    name === 'AbortError' ||
+    name === 'TimeoutError' ||
+    (error instanceof Error && /timed? ?out/i.test(error.message));
+  if (isTimeout) {
+    return {
+      success: false,
+      error: `${label} timed out. The location provider did not respond in time — try again or enter a city manually.`,
+      statusCode: 504,
+      code: 'GEOCODE_TIMEOUT',
+    };
+  }
+  const message = error instanceof Error ? error.message : `${label} failed`;
+  return {
+    success: false,
+    error: `${label} failed. You can still search by typing a city or address.`,
+    statusCode: 502,
+    code: 'GEOCODE_PROVIDER_UNAVAILABLE',
+    details: process.env.NODE_ENV === 'test' ? message : undefined,
+  };
+}
+
 export class LocationService {
   /**
    * Reverse-geocode a coordinate pair to a human-readable address label.
@@ -73,10 +105,20 @@ export class LocationService {
       });
 
       if (response.status === 429) {
-        return { success: false, error: 'Reverse geocoding rate limit exceeded', statusCode: 429 };
+        return {
+          success: false,
+          error: 'Reverse geocoding rate limit exceeded. Try again in a moment.',
+          statusCode: 429,
+          code: 'GEOCODE_RATE_LIMITED',
+        };
       }
       if (!response.ok) {
-        return { success: false, error: 'Reverse geocoding service unavailable', statusCode: 502 };
+        return {
+          success: false,
+          error: 'Reverse geocoding service is temporarily unavailable.',
+          statusCode: 502,
+          code: 'GEOCODE_PROVIDER_UNAVAILABLE',
+        };
       }
 
       const data = (await response.json()) as {
@@ -93,7 +135,12 @@ export class LocationService {
       };
 
       if (data.error || !data.display_name) {
-        return { success: false, error: 'Location not found', statusCode: 404 };
+        return {
+          success: false,
+          error: 'Location not found. Enter a city or address manually.',
+          statusCode: 404,
+          code: 'GEOCODE_NOT_FOUND',
+        };
       }
 
       // Build a concise label: "City, State, Country" falling back to display_name.
@@ -106,14 +153,18 @@ export class LocationService {
       await cache.set(cacheKey, result, REVERSE_GEOCODE_TTL);
       return { success: true, data: result };
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Reverse geocoding failed';
-      return { success: false, error: message, statusCode: 500 };
+      return classifyGeocodeError(error, 'Reverse geocoding');
     }
   }
 
   async geocode(address: string): Promise<ServiceResponse<GeocodeResult>> {
     if (!address || address.trim() === '') {
-      return { success: false, error: 'Address is required', statusCode: 400 };
+      return {
+        success: false,
+        error: 'Address is required',
+        statusCode: 400,
+        code: 'GEOCODE_INVALID_INPUT',
+      };
     }
 
     const cacheKey = `geocode:${address.trim().toLowerCase()}`;
@@ -128,10 +179,20 @@ export class LocationService {
       });
 
       if (response.status === 429) {
-        return { success: false, error: 'Geocoding rate limit exceeded', statusCode: 429 };
+        return {
+          success: false,
+          error: 'Geocoding rate limit exceeded. Try again in a moment.',
+          statusCode: 429,
+          code: 'GEOCODE_RATE_LIMITED',
+        };
       }
       if (!response.ok) {
-        return { success: false, error: 'Geocoding service unavailable', statusCode: 502 };
+        return {
+          success: false,
+          error: 'Geocoding service is temporarily unavailable. Enter a city manually instead.',
+          statusCode: 502,
+          code: 'GEOCODE_PROVIDER_UNAVAILABLE',
+        };
       }
 
       const results = (await response.json()) as Array<{
@@ -141,7 +202,12 @@ export class LocationService {
       }>;
 
       if (!results.length) {
-        return { success: false, error: 'Address not found', statusCode: 404 };
+        return {
+          success: false,
+          error: 'Address not found. Try a more specific city or address.',
+          statusCode: 404,
+          code: 'GEOCODE_NOT_FOUND',
+        };
       }
 
       const [hit] = results;
@@ -154,8 +220,7 @@ export class LocationService {
       await cache.set(cacheKey, result, GEOCODE_TTL);
       return { success: true, data: result };
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Geocoding failed';
-      return { success: false, error: message, statusCode: 500 };
+      return classifyGeocodeError(error, 'Geocoding');
     }
   }
 

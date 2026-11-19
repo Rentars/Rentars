@@ -16,6 +16,12 @@ export interface DashboardSummary {
   upcoming_reservations: number;
   total_revenue: number;
   net_revenue: number;
+  /** Ledger-derived available (withdrawable) balance = net − paid_out − disputed. */
+  available_balance?: number;
+  /** Reserved funds from Pending bookings (in escrow, NOT withdrawable). */
+  pending_payout?: number;
+  /** Disputed-booking funds on hold (NOT withdrawable). */
+  disputed_balance?: number;
 }
 
 export interface HostProperty {

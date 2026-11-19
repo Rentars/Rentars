@@ -8,6 +8,7 @@ import {
   postAdjustment,
   type LedgerDirection,
   type LedgerCurrency,
+  type LedgerEntry,
 } from '@/services/ledger.service.js';
 
 const earningsService = new EarningsService();
@@ -203,6 +204,80 @@ export async function getReconciliationReport(req: AuthRequest, res: Response): 
   }
 
   res.json(result.data);
+}
+
+/**
+ * POST /api/v1/admin/host/:hostId/ledger/adjustment
+/**
+ * GET /api/v1/host/earnings/export?from=YYYY-MM-DD&to=YYYY-MM-DD&currency=USDC
+ *
+ * Returns the host's earnings summary AND the underlying ledger entries for
+ * the period using the SAME definitions as the /earnings and /ledger/balance
+ * endpoints, so an exported report reconciles exactly with the dashboard and
+ * the earnings view (Feature 4).  Entries are capped at 1000 per export.
+ */
+export async function getEarningsExport(req: AuthRequest, res: Response): Promise<void> {
+  const hostId = req.userId;
+  if (!hostId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const { from, to, currency } = req.query as {
+    from?: string;
+    to?: string;
+    currency?: string;
+  };
+
+  const dates = validateDateParams(from, to);
+  if (!dates) {
+    res.status(422).json({ error: 'from and to are required (YYYY-MM-DD or ISO-8601)' });
+    return;
+  }
+  const parsedCurrency = parseCurrency(currency);
+  if (!parsedCurrency) {
+    res.status(422).json({ error: 'currency must be USDC' });
+    return;
+  }
+
+  const filter = { ...dates, currency: parsedCurrency };
+
+  const [summaryResult, entriesResult] = await Promise.all([
+    earningsService.getReconciledEarnings(hostId, filter),
+    listLedgerEntries(hostId, filter, 1, 1000),
+  ]);
+
+  if (!summaryResult.success) {
+    res.status(400).json({ error: summaryResult.error });
+    return;
+  }
+  if (!entriesResult.success) {
+    res.status(400).json({ error: entriesResult.error });
+    return;
+  }
+
+  const entries: LedgerEntry[] = entriesResult.data!.entries;
+  const summary = summaryResult.data!;
+
+  res.json({
+    summary,
+    entries,
+    totals: {
+      gross: summary.gross,
+      platform_fees: summary.platform_fees,
+      refunds: summary.refunds ?? 0,
+      net: summary.net,
+      paid_out: summary.paid_out ?? 0,
+      available: summary.available ?? summary.released,
+      pending: summary.pending,
+      disputed: summary.disputed ?? 0,
+    },
+    period: { from: dates.from, to: dates.to },
+    currency: parsedCurrency,
+    generated_at: new Date().toISOString(),
+    entry_count: entries.length,
+    total_entries_in_period: entriesResult.data!.total,
+  });
 }
 
 /**

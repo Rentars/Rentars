@@ -1,5 +1,6 @@
 import { supabase } from '@/config/supabase.js';
 import type { ServiceResponse } from './index.js';
+import { isPendingHoldExpired } from './calendarIntervals.service.js';
 
 export interface AvailabilityRange {
   id: string;
@@ -15,6 +16,12 @@ export interface BlockRangeInput {
   start_date: string;
   end_date: string;
   reason?: string;
+  /**
+   * Typed reason for the block. Stored as a structured prefix in `reason`
+   * (e.g. "maintenance:boiler service") so the type survives without a
+   * dedicated column and is categorizable on read by categorizeBlockReason.
+   */
+  block_type?: 'personal' | 'maintenance';
 }
 
 export interface PropertySettings {
@@ -81,24 +88,43 @@ export async function blockAvailabilityRange(
   if (!startDate || !endDate) return { success: false, error: 'Invalid date format' };
   if (startDate >= endDate) return { success: false, error: 'start_date must be before end_date' };
 
-  // Reject if a confirmed booking already covers any part of this range.
+  // Reject if a confirmed booking, or an ACTIVE pending hold, already covers
+  // any part of this range. Pending holds that have outlived their hold window
+  // (see PENDING_HOLD_MINUTES) are treated as expired and do NOT block a new
+  // manual block — the host may reclaim those dates. This guard runs in the
+  // service layer so a UI bypass still cannot create a conflicting block.
   const { data: conflictingBookings, error: conflictError } = await supabase
     .from('bookings')
-    .select('id')
+    .select('id, status, created_at')
     .eq('property_id', propertyId)
     .in('status', ['Confirmed', 'Pending'])
     .lt('check_in', input.end_date)
-    .gt('check_out', input.start_date)
-    .limit(1);
+    .gt('check_out', input.start_date);
 
   if (conflictError) return { success: false, error: conflictError.message };
 
-  if (conflictingBookings && conflictingBookings.length > 0) {
+  const blockingConflict = (conflictingBookings ?? []).some((b) => {
+    if (b.status === 'Confirmed') return true;
+    // Pending booking: only blocks if its hold has not expired.
+    if (b.status === 'Pending') {
+      return !isPendingHoldExpired(b.created_at);
+    }
+    return false;
+  });
+
+  if (blockingConflict) {
     return {
       success: false,
-      error: 'Cannot block this range: an existing booking overlaps these dates',
+      error:
+        'Cannot block this range: a confirmed booking or an active pending hold overlaps these dates. Expired holds may be reclaimed after the hold window elapses.',
     };
   }
+
+  // Compose a structured reason so the block type is categorizable on read
+  // without a dedicated column: "maintenance:<note>" / "personal:<note>".
+  const storedReason = input.block_type
+    ? `${input.block_type}:${input.reason ?? ''}`
+    : input.reason;
 
   const { data, error } = await supabase
     .from('availability_ranges')
@@ -107,7 +133,7 @@ export async function blockAvailabilityRange(
       start_date: input.start_date,
       end_date: input.end_date,
       is_available: false,
-      reason: input.reason,
+      reason: storedReason,
       blocked_by: ownerId,
     })
     .select()

@@ -25,7 +25,7 @@ import {
 import { trackSearch, getSearchSuggestions, getTrendingSearches, trackSuggestionEvent } from '@/services/searchAnalytics.service.js';
 import { computeZeroResultSuggestions, getPriceHistogram } from '@/services/propertySearch.service.js';
 import { supabase } from '@/config/supabase.js';
-import { redactExactCoordinates, resolveLocationTier } from '@/utils/locationPrivacy.js';
+import { redactExactCoordinates, resolveLocationTier, markExactLocation } from '@/utils/locationPrivacy.js';
 import type { AuthRequest } from '@/middleware/auth.middleware.js';
 
 // ─── Location-privacy helpers ─────────────────────────────────────────────────
@@ -52,7 +52,7 @@ async function applyLocationPrivacy(
   );
 
   if (tier === 'host' || tier === 'booking') {
-    return property as unknown as Record<string, unknown>;
+    return markExactLocation(property) as unknown as Record<string, unknown>;
   }
 
   return redactExactCoordinates(property as Property & { latitude?: number; longitude?: number }) as unknown as Record<string, unknown>;
