@@ -170,3 +170,26 @@ hCaptcha is verified **server-side** by `captchaMiddleware` (`apps/backend/src/m
 `HCAPTCHA_ENABLED=false` bypasses verification in development and CI only. In production it is ignored and logged.
 
 **Web client:** `HCaptcha.tsx` announces load failures and challenge errors in a live region with a keyboard-reachable "Try again". Tokens are single-use, so `LoginForm` and `RegisterForm` clear the token and reset the widget after every submit attempt.
+
+## Profile field ownership and updates (#918)
+
+The `profiles` table (migration `00005`) has these columns: `user_id`, `display_name`, `avatar_url` (VARCHAR 255), `bio`, `phone`, `stellar_address`, `verified`, `created_at`, `updated_at`. The API maps `name` to `display_name` in one place (`apps/backend/src/services/profile.service.ts`).
+
+| Field | API name | Visibility | Writable by owner | Notes |
+|---|---|---|---|---|
+| Display name | `name` | Public | Yes | Required and non-empty after trimming |
+| Avatar | `avatar_url` | Public | Yes | http(s) URL, at most 255 characters. Upload storage is not implemented |
+| Stellar address | `stellar_address` | Public | Yes | Must match `^G[A-Z2-7]{55}$`. Changes are audited as `account.wallet_link` on both PATCH paths |
+| Verification | `verification_status` | Public | No | Derived from `verified` |
+| Phone | `phone` | Private (owner only) | Yes | E.164-style |
+| Bio | `bio` | Private (owner only) | Yes | At most 500 characters |
+| Timestamps | `created_at`, `updated_at` | Private | No | `updated_at` is set on every write |
+| Identity and privilege | `id`, `user_id`, `role`, `status`, `verified` | Server-owned | No | Dropped from any update |
+
+Removed from the API because no column exists: `address`, `preferred_currency`, `last_active`, `stellar_wallet`.
+
+**Partial updates:** `PATCH /api/profile` writes only the keys present. An omitted key keeps its stored value, and an explicit `null` clears an optional field.
+
+**Concurrent edits:** optionally send `expected_updated_at` (the `updated_at` last read). If the stored value has changed, the server returns `409 PROFILE_CONFLICT` with the current profile, and the web form adopts it instead of overwriting.
+
+**Public view:** `GET /api/profile/:id` returns only the public fields and no completeness data, which would reveal which private fields are empty.

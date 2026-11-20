@@ -57,7 +57,7 @@ export async function verifyHCaptchaToken(
 ): Promise<CaptchaVerifyOutcome> {
   const body = new URLSearchParams({ secret: secretKey, response: token });
 
-  let res: Response;
+  let res: globalThis.Response;
   try {
     res = await fetchImpl(HCAPTCHA_VERIFY_URL, {
       method: 'POST',
