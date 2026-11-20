@@ -135,3 +135,38 @@ In development over plain HTTP, browsers ignore the `__Host-` cookie because it 
 - **Audit:** every attempt writes `admin.user_role_change` (allowed) or `admin.user_role_change_denied` (refused) with actor, target, old role, new role, and request correlation ID.
 - **Client display:** the web app reads its role from `GET /api/auth/me`, never from localStorage. If the server cannot confirm the role, the UI shows no role.
 - **Known gap:** a demoted admin keeps admin-family access on existing tokens until they expire. Shorter access-token lifetimes or a token-version check would close this.
+
+## CAPTCHA enforcement (#917)
+
+hCaptcha is verified **server-side** by `captchaMiddleware` (`apps/backend/src/middleware/captcha.middleware.ts`). The client sends the token as `captchaToken`; the server calls hCaptcha `siteverify` with a 5 s timeout.
+
+**Protected endpoints** (verification required on every request):
+
+| Endpoint | Why |
+|---|---|
+| `POST /api/auth/register` | Account creation at scale |
+| `POST /api/auth/login` | Credential stuffing |
+| `POST /api/auth/password-reset/request` | Reset-email flooding |
+
+**Documented exemptions** (no CAPTCHA; each is protected another way):
+
+| Endpoint | Protection instead |
+|---|---|
+| `POST /api/auth/wallet/challenge`, `POST /api/auth/wallet/verify` | Wallet signature proof plus per-route rate limits |
+| `POST /api/auth/password-reset/confirm` | Single-use reset token from email |
+| `POST /api/auth/verify-email` | Single-use verification token plus rate limit |
+| `POST /api/auth/refresh`, `POST /api/auth/logout*` | Refresh-token possession, no new account or credential attempt |
+
+**Outcomes** (all fail closed; a provider problem never accepts a request):
+
+| Situation | HTTP | Code | Retryable |
+|---|---|---|---|
+| No token, or token over 4096 chars | 422 | `CAPTCHA_TOKEN_MISSING` | No (complete the challenge) |
+| Provider rejects token | 422 | `CAPTCHA_INVALID` | Yes, with a new challenge |
+| Token expired or already used | 422 | `CAPTCHA_EXPIRED` | Yes, with a new challenge |
+| Provider timeout, network error, non-2xx, or unreadable answer | 503 | `CAPTCHA_UNAVAILABLE` | Yes, after `Retry-After: 5` |
+| `HCAPTCHA_SECRET_KEY` missing in production | 503 | `CAPTCHA_MISCONFIGURED` | No (operator fix) |
+
+`HCAPTCHA_ENABLED=false` bypasses verification in development and CI only. In production it is ignored and logged.
+
+**Web client:** `HCaptcha.tsx` announces load failures and challenge errors in a live region with a keyboard-reachable "Try again". Tokens are single-use, so `LoginForm` and `RegisterForm` clear the token and reset the widget after every submit attempt.
