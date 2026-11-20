@@ -1,6 +1,13 @@
 import { Router } from 'express';
 import { login, register, requestReset, confirmReset, refreshAccessToken, logout, logoutAllDevices, verifyEmailHandler, resendVerificationHandler } from '@/controllers/auth.controller.js';
-import { walletChallenge, walletVerify } from '@/controllers/wallet.controller.js';
+import {
+  walletChallenge,
+  walletVerify,
+  walletLinkChallenge,
+  walletLink,
+  walletUnlinkChallenge,
+  walletUnlink,
+} from '@/controllers/wallet.controller.js';
 import {
   loginSchema,
   registerSchema,
@@ -10,6 +17,7 @@ import {
   resendVerificationSchema,
   walletChallengeSchema,
   walletVerifySchema,
+  walletUnlinkSchema,
   validateBody,
 } from '@/validators/auth.validator.js';
 import { createAuthRouteLimiter, emailFromBody, stellarAddressFromBody } from '@/middleware/authRateLimit.middleware.js';
@@ -29,6 +37,8 @@ const verifyEmailLimiter = createAuthRouteLimiter({ name: 'verify-email' });
 const verifyEmailResendLimiter = createAuthRouteLimiter({ name: 'verify-email-resend', accountKey: emailFromBody });
 const walletChallengeLimiter = createAuthRouteLimiter({ name: 'wallet-challenge', accountKey: stellarAddressFromBody });
 const walletVerifyLimiter = createAuthRouteLimiter({ name: 'wallet-verify', accountKey: stellarAddressFromBody });
+const walletLinkLimiter = createAuthRouteLimiter({ name: 'wallet-link', accountKey: stellarAddressFromBody });
+const walletUnlinkLimiter = createAuthRouteLimiter({ name: 'wallet-unlink' });
 
 // POST /api/v1/auth/register — CAPTCHA required
 router.post('/register', registerLimiter, validateBody(registerSchema), captchaMiddleware, register);
@@ -59,5 +69,11 @@ router.post('/password-reset/confirm', passwordResetConfirmLimiter, validateBody
 
 router.post('/wallet/challenge', walletChallengeLimiter, validateBody(walletChallengeSchema), walletChallenge);
 router.post('/wallet/verify', walletVerifyLimiter, validateBody(walletVerifySchema), walletVerify);
+
+// Linking and unlinking require an authenticated session plus a fresh signed challenge.
+router.post('/wallet/link/challenge', authenticate, walletLinkLimiter, validateBody(walletChallengeSchema), walletLinkChallenge);
+router.post('/wallet/link', authenticate, walletLinkLimiter, validateBody(walletVerifySchema), walletLink);
+router.post('/wallet/unlink/challenge', authenticate, walletUnlinkLimiter, walletUnlinkChallenge);
+router.post('/wallet/unlink', authenticate, walletUnlinkLimiter, validateBody(walletUnlinkSchema), walletUnlink);
 
 export default router;

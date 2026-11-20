@@ -114,6 +114,19 @@ export const walletVerifySchema = z.object({
   signature: z.string({ required_error: 'signature is required' }),
 });
 
+// ─── Wallet link / unlink schemas ─────────────────────────────────────────────
+
+export const walletUnlinkSchema = z.object({
+  address: z
+    .string({ required_error: 'address is required' })
+    .refine(
+      (addr) => StrKey.isValidEd25519PublicKey(addr),
+      'address must be a valid Stellar public key',
+    ),
+  challenge: z.string({ required_error: 'challenge is required' }),
+  signature: z.string({ required_error: 'signature is required' }),
+});
+
 // ─── Middleware factory ───────────────────────────────────────────────────────
 
 export function validateBody<T extends z.ZodTypeAny>(schema: T) {
