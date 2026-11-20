@@ -20,6 +20,28 @@ export interface ProfileCompleteness {
   missingFields: string[];
 }
 
+const PROTECTED_PROFILE_FIELDS = new Set([
+  'id',
+  'user_id',
+  'role',
+  'status',
+  'verified',
+  'verification_status',
+  'created_at',
+  'updated_at',
+]);
+
+/** Returns a copy of `data` without server-owned fields. */
+export function omitProtectedFields<T extends Record<string, unknown>>(data: T): Partial<T> {
+  const out: Partial<T> = {};
+  for (const [key, value] of Object.entries(data)) {
+    if (!PROTECTED_PROFILE_FIELDS.has(key)) {
+      (out as Record<string, unknown>)[key] = value;
+    }
+  }
+  return out;
+}
+
 const COMPLETENESS_WEIGHTS: Record<string, number> = {
   name: 25,
   avatar_url: 25,
@@ -64,13 +86,15 @@ export async function updateProfile(
   profileData: Partial<Omit<UserProfile, 'user_id' | 'stellar_address'>>,
 ): Promise<ServiceResponse<UserProfile>> {
   if (!userId) return { success: false, error: 'User ID is required' };
-  if (Object.keys(profileData).length === 0) {
+  // Privilege and identity fields are never writable through a profile update (#916).
+  const writable = omitProtectedFields(profileData);
+  if (Object.keys(writable).length === 0) {
     return { success: false, error: 'No fields provided for update' };
   }
 
   const { data, error } = await supabase
     .from('profiles')
-    .upsert({ ...profileData, user_id: userId })
+    .upsert({ ...writable, user_id: userId })
     .select()
     .single();
 

@@ -124,3 +124,14 @@ Bearer request has no ambient credentials to forge. A cross-site page cannot set
 exemption is what keeps its mutations working.
 
 In development over plain HTTP, browsers ignore the `__Host-` cookie because it requires `Secure`.
+
+## Role hierarchy and assignment (#916)
+
+- **Authority:** `users.role` in the database is the only source of truth. The JWT `role` claim is a cache for route gating; the admin role-change endpoint re-reads the actor's role from the database before acting.
+- **Roles:** `tenant`, `host` (non-privileged); `admin`, `moderator`, `support`, `finance` (privileged). The `both` value in the web types is not stored by the backend.
+- **Who can change roles:** only an `admin` (scope `admin:users:role`), via `PATCH /api/v1/admin/users/:id/role` with body `{ "role": "<role>" }`. Unknown body fields are rejected.
+- **Transition matrix:** defined in `apps/backend/src/config/roleTransitions.ts`. Privileged roles are granted and removed only through a non-privileged role. Self-changes and demotion of the last admin are refused.
+- **Profile updates:** `PATCH /api/profile` cannot set `role`, `status`, `verified`, `verification_status`, or identity fields. Such keys are dropped by the validator and again in the service.
+- **Audit:** every attempt writes `admin.user_role_change` (allowed) or `admin.user_role_change_denied` (refused) with actor, target, old role, new role, and request correlation ID.
+- **Client display:** the web app reads its role from `GET /api/auth/me`, never from localStorage. If the server cannot confirm the role, the UI shows no role.
+- **Known gap:** a demoted admin keeps admin-family access on existing tokens until they expire. Shorter access-token lifetimes or a token-version check would close this.
