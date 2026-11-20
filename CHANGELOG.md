@@ -9,26 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security — 2026-11-20
 
-#### #915 — Social login callback policy (social login remains deferred)
-- Added single-use, time-limited OAuth `state` helpers and a `sanitizeReturnPath` guard that rejects external and protocol-relative redirects.
-- Documented exact redirect URIs, provider dashboard settings, callback failure states, and the no-merge-by-email account policy in `docs/social-login-roadmap.md`. No provider control is shown yet.
+#### #911 — Account email verification end to end
+- New `POST /api/v1/auth/verify-email/resend`. It returns the same response for every address, is rate limited per IP and per address, and replaces the stored token so only the newest link works.
+- Confirming an already-verified account returns success instead of an error.
+- `/verify-email` page shows verified, expired, invalid, missing and error states, offers a resend form, and removes the token from the address bar and history.
 
-#### #916 — Server-owned, auditable role changes
-- New `PATCH /api/v1/admin/users/:id/role` (scope `admin:users:role`, admin only). The actor's role is re-read from the database, the change uses a compare-and-set, and self-changes, privileged-to-privileged moves, and last-admin demotion are refused.
-- Allowed and denied role changes are audited with actor, target, old and new role, and request correlation ID.
-- Profile updates can no longer carry `role`, `status`, `verified`, or identity fields, even if sent in the body.
-- New `GET /api/auth/me`. The web app takes its role from the server and ignores any role stored in localStorage.
+#### #912 — Password recovery from request to reset
+- `/forgot-password` shows one neutral outcome for every address and sends the captcha token when captcha is enabled.
+- `/reset-password` reads the token only from the `token` parameter, removes it from history, and applies the same password policy as registration.
+- Captcha tokens survive request validation, so login, register and reset requests are no longer rejected when captcha is enabled.
 
-#### #917 — CAPTCHA fails closed with retryable provider errors
-- Provider timeouts, network errors, and unreadable answers now return `503 CAPTCHA_UNAVAILABLE` with `retryable: true` and `Retry-After`. The previous non-production pass-through is removed.
-- `HCAPTCHA_ENABLED=false` is ignored in production.
-- Expired or reused tokens return `CAPTCHA_EXPIRED`. Login and register reset the challenge after every attempt. Load and challenge errors have an accessible retry.
+#### #913 — Passkey placeholders fail closed
+- Passkey key derivation, signature verification and wallet deployment reject with `PASSKEY_UNSUPPORTED` before generating keys, signing or submitting anything.
+- `useStellar` no longer returns a placeholder transaction. It exposes `passkeySupported: false`.
+- See `docs/passkey-wallet-decision.md` for the supported model that must be chosen first.
 
-#### #918 — Consistent profile reads, writes, and forms
-- The API maps `name` to `profiles.display_name`. Public and owner reads now select only existing columns; the public profile previously always failed.
-- `PATCH /api/profile` writes only supplied fields. An optional `expected_updated_at` returns `409 PROFILE_CONFLICT` with the current profile instead of overwriting.
-- Whitespace-only names are rejected. Public profiles omit private fields and completeness data.
-- The dashboard profile page loads the real profile instead of mock data, and the form sends only changed fields.
+#### #914 — Wallet linking and recovery policy
+- Wallet challenges are bound to a purpose (login, link, unlink), a user, the network and an expiry, and are single use.
+- Wallet sign-in resolves the same account record as email sign-in. The routed service no longer creates a separate identity.
+- New authenticated `POST /api/v1/auth/wallet/link(/challenge)` and `POST /api/v1/auth/wallet/unlink(/challenge)` endpoints require a fresh signed challenge.
+- An address belongs to at most one account (partial unique index, migration `00071`). Unlinking is refused when it would remove the only verified sign-in method.
+- Link and unlink changes are written to the audit log.
 
 ### Security — 2026-10-19
 
