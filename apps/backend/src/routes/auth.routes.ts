@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { login, register, requestReset, confirmReset, refreshAccessToken, logout, logoutAllDevices, verifyEmailHandler } from '@/controllers/auth.controller.js';
+import { login, register, requestReset, confirmReset, refreshAccessToken, logout, logoutAllDevices, verifyEmailHandler, resendVerificationHandler } from '@/controllers/auth.controller.js';
 import { walletChallenge, walletVerify } from '@/controllers/wallet.controller.js';
 import {
   loginSchema,
@@ -7,6 +7,7 @@ import {
   requestPasswordResetSchema,
   confirmPasswordResetSchema,
   verifyEmailSchema,
+  resendVerificationSchema,
   walletChallengeSchema,
   walletVerifySchema,
   validateBody,
@@ -25,6 +26,7 @@ const refreshLimiter = createAuthRouteLimiter({ name: 'refresh' });
 const passwordResetRequestLimiter = createAuthRouteLimiter({ name: 'password-reset-request', accountKey: emailFromBody });
 const passwordResetConfirmLimiter = createAuthRouteLimiter({ name: 'password-reset-confirm' });
 const verifyEmailLimiter = createAuthRouteLimiter({ name: 'verify-email' });
+const verifyEmailResendLimiter = createAuthRouteLimiter({ name: 'verify-email-resend', accountKey: emailFromBody });
 const walletChallengeLimiter = createAuthRouteLimiter({ name: 'wallet-challenge', accountKey: stellarAddressFromBody });
 const walletVerifyLimiter = createAuthRouteLimiter({ name: 'wallet-verify', accountKey: stellarAddressFromBody });
 
@@ -45,6 +47,9 @@ router.post('/logout-all-devices', authenticate, logoutAllDevices);
 
 // POST /api/v1/auth/verify-email — confirm email address with token
 router.post('/verify-email', verifyEmailLimiter, validateBody(verifyEmailSchema), verifyEmailHandler);
+
+// POST /api/v1/auth/verify-email/resend — rate limited per IP and per address; enumeration-safe
+router.post('/verify-email/resend', verifyEmailResendLimiter, validateBody(resendVerificationSchema), resendVerificationHandler);
 
 // POST /api/v1/auth/password-reset/request — CAPTCHA required
 router.post('/password-reset/request', passwordResetRequestLimiter, validateBody(requestPasswordResetSchema), captchaMiddleware, requestReset);
