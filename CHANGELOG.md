@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security — 2026-11-20
+
+#### #915 — Social login callback policy (social login remains deferred)
+- Added single-use, time-limited OAuth `state` helpers and a `sanitizeReturnPath` guard that rejects external and protocol-relative redirects.
+- Documented exact redirect URIs, provider dashboard settings, callback failure states, and the no-merge-by-email account policy in `docs/social-login-roadmap.md`. No provider control is shown yet.
+
+#### #916 — Server-owned, auditable role changes
+- New `PATCH /api/v1/admin/users/:id/role` (scope `admin:users:role`, admin only). The actor's role is re-read from the database, the change uses a compare-and-set, and self-changes, privileged-to-privileged moves, and last-admin demotion are refused.
+- Allowed and denied role changes are audited with actor, target, old and new role, and request correlation ID.
+- Profile updates can no longer carry `role`, `status`, `verified`, or identity fields, even if sent in the body.
+- New `GET /api/auth/me`. The web app takes its role from the server and ignores any role stored in localStorage.
+
+#### #917 — CAPTCHA fails closed with retryable provider errors
+- Provider timeouts, network errors, and unreadable answers now return `503 CAPTCHA_UNAVAILABLE` with `retryable: true` and `Retry-After`. The previous non-production pass-through is removed.
+- `HCAPTCHA_ENABLED=false` is ignored in production.
+- Expired or reused tokens return `CAPTCHA_EXPIRED`. Login and register reset the challenge after every attempt. Load and challenge errors have an accessible retry.
+
+#### #918 — Consistent profile reads, writes, and forms
+- The API maps `name` to `profiles.display_name`. Public and owner reads now select only existing columns; the public profile previously always failed.
+- `PATCH /api/profile` writes only supplied fields. An optional `expected_updated_at` returns `409 PROFILE_CONFLICT` with the current profile instead of overwriting.
+- Whitespace-only names are rejected. Public profiles omit private fields and completeness data.
+- The dashboard profile page loads the real profile instead of mock data, and the form sends only changed fields.
+
 ### Security — 2026-10-19
 
 #### #740 — Recovery and verification token hardening
