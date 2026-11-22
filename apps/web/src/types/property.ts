@@ -1,39 +1,28 @@
-export interface PropertyImage {
-  id: string;
-  url: string;
-  is_primary?: boolean;
-  display_order?: number;
-}
+/**
+ * Property types — re-exported from the canonical Zod schema.
+ *
+ * Import from @/lib/api-schemas/property.schema to access the Zod validators.
+ * This file re-exports the inferred TypeScript types for backwards compatibility.
+ */
 
-export interface Property {
-  id: string;
-  title: string;
-  description: string;
-  price_per_night: number;
-  location: string;
-  images: PropertyImage[];
-  owner_id: string;
-  available: boolean;
-  created_at: string;
+export type {
+  PropertyStatus,
+  PropertyType,
+  PropertyImage,
+  PropertySearchResult as Property,
+  AdvancedSearchResponse,
+} from '@/lib/api-schemas/property.schema';
 
-  // Capacity
-  max_guests?: number;
+export {
+  PropertyStatusSchema,
+  PropertyTypeSchema,
+  PropertySearchResultSchema,
+  AdvancedSearchResponseSchema,
+} from '@/lib/api-schemas/property.schema';
 
-  // Map search support
-  lat?: number;
-  lng?: number;
+// ── Utility helpers ───────────────────────────────────────────────────────────
 
-  // Featured listing window (migration 00022).
-  // A property is currently featured when featured_until is a future datetime.
-  // The backend also surfaces is_featured: true on search results so the
-  // frontend never needs to parse the timestamp itself.
-  featured_until?: string | null;
-  is_featured?: boolean;
-
-  // Human-readable URL slug (migration 00024).
-  // Format: <title>-<city>-<6-char-id-prefix>
-  slug?: string;
-}
+import type { PropertySearchResult } from '@/lib/api-schemas/property.schema';
 
 /**
  * Build the canonical URL path for a property.
@@ -48,6 +37,8 @@ export interface Property {
  *   propertyPath({ id: 'abc' })
  *   // → '/property/abc'
  */
-export function propertyPath(property: Pick<Property, 'id' | 'slug'>): string {
+export function propertyPath(
+  property: Pick<PropertySearchResult, 'id' | 'slug'>,
+): string {
   return `/property/${property.slug ?? property.id}`;
 }

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { type Request, type Response, type NextFunction } from 'express';
 import { env } from '../config/env.js';
 import { getRequestContext, runWithRequestContext } from '../services/logging.service.js';
+import { getTraceContext } from '../config/tracing.js';
 
 // ── Log levels ────────────────────────────────────────────────────────────────
 
@@ -26,15 +27,30 @@ export interface LogEntry {
   level: LogLevel;
   message: string;
   timestamp: string;
+  service?: string;
+  environment?: string;
   requestId?: string;
   userId?: string;
+  traceId?: string;
+  spanId?: string;
+  correlationId?: string;
   [key: string]: unknown;
 }
 
 /**
  * Emit a structured JSON log line.
+ *
+ * Fields are merged in this order (later values win):
+ *   1. The caller-supplied `entry`
+ *   2. `requestId` / `userId` from the per-request AsyncLocalStorage context
+ *      (so deep service calls don't need to thread `req` everywhere)
+ *   3. `traceId` / `spanId` from the W3C trace context AsyncLocalStorage
+ *      (set by `tracingMiddleware` and propagated to workers via
+ *      `runWithWorkerContext`)
+ *   4. `service` and `environment` defaults if the caller didn't set them
+ *
  * In development the line is pretty-printed; in production it is a single-line
- * JSON object suitable for log-aggregation pipelines (Loki, CloudWatch, etc.).
+ * JSON object suitable for Loki / CloudWatch / any structured log pipeline.
  *
  * The log is suppressed when its level falls below the configured LOG_LEVEL.
  */
@@ -42,15 +58,29 @@ export function structuredLog(entry: LogEntry): void {
   const configuredLevel = getConfiguredLevel();
   if (LEVEL_PRIORITY[entry.level] < LEVEL_PRIORITY[configuredLevel]) return;
 
-  // Fall back to the AsyncLocalStorage-backed request context for any field
-  // the caller didn't set explicitly, so log calls made deep inside services
-  // (with no direct access to `req`) still carry the correlation id.
-  const context = getRequestContext();
+  // Pull per-request correlation fields from AsyncLocalStorage so callers
+  // deep inside services don't need direct access to `req`.
+  const reqCtx = getRequestContext();
+
+  // Pull trace context so every log line is linkable to a distributed trace.
+  const traceCtx = getTraceContext();
+
   const merged: LogEntry = {
+    service: 'rentars-api',
+    environment: env.NODE_ENV,
     ...entry,
-    requestId: entry.requestId ?? context?.requestId,
-    userId: entry.userId ?? context?.userId,
+    // Request correlation — only override caller if they left it unset
+    requestId: entry.requestId ?? reqCtx?.requestId,
+    userId: entry.userId ?? reqCtx?.userId,
+    // Trace correlation — fold in traceId/spanId when the trace context exists
+    traceId: entry.traceId ?? traceCtx?.traceId,
+    spanId: entry.spanId ?? traceCtx?.spanId,
   };
+
+  // Drop undefined fields so the JSON payload stays clean.
+  for (const key of Object.keys(merged)) {
+    if (merged[key] === undefined) delete merged[key];
+  }
 
   const line =
     env.NODE_ENV === 'development'
@@ -72,9 +102,9 @@ export function structuredLog(entry: LogEntry): void {
  * Attach a unique request-ID to every incoming request so that all log
  * entries emitted during that request can be correlated in a dashboard.
  *
- * The ID is read from the `X-Request-Id` header if the upstream proxy
- * already set one; otherwise a fresh UUID v4 is generated.
- * The final ID is echoed back to the caller in `X-Request-Id`.
+ * The ID is read from the `X-Request-Id` header if the upstream proxy already
+ * set one; otherwise a fresh UUID v4 is generated.  The final ID is echoed
+ * back to the caller in `X-Request-Id`.
  */
 export function requestIdMiddleware(
   req: Request,
@@ -87,16 +117,12 @@ export function requestIdMiddleware(
       ? incomingId
       : randomUUID();
 
-  // Attach to the request object for downstream middleware and controllers
   (req as RequestWithId).requestId = requestId;
-
-  // Echo back so the client can correlate responses
   res.setHeader('X-Request-Id', requestId);
 
   // Bind the correlation id (and method/path) to the async context for the
-  // rest of the request lifecycle, so any log call made further down the
-  // stack — controllers, services, blockchain/Supabase calls — can pick it
-  // up via `getRequestContext()` without `req` being passed around.
+  // rest of the request lifecycle so any log call made in controllers, services,
+  // blockchain/Supabase calls can pick it up via `getRequestContext()`.
   runWithRequestContext({ requestId, method: req.method, path: req.path }, next);
 }
 
@@ -112,13 +138,16 @@ export interface RequestWithId extends Request {
 /**
  * Structured HTTP request/response logger.
  *
- * Emits a single structured log entry per request on response finish, containing:
+ * Emits one structured log entry per request on response finish containing:
  *   - ISO timestamp
- *   - Request-ID for correlation
+ *   - service + environment
+ *   - requestId for HTTP-level correlation
+ *   - traceId + spanId for distributed-trace linkage
  *   - HTTP method, normalised path, status code, duration
  *   - Authenticated user-ID (if present on req.userId)
+ *   - outcome: 'success' | 'client_error' | 'server_error'
  *
- * Paths matching SKIP_PATHS are not logged (e.g. /health, /metrics).
+ * Paths in SKIP_PATHS are not logged (health, metrics, favicon).
  */
 const SKIP_PATHS = new Set(['/health', '/metrics', '/favicon.ico']);
 
@@ -136,8 +165,16 @@ export function requestLoggingMiddleware(
   const typedReq = req as RequestWithId;
 
   res.on('finish', () => {
-    const duration = Date.now() - startMs;
-    const level: LogLevel = res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info';
+    const durationMs = Date.now() - startMs;
+    const level: LogLevel =
+      res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info';
+
+    const outcome =
+      res.statusCode >= 500
+        ? 'server_error'
+        : res.statusCode >= 400
+          ? 'client_error'
+          : 'success';
 
     structuredLog({
       level,
@@ -148,7 +185,8 @@ export function requestLoggingMiddleware(
       method: req.method,
       path: req.path,
       status: res.statusCode,
-      durationMs: duration,
+      durationMs,
+      outcome,
       userAgent: req.headers['user-agent'],
       ip: req.ip,
     });
