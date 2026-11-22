@@ -1806,4 +1806,340 @@ mod tests {
         // Event "escrow_funded" should be emitted during fund_escrow
         assert!(true);
     }
+
+    // ─── Cross-Contract Integration Tests ─────────────────────────────────────
+    //
+    // These tests deploy both the booking and property-listing contracts into a
+    // single `Env`, wire the booking contract to the listing contract, and
+    // exercise the integrated rental flow end-to-end. Assertion messages name
+    // the interface or state invariant that regressed so failures are
+    // actionable in CI.
+    mod cross_contract {
+        use super::*;
+
+        /// Shared harness: deploys both contracts, wires them together, and
+        /// returns the environment plus the relevant addresses.
+        struct Harness {
+            env: Env,
+            booking_cid: Address,
+            listing_cid: Address,
+            admin: Address,
+        }
+
+        impl Harness {
+            fn new() -> Self {
+                let env = Env::default();
+                env.mock_all_auths();
+
+                let listing_cid = env.register_contract(None, PropertyListingContract);
+                let booking_cid = env.register_contract(None, BookingContract);
+                let admin = Address::generate(&env);
+
+                let booking_client = BookingContractClient::new(&env, &booking_cid);
+                booking_client.initialize(&admin, &listing_cid);
+
+                Harness {
+                    env,
+                    booking_cid,
+                    listing_cid,
+                    admin,
+                }
+            }
+
+            fn booking(&self) -> BookingContractClient<'_> {
+                BookingContractClient::new(&self.env, &self.booking_cid)
+            }
+
+            fn listing(&self) -> PropertyListingContractClient<'_> {
+                PropertyListingContractClient::new(&self.env, &self.listing_cid)
+            }
+
+            fn create_listing(&self, owner: &Address) -> u64 {
+                self.listing().create_listing(
+                    owner,
+                    &String::from_str(&self.env, "Integration Property"),
+                    &String::from_str(&self.env, "Cross-contract test listing"),
+                    &100_0000000_i128,
+                )
+            }
+
+            /// Query the listing contract for the eligibility of a property.
+            fn is_eligible(&self, property_id: u64) -> bool {
+                self.listing().get_listing(&property_id).status == ListingStatus::Active
+            }
+        }
+
+        // ─── Positive flow ────────────────────────────────────────────────────
+
+        #[test]
+        fn test_integration_full_rental_flow() {
+            let h = Harness::new();
+            let owner = Address::generate(&h.env);
+            let tenant = Address::generate(&h.env);
+
+            // 1. Listing creation is visible on the listing contract.
+            let property_id = h.create_listing(&owner);
+            let listing = h.listing().get_listing(&property_id);
+            assert_eq!(
+                listing.status,
+                ListingStatus::Active,
+                "property-listing::create_listing must produce an Active listing",
+            );
+            assert_eq!(
+                listing.owner, owner,
+                "property-listing::create_listing must record the owner",
+            );
+
+            // 2. Eligibility check agrees with the listing state.
+            assert!(
+                h.is_eligible(property_id),
+                "property-listing eligibility must report Active listing as eligible",
+            );
+
+            // 3. Booking creation succeeds and flips the listing to Rented.
+            let booking_id = h.booking().create_booking(
+                &tenant,
+                &property_id,
+                &1_000_u64,
+                &1_007_u64,
+                &700_0000000_i128,
+            );
+            assert_eq!(
+                booking_id, 1,
+                "booking::create_booking must return the first booking id",
+            );
+
+            let booking = h.booking().get_booking(&booking_id);
+            assert_eq!(
+                booking.status,
+                BookingStatus::Pending,
+                "booking::create_booking must leave the booking Pending",
+            );
+            assert_eq!(
+                booking.property_owner, owner,
+                "booking::create_booking must copy the owner from the listing contract",
+            );
+            assert_eq!(
+                h.listing().get_listing(&property_id).status,
+                ListingStatus::Rented,
+                "property-listing::set_rented must be called on successful booking",
+            );
+
+            // 4. Status transition is reflected on the booking contract.
+            h.booking()
+                .update_status(&h.admin, &booking_id, &BookingStatus::Confirmed);
+            assert_eq!(
+                h.booking().get_booking(&booking_id).status,
+                BookingStatus::Confirmed,
+                "booking::update_status must transition Pending -> Confirmed",
+            );
+
+            h.booking()
+                .update_status(&h.admin, &booking_id, &BookingStatus::Completed);
+            assert_eq!(
+                h.booking().get_booking(&booking_id).status,
+                BookingStatus::Completed,
+                "booking::update_status must transition Confirmed -> Completed",
+            );
+        }
+
+        #[test]
+        fn test_integration_cancel_restores_availability() {
+            let h = Harness::new();
+            let owner = Address::generate(&h.env);
+            let tenant = Address::generate(&h.env);
+
+            let property_id = h.create_listing(&owner);
+            let booking_id = h.booking().create_booking(
+                &tenant,
+                &property_id,
+                &1_000_u64,
+                &1_005_u64,
+                &100_i128,
+            );
+
+            assert!(
+                !h.booking()
+                    .check_availability(&property_id, &1_000_u64, &1_005_u64),
+                "booking::check_availability must report booked range as unavailable",
+            );
+
+            h.booking().cancel_booking(&tenant, &booking_id);
+
+            assert_eq!(
+                h.booking().get_booking(&booking_id).status,
+                BookingStatus::Cancelled,
+                "booking::cancel_booking must mark the booking Cancelled",
+            );
+            assert!(
+                h.booking()
+                    .check_availability(&property_id, &1_000_u64, &1_005_u64),
+                "booking::check_availability must free the range after cancellation",
+            );
+        }
+
+        // ─── Negative: missing contract reference ─────────────────────────────
+
+        #[test]
+        #[should_panic(expected = "Not initialized")]
+        fn test_integration_missing_contract_reference() {
+            let env = Env::default();
+            env.mock_all_auths();
+
+            // Deploy the booking contract but never initialize it with a
+            // listing contract reference.
+            let booking_cid = env.register_contract(None, BookingContract);
+            let listing_cid = env.register_contract(None, PropertyListingContract);
+            let booking_client = BookingContractClient::new(&env, &booking_cid);
+            let listing_client = PropertyListingContractClient::new(&env, &listing_cid);
+
+            let owner = Address::generate(&env);
+            let tenant = Address::generate(&env);
+            let property_id = listing_client.create_listing(
+                &owner,
+                &String::from_str(&env, "Orphan Property"),
+                &String::from_str(&env, "No booking wiring"),
+                &100_0000000_i128,
+            );
+
+            // booking::create_booking must reject calls when the listing
+            // contract reference was never initialized.
+            booking_client.create_booking(
+                &tenant,
+                &property_id,
+                &1_000_u64,
+                &1_007_u64,
+                &100_i128,
+            );
+        }
+
+        // ─── Negative: inactive listing ───────────────────────────────────────
+
+        #[test]
+        #[should_panic(expected = "Property is not available for booking")]
+        fn test_integration_inactive_listing_rejected() {
+            let h = Harness::new();
+            let owner = Address::generate(&h.env);
+            let tenant = Address::generate(&h.env);
+
+            let property_id = h.create_listing(&owner);
+            h.listing()
+                .update_status(&owner, &property_id, &ListingStatus::Inactive);
+
+            assert!(
+                !h.is_eligible(property_id),
+                "property-listing eligibility must report Inactive listing as ineligible",
+            );
+
+            // booking::create_booking must reject inactive listing.
+            h.booking().create_booking(
+                &tenant,
+                &property_id,
+                &1_000_u64,
+                &1_007_u64,
+                &100_i128,
+            );
+        }
+
+        // ─── Negative: overlapping reservation ────────────────────────────────
+
+        #[test]
+        #[should_panic(expected = "Property is not available for booking")]
+        fn test_integration_overlapping_reservation_rejected() {
+            let h = Harness::new();
+            let owner = Address::generate(&h.env);
+            let tenant_a = Address::generate(&h.env);
+            let tenant_b = Address::generate(&h.env);
+
+            let property_id = h.create_listing(&owner);
+
+            // First reservation succeeds and marks the listing Rented.
+            h.booking().create_booking(
+                &tenant_a,
+                &property_id,
+                &1_000_u64,
+                &1_007_u64,
+                &100_i128,
+            );
+            assert_eq!(
+                h.listing().get_listing(&property_id).status,
+                ListingStatus::Rented,
+                "property-listing::set_rented must be called after first booking",
+            );
+
+            // Second reservation for the same property must be rejected by
+            // the listing contract's eligibility check.
+            h.booking().create_booking(
+                &tenant_b,
+                &property_id,
+                &1_000_u64,
+                &1_007_u64,
+                &100_i128,
+            );
+        }
+
+        // ─── Negative: downstream failure atomicity ───────────────────────────
+
+        #[test]
+        fn test_integration_downstream_failure_atomicity() {
+            let h = Harness::new();
+            let owner = Address::generate(&h.env);
+            let tenant = Address::generate(&h.env);
+
+            let property_id = h.create_listing(&owner);
+            let booking_count_before = h.booking().booking_count();
+            let listing_status_before = h.listing().get_listing(&property_id).status;
+
+            // Force a downstream failure: the listing contract rejects the
+            // booking because the property is Inactive. The booking contract
+            // must not leave any partial writes behind.
+            h.listing()
+                .update_status(&owner, &property_id, &ListingStatus::Inactive);
+
+            let result = h.booking().try_create_booking(
+                &tenant,
+                &property_id,
+                &1_000_u64,
+                &1_007_u64,
+                &100_i128,
+            );
+            assert!(
+                result.is_err(),
+                "booking::create_booking must fail when listing is Inactive",
+            );
+
+            // No partial booking state on the booking contract.
+            assert_eq!(
+                h.booking().booking_count(),
+                booking_count_before,
+                "booking::create_booking must not increment booking_count on failure",
+            );
+            assert_eq!(
+                h.booking().get_property_bookings(&property_id).len(),
+                0,
+                "booking::create_booking must not record a booking on failure",
+            );
+
+            // No partial state on the listing contract: the failed booking
+            // must not have flipped the listing to Rented.
+            assert_eq!(
+                h.listing().get_listing(&property_id).status,
+                ListingStatus::Inactive,
+                "property-listing::set_rented must not be called on failed booking",
+            );
+            assert_ne!(
+                h.listing().get_listing(&property_id).status,
+                ListingStatus::Rented,
+                "property-listing status must not become Rented after a failed booking",
+            );
+
+            // Sanity: the pre-failure status was Active, so the only change is
+            // the explicit Inactive update above.
+            assert_eq!(
+                listing_status_before,
+                ListingStatus::Active,
+                "property-listing::create_listing must produce an Active listing",
+            );
+        }
+    }
 }

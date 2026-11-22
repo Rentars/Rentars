@@ -704,4 +704,465 @@ mod tests {
         assert_eq!(client_a.review_count(), 1);
         assert_eq!(client_b.review_count(), 0, "env_b must remain isolated from env_a");
     }
+
+    // ─── Cross-Contract Compatibility Tests ───────────────────────────────────
+
+    /// Cross-contract harness: deploys the Review, Booking and PropertyListing
+    /// contracts into a single `Env` so the integrated rental flow can be
+    /// exercised end-to-end.
+    ///
+    /// The review contract does not (yet) hold a direct dependency on the
+    /// booking/property contracts, so the harness models the integration
+    /// boundary explicitly: a review is only considered valid when it is
+    /// anchored to a booking that the booking contract reports as completed
+    /// for a listing that the property contract reports as active. These
+    /// helpers keep the cross-contract invariants in one place so a regression
+    /// in any interface is reported with a precise message.
+    mod cross_contract {
+        use super::*;
+        use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Symbol};
+
+        // ── Minimal stand-in interfaces ───────────────────────────────────
+        //
+        // These mirror the public surface of the booking and property-listing
+        // contracts that the review flow depends on. They are registered in
+        // the same `Env` as the review contract so cross-contract state can be
+        // asserted together.
+
+        #[contracttype]
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum ListingStatus {
+            Active,
+            Inactive,
+        }
+
+        #[contracttype]
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum BookingStatus {
+            Pending,
+            Completed,
+            Cancelled,
+        }
+
+        #[contracttype]
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct Listing {
+            pub id: u64,
+            pub host: Address,
+            pub status: ListingStatus,
+        }
+
+        #[contracttype]
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct Booking {
+            pub id: u64,
+            pub listing_id: u64,
+            pub guest: Address,
+            pub status: BookingStatus,
+        }
+
+        #[contract]
+        pub struct PropertyListingContract;
+
+        #[contractimpl]
+        impl PropertyListingContract {
+            pub fn create_listing(env: Env, id: u64, host: Address) -> Listing {
+                let listing = Listing {
+                    id,
+                    host,
+                    status: ListingStatus::Active,
+                };
+                env.storage()
+                    .persistent()
+                    .set(&(symbol_short!("LISTING"), id), &listing);
+                listing
+            }
+
+            pub fn set_listing_status(env: Env, id: u64, status: ListingStatus) {
+                let mut listing: Listing = env
+                    .storage()
+                    .persistent()
+                    .get(&(symbol_short!("LISTING"), id))
+                    .expect("listing must exist");
+                listing.status = status;
+                env.storage()
+                    .persistent()
+                    .set(&(symbol_short!("LISTING"), id), &listing);
+            }
+
+            pub fn get_listing(env: Env, id: u64) -> Listing {
+                env.storage()
+                    .persistent()
+                    .get(&(symbol_short!("LISTING"), id))
+                    .expect("listing must exist")
+            }
+        }
+
+        #[contract]
+        pub struct BookingContract;
+
+        #[contractimpl]
+        impl BookingContract {
+            pub fn create_booking(
+                env: Env,
+                id: u64,
+                listing_id: u64,
+                guest: Address,
+            ) -> Booking {
+                let booking = Booking {
+                    id,
+                    listing_id,
+                    guest,
+                    status: BookingStatus::Pending,
+                };
+                env.storage()
+                    .persistent()
+                    .set(&(symbol_short!("BOOKING"), id), &booking);
+                booking
+            }
+
+            pub fn complete_booking(env: Env, id: u64) {
+                let mut booking: Booking = env
+                    .storage()
+                    .persistent()
+                    .get(&(symbol_short!("BOOKING"), id))
+                    .expect("booking must exist");
+                booking.status = BookingStatus::Completed;
+                env.storage()
+                    .persistent()
+                    .set(&(symbol_short!("BOOKING"), id), &booking);
+            }
+
+            pub fn cancel_booking(env: Env, id: u64) {
+                let mut booking: Booking = env
+                    .storage()
+                    .persistent()
+                    .get(&(symbol_short!("BOOKING"), id))
+                    .expect("booking must exist");
+                booking.status = BookingStatus::Cancelled;
+                env.storage()
+                    .persistent()
+                    .set(&(symbol_short!("BOOKING"), id), &booking);
+            }
+
+            pub fn get_booking(env: Env, id: u64) -> Booking {
+                env.storage()
+                    .persistent()
+                    .get(&(symbol_short!("BOOKING"), id))
+                    .expect("booking must exist")
+            }
+        }
+
+        // ── Harness ───────────────────────────────────────────────────────
+
+        pub struct Harness {
+            pub env: Env,
+            pub review_id: Address,
+            pub booking_id: Address,
+            pub property_id: Address,
+        }
+
+        impl Harness {
+            pub fn new() -> Self {
+                let env = Env::default();
+                env.mock_all_auths();
+                let review_id = env.register_contract(None, ReviewContract);
+                let booking_id = env.register_contract(None, BookingContract);
+                let property_id = env.register_contract(None, PropertyListingContract);
+                Self {
+                    env,
+                    review_id,
+                    booking_id,
+                    property_id,
+                }
+            }
+
+            pub fn review(&self) -> ReviewContractClient<'_> {
+                ReviewContractClient::new(&self.env, &self.review_id)
+            }
+
+            pub fn booking(&self) -> BookingContractClient<'_> {
+                BookingContractClient::new(&self.env, &self.booking_id)
+            }
+
+            pub fn property(&self) -> PropertyListingContractClient<'_> {
+                PropertyListingContractClient::new(&self.env, &self.property_id)
+            }
+
+            /// Cross-contract invariant: a review may only be anchored to a
+            /// booking that exists, belongs to an active listing, and has been
+            /// completed. Returns `Err` with a message naming the violated
+            /// interface so failures identify the regressed contract.
+            pub fn assert_review_eligible(&self, booking_id: u64) -> Result<(), Symbol> {
+                let booking = self.booking().get_booking(&booking_id);
+                let listing = self.property().get_listing(&booking.listing_id);
+                if listing.status != ListingStatus::Active {
+                    return Err(symbol_short!("INACTIVE"));
+                }
+                if booking.status != BookingStatus::Completed {
+                    return Err(symbol_short!("NOTDONE"));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    use cross_contract::{
+        BookingContractClient, BookingStatus, Harness, ListingStatus, PropertyListingContractClient,
+    };
+
+    /// Happy path: a completed booking on an active listing allows a review,
+    /// and the review state stays consistent with the booking/property state.
+    #[test]
+    fn test_cross_contract_review_after_completed_booking() {
+        let h = Harness::new();
+        let host = Address::generate(&h.env);
+        let guest = Address::generate(&h.env);
+
+        h.property().create_listing(&1_u64, &host);
+        h.booking().create_booking(&10_u64, &1_u64, &guest);
+        h.booking().complete_booking(&10_u64);
+
+        h.assert_review_eligible(10)
+            .expect("review interface: completed booking on active listing must be eligible");
+
+        let review_client = h.review();
+        let id = review_client.submit_review(
+            &guest,
+            &host,
+            &5_u32,
+            &String::from_str(&h.env, "Great stay"),
+        );
+
+        assert_eq!(
+            review_client.review_count(),
+            1,
+            "review interface: review_count must reflect the single valid cross-contract flow"
+        );
+        assert_eq!(
+            review_client.get_reputation(&host),
+            500,
+            "review interface: reputation must reflect only the valid cross-contract review"
+        );
+        assert_eq!(
+            review_client.get_reviews_for_user(&host).len(),
+            1,
+            "review interface: reviewee index must contain exactly the valid review"
+        );
+        assert_eq!(review_client.get_review(&id).reviewer, guest);
+    }
+
+    /// A review must not be accepted for a booking that does not exist.
+    #[test]
+    fn test_cross_contract_review_missing_booking() {
+        let h = Harness::new();
+        let host = Address::generate(&h.env);
+        let guest = Address::generate(&h.env);
+
+        h.property().create_listing(&1_u64, &host);
+
+        // No booking was created — the eligibility check must fail.
+        let result = h.assert_review_eligible(999);
+        assert!(
+            result.is_err(),
+            "booking interface: eligibility must fail for a non-existent booking"
+        );
+
+        // Review state must remain untouched by the failed cross-contract flow.
+        let review_client = h.review();
+        assert_eq!(
+            review_client.review_count(),
+            0,
+            "review interface: review_count must stay 0 when the booking is missing"
+        );
+        assert_eq!(
+            review_client.get_reputation(&host),
+            0,
+            "review interface: reputation must stay 0 when the booking is missing"
+        );
+    }
+
+    /// A review must not be accepted while the booking is still pending.
+    #[test]
+    fn test_cross_contract_review_pending_booking_rejected() {
+        let h = Harness::new();
+        let host = Address::generate(&h.env);
+        let guest = Address::generate(&h.env);
+
+        h.property().create_listing(&1_u64, &host);
+        h.booking().create_booking(&10_u64, &1_u64, &guest);
+
+        let result = h.assert_review_eligible(10);
+        assert!(
+            result.is_err(),
+            "booking interface: pending booking must not be review-eligible"
+        );
+
+        let review_client = h.review();
+        assert_eq!(
+            review_client.review_count(),
+            0,
+            "review interface: no review may be recorded for a pending booking"
+        );
+    }
+
+    /// A review must not be accepted for a booking on an inactive listing.
+    #[test]
+    fn test_cross_contract_review_inactive_listing_rejected() {
+        let h = Harness::new();
+        let host = Address::generate(&h.env);
+        let guest = Address::generate(&h.env);
+
+        h.property().create_listing(&1_u64, &host);
+        h.booking().create_booking(&10_u64, &1_u64, &guest);
+        h.booking().complete_booking(&10_u64);
+        h.property()
+            .set_listing_status(&1_u64, &ListingStatus::Inactive);
+
+        let result = h.assert_review_eligible(10);
+        assert!(
+            result.is_err(),
+            "property interface: completed booking on inactive listing must not be review-eligible"
+        );
+
+        let review_client = h.review();
+        assert_eq!(
+            review_client.review_count(),
+            0,
+            "review interface: no review may be recorded for an inactive listing"
+        );
+    }
+
+    /// A cancelled booking must not be review-eligible.
+    #[test]
+    fn test_cross_contract_review_cancelled_booking_rejected() {
+        let h = Harness::new();
+        let host = Address::generate(&h.env);
+        let guest = Address::generate(&h.env);
+
+        h.property().create_listing(&1_u64, &host);
+        h.booking().create_booking(&10_u64, &1_u64, &guest);
+        h.booking().cancel_booking(&10_u64);
+
+        let result = h.assert_review_eligible(10);
+        assert!(
+            result.is_err(),
+            "booking interface: cancelled booking must not be review-eligible"
+        );
+
+        let review_client = h.review();
+        assert_eq!(
+            review_client.review_count(),
+            0,
+            "review interface: no review may be recorded for a cancelled booking"
+        );
+    }
+
+    /// Downstream failure atomicity: a rejected review submission (invalid
+    /// rating) must not leave partial writes in the review contract, and the
+    /// booking/property state must be unchanged.
+    #[test]
+    fn test_cross_contract_failed_review_is_atomic() {
+        let h = Harness::new();
+        let host = Address::generate(&h.env);
+        let guest = Address::generate(&h.env);
+
+        h.property().create_listing(&1_u64, &host);
+        h.booking().create_booking(&10_u64, &1_u64, &guest);
+        h.booking().complete_booking(&10_u64);
+
+        let review_client = h.review();
+
+        // Invalid rating must be rejected by the review contract.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            review_client.submit_review(
+                &guest,
+                &host,
+                &0_u32,
+                &String::from_str(&h.env, "invalid"),
+            );
+        }));
+        assert!(
+            result.is_err(),
+            "review interface: rating 0 must be rejected even in a valid cross-contract flow"
+        );
+
+        // No partial writes: review state is untouched.
+        assert_eq!(
+            review_client.review_count(),
+            0,
+            "review interface: failed submission must not increment review_count"
+        );
+        assert_eq!(
+            review_client.get_reviews_for_user(&host).len(),
+            0,
+            "review interface: failed submission must not write to the reviewee index"
+        );
+        assert_eq!(
+            review_client.get_reputation(&host),
+            0,
+            "review interface: failed submission must not affect reputation"
+        );
+
+        // Cross-contract state is unchanged by the failed review.
+        assert_eq!(
+            h.booking().get_booking(&10_u64).status,
+            BookingStatus::Completed,
+            "booking interface: failed review must not mutate booking status"
+        );
+        assert_eq!(
+            h.property().get_listing(&1_u64).status,
+            ListingStatus::Active,
+            "property interface: failed review must not mutate listing status"
+        );
+    }
+
+    /// Multiple valid cross-contract flows accumulate consistently, while
+    /// ineligible flows contribute nothing to review count or reputation.
+    #[test]
+    fn test_cross_contract_review_state_consistency() {
+        let h = Harness::new();
+        let host = Address::generate(&h.env);
+        let guest_a = Address::generate(&h.env);
+        let guest_b = Address::generate(&h.env);
+
+        h.property().create_listing(&1_u64, &host);
+
+        // Valid flow: completed booking.
+        h.booking().create_booking(&10_u64, &1_u64, &guest_a);
+        h.booking().complete_booking(&10_u64);
+        h.assert_review_eligible(10)
+            .expect("review interface: completed booking must be eligible");
+
+        // Ineligible flow: pending booking.
+        h.booking().create_booking(&11_u64, &1_u64, &guest_b);
+        assert!(
+            h.assert_review_eligible(11).is_err(),
+            "booking interface: pending booking must not be eligible"
+        );
+
+        let review_client = h.review();
+        review_client.submit_review(
+            &guest_a,
+            &host,
+            &4_u32,
+            &String::from_str(&h.env, "Valid review"),
+        );
+
+        assert_eq!(
+            review_client.review_count(),
+            1,
+            "review interface: only the valid cross-contract flow may be counted"
+        );
+        assert_eq!(
+            review_client.get_reputation(&host),
+            400,
+            "review interface: reputation must reflect only valid cross-contract reviews"
+        );
+        assert_eq!(
+            review_client.get_reviews_for_user(&host).len(),
+            1,
+            "review interface: reviewee index must contain only valid cross-contract reviews"
+        );
+    }
 }

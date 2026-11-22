@@ -819,4 +819,222 @@ mod tests {
             &-500_i128,
         );
     }
+
+    // ─── Cross-Contract Integration Tests ─────────────────────────────────────
+    //
+    // These tests deploy both the PropertyListing contract and the Booking
+    // contract into a single `Env` so that the integrated rental flow is
+    // exercised end-to-end. They mirror the harness used on the booking side
+    // and assert that the property-listing interface (`get_listing`,
+    // `set_rented`, `update_status`) reports state that the booking contract's
+    // eligibility checks observe consistently.
+    //
+    // Invariants under test:
+    //   * A booking is only eligible while the listing status is `Active`.
+    //   * `set_rented` is only callable while the listing is `Active`.
+    //   * A failed booking attempt leaves the listing status unchanged
+    //     (no partial writes across the contract boundary).
+
+    mod cross_contract {
+        use super::*;
+        use soroban_sdk::testutils::Address as _;
+
+        /// Deploy both contracts into one environment and return the two
+        /// clients plus the listing owner address.
+        ///
+        /// The booking contract is referenced through its public client so the
+        /// test compiles against the same interface backend clients encode.
+        fn deploy_both(
+            env: &Env,
+        ) -> (
+            PropertyListingContractClient<'_>,
+            booking::BookingContractClient<'_>,
+            Address,
+        ) {
+            env.mock_all_auths();
+
+            let property_id = env.register_contract(None, PropertyListingContract);
+            let booking_id = env.register_contract(None, booking::BookingContract);
+
+            let property = PropertyListingContractClient::new(env, &property_id);
+            let booking = booking::BookingContractClient::new(env, &booking_id);
+
+            let owner = Address::generate(env);
+            (property, booking, owner)
+        }
+
+        /// Create a listing through the property contract and return its id.
+        fn seed_listing(
+            env: &Env,
+            property: &PropertyListingContractClient<'_>,
+            owner: &Address,
+        ) -> u64 {
+            property.create_listing(
+                owner,
+                &String::from_str(env, "Cross-Contract Cabin"),
+                &String::from_str(env, "Listing used by integration tests"),
+                &50_0000000_i128,
+            )
+        }
+
+        /// The booking contract observes an `Active` listing as eligible.
+        #[test]
+        fn test_booking_eligible_while_listing_active() {
+            let env = Env::default();
+            let (property, booking, owner) = deploy_both(&env);
+            let listing_id = seed_listing(&env, &property, &owner);
+
+            assert_eq!(
+                property.get_listing(&listing_id).status,
+                ListingStatus::Active,
+                "property-listing::get_listing must report Active for a freshly created listing"
+            );
+
+            assert!(
+                booking.is_listing_eligible(&listing_id),
+                "cross-contract invariant: booking::is_listing_eligible must be true while \
+                 property-listing::get_listing reports Active"
+            );
+        }
+
+        /// After `set_rented`, the booking contract no longer sees the listing
+        /// as eligible — the Active -> Rented transition is observed across the
+        /// contract boundary.
+        #[test]
+        fn test_set_rented_observed_by_booking_eligibility() {
+            let env = Env::default();
+            let (property, booking, owner) = deploy_both(&env);
+            let listing_id = seed_listing(&env, &property, &owner);
+
+            property.set_rented(&listing_id);
+
+            assert_eq!(
+                property.get_listing(&listing_id).status,
+                ListingStatus::Rented,
+                "property-listing::set_rented must transition status Active -> Rented"
+            );
+            assert!(
+                !booking.is_listing_eligible(&listing_id),
+                "cross-contract invariant: booking::is_listing_eligible must be false after \
+                 property-listing::set_rented marks the listing Rented"
+            );
+        }
+
+        /// After the owner marks a listing `Inactive`, the booking contract
+        /// observes it as ineligible.
+        #[test]
+        fn test_inactive_listing_observed_by_booking_eligibility() {
+            let env = Env::default();
+            let (property, booking, owner) = deploy_both(&env);
+            let listing_id = seed_listing(&env, &property, &owner);
+
+            property.update_status(&owner, &listing_id, &ListingStatus::Inactive);
+
+            assert_eq!(
+                property.get_listing(&listing_id).status,
+                ListingStatus::Inactive,
+                "property-listing::update_status must transition status Active -> Inactive"
+            );
+            assert!(
+                !booking.is_listing_eligible(&listing_id),
+                "cross-contract invariant: booking::is_listing_eligible must be false while \
+                 property-listing::get_listing reports Inactive"
+            );
+        }
+
+        /// `set_rented` is only callable while the listing is `Active`; calling
+        /// it on an `Inactive` listing must fail and leave the status unchanged.
+        #[test]
+        fn test_set_rented_requires_active_listing() {
+            let env = Env::default();
+            let (property, booking, owner) = deploy_both(&env);
+            let listing_id = seed_listing(&env, &property, &owner);
+
+            property.update_status(&owner, &listing_id, &ListingStatus::Inactive);
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                property.set_rented(&listing_id);
+            }));
+            assert!(
+                result.is_err(),
+                "property-listing::set_rented must reject a listing that is not Active"
+            );
+
+            assert_eq!(
+                property.get_listing(&listing_id).status,
+                ListingStatus::Inactive,
+                "cross-contract invariant: a failed property-listing::set_rented must not \
+                 mutate the listing status"
+            );
+            assert!(
+                !booking.is_listing_eligible(&listing_id),
+                "cross-contract invariant: booking::is_listing_eligible must remain false after \
+                 a failed property-listing::set_rented"
+            );
+        }
+
+        /// A failed booking attempt (listing not eligible) must not leave any
+        /// partial writes: the listing status stays `Active` and the booking
+        /// contract records no reservation.
+        #[test]
+        fn test_failed_booking_leaves_listing_unchanged() {
+            let env = Env::default();
+            let (property, booking, owner) = deploy_both(&env);
+            let listing_id = seed_listing(&env, &property, &owner);
+
+            // Make the listing ineligible, then attempt a booking.
+            property.update_status(&owner, &listing_id, &ListingStatus::Inactive);
+
+            let guest = Address::generate(&env);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                booking.book_listing(&guest, &listing_id);
+            }));
+            assert!(
+                result.is_err(),
+                "booking::book_listing must fail when property-listing reports an ineligible \
+                 listing"
+            );
+
+            assert_eq!(
+                property.get_listing(&listing_id).status,
+                ListingStatus::Inactive,
+                "cross-contract invariant: a failed booking must not mutate the listing status \
+                 reported by property-listing::get_listing"
+            );
+            assert!(
+                !booking.has_reservation(&listing_id),
+                "cross-contract invariant: a failed booking must not persist a reservation in \
+                 the booking contract"
+            );
+        }
+
+        /// A booking against a listing id that does not exist in the property
+        /// contract must fail without creating any state.
+        #[test]
+        fn test_booking_missing_listing_fails() {
+            let env = Env::default();
+            let (property, booking, _owner) = deploy_both(&env);
+
+            let guest = Address::generate(&env);
+            let missing_id = 9999_u64;
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                booking.book_listing(&guest, &missing_id);
+            }));
+            assert!(
+                result.is_err(),
+                "booking::book_listing must fail when property-listing::get_listing reports \
+                 the listing is missing"
+            );
+            assert!(
+                !booking.has_reservation(&missing_id),
+                "cross-contract invariant: a failed booking for a missing listing must not \
+                 persist a reservation"
+            );
+            assert!(
+                !property.listing_exists(&missing_id),
+                "property-listing::listing_exists must remain false for a missing listing"
+            );
+        }
+    }
 }

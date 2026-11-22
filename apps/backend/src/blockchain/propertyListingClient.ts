@@ -28,6 +28,65 @@ import type {
 const ABI_VERSION = '0.1.0';
 const CONTRACT_NAME = 'property-listing';
 
+/**
+ * ABI argument descriptors for each state-changing method.
+ *
+ * These mirror apps/contracts/property_listing_abi.json exactly and are used
+ * by the cross-contract compatibility tests to assert that the XDR operations
+ * built by this client match the on-chain interface (order + types).
+ */
+export const PROPERTY_LISTING_ABI = {
+  create_listing: [
+    { name: 'owner', type: 'address' },
+    { name: 'title', type: 'string' },
+    { name: 'description', type: 'string' },
+    { name: 'price_per_night', type: 'i128' },
+  ],
+  update_listing: [
+    { name: 'caller', type: 'address' },
+    { name: 'id', type: 'u64' },
+    { name: 'title', type: 'string' },
+    { name: 'description', type: 'string' },
+    { name: 'price_per_night', type: 'i128' },
+  ],
+  update_status: [
+    { name: 'caller', type: 'address' },
+    { name: 'id', type: 'u64' },
+    { name: 'status', type: 'enum' },
+  ],
+} as const;
+
+export type PropertyListingAbiMethod = keyof typeof PROPERTY_LISTING_ABI;
+
+/**
+ * Decode the contract invocation encoded in an operation returned by
+ * Contract.call(). Exposed so cross-contract tests can assert the ABI shape
+ * without re-implementing XDR parsing.
+ */
+export function decodeInvocation(op: xdr.Operation): {
+  contractId: string;
+  method: string;
+  args: xdr.ScVal[];
+} {
+  const body = op.body();
+  if (body.switch().name !== 'invokeHostFunction') {
+    throw new Error(
+      `[${CONTRACT_NAME}@${ABI_VERSION}] expected invokeHostFunction operation, got ${body.switch().name}`,
+    );
+  }
+  const hostFn = body.invokeHostFunctionOp().hostFunction();
+  if (hostFn.switch().name !== 'hostFunctionTypeInvokeContract') {
+    throw new Error(
+      `[${CONTRACT_NAME}@${ABI_VERSION}] expected invokeContract host function, got ${hostFn.switch().name}`,
+    );
+  }
+  const invoke = hostFn.invokeContract();
+  const contractId = invoke.contractAddress();
+  const method = invoke.functionName().toString();
+  const args = invoke.args();
+  return { contractId: contractId, method, args };
+}
+
 // ─── Client ──────────────────────────────────────────────────────────────────
 
 export class PropertyListingClient {

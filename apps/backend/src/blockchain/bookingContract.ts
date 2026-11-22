@@ -7,6 +7,7 @@
  */
 
 import {
+  Address,
   Contract,
   TransactionBuilder,
   nativeToScVal,
@@ -104,7 +105,7 @@ export async function createBookingOnChain(
 
   const op = contract.call(
     'create_booking',
-    nativeToScVal(userId, { type: 'address' }),
+    nativeToScVal(Address.fromString(userId), { type: 'address' }),
     nativeToScVal(propertyId, { type: 'u64' }),
     nativeToScVal(startDate, { type: 'u64' }),
     nativeToScVal(endDate, { type: 'u64' }),
@@ -142,7 +143,7 @@ export async function cancelBookingOnChain(
 
   const op = contract.call(
     'cancel_booking',
-    nativeToScVal(callerAddress, { type: 'address' }),
+    nativeToScVal(Address.fromString(callerAddress), { type: 'address' }),
     nativeToScVal(bookingId, { type: 'u64' }),
   );
 
@@ -169,7 +170,7 @@ export async function updateBookingStatusOnChain(
 
   const op = contract.call(
     'update_status',
-    nativeToScVal(callerAddress, { type: 'address' }),
+    nativeToScVal(Address.fromString(callerAddress), { type: 'address' }),
     nativeToScVal(bookingId, { type: 'u64' }),
     xdr.ScVal.scvVec([xdr.ScVal.scvSymbol(newStatus)]),
   );
@@ -197,8 +198,8 @@ export async function setTokenAddressOnChain(
 
   const op = contract.call(
     'set_token_address',
-    nativeToScVal(callerAddress, { type: 'address' }),
-    nativeToScVal(tokenAddress, { type: 'address' }),
+    nativeToScVal(Address.fromString(callerAddress), { type: 'address' }),
+    nativeToScVal(Address.fromString(tokenAddress), { type: 'address' }),
   );
 
   const tx = await buildPrepareAndSign(server, [op]);
@@ -223,7 +224,7 @@ export async function fundEscrowOnChain(
 
   const op = contract.call(
     'fund_escrow',
-    nativeToScVal(tenant, { type: 'address' }),
+    nativeToScVal(Address.fromString(tenant), { type: 'address' }),
     nativeToScVal(bookingId, { type: 'u64' }),
   );
 
@@ -248,7 +249,7 @@ export async function disputeBookingOnChain(
 
   const op = contract.call(
     'dispute_booking',
-    nativeToScVal(tenant, { type: 'address' }),
+    nativeToScVal(Address.fromString(tenant), { type: 'address' }),
     nativeToScVal(bookingId, { type: 'u64' }),
   );
 
@@ -276,7 +277,7 @@ export async function resolveDisputeOnChain(
 
   const op = contract.call(
     'resolve_dispute',
-    nativeToScVal(callerAddress, { type: 'address' }),
+    nativeToScVal(Address.fromString(callerAddress), { type: 'address' }),
     nativeToScVal(bookingId, { type: 'u64' }),
     nativeToScVal(releaseToOwner, { type: 'bool' }),
   );

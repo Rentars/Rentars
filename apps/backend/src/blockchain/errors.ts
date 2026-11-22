@@ -86,3 +86,84 @@ export class QuoteInvalidatedError extends BlockchainError {
     this.name = 'QuoteInvalidatedError';
   }
 }
+
+/**
+ * Cross-contract failure scenarios exercised by the integration test harness.
+ * Each scenario maps to the interface or state invariant that regressed so
+ * failures are attributable to a specific contract boundary.
+ */
+export type CrossContractFailureScenario =
+  | 'missing_contract'
+  | 'inactive_listing'
+  | 'overlapping_reservation'
+  | 'downstream_failure';
+
+export interface CrossContractFailureContext {
+  readonly scenario: CrossContractFailureScenario;
+  readonly contractMethod?: string;
+  readonly listingId?: string;
+  readonly bookingId?: string;
+  readonly cause?: unknown;
+}
+
+const CROSS_CONTRACT_FAILURE_CODES: Record<CrossContractFailureScenario, string> = {
+  missing_contract: 'MISSING_CONTRACT',
+  inactive_listing: 'INACTIVE_LISTING',
+  overlapping_reservation: 'OVERLAPPING_RESERVATION',
+  downstream_failure: 'DOWNSTREAM_FAILURE',
+};
+
+const CROSS_CONTRACT_FAILURE_MESSAGES: Record<CrossContractFailureScenario, string> = {
+  missing_contract: 'Property listing contract is not deployed or not initialized',
+  inactive_listing: 'Listing is not eligible for booking (inactive or unavailable)',
+  overlapping_reservation: 'Reservation overlaps an existing booking for this listing',
+  downstream_failure: 'Downstream contract call failed; booking was rolled back',
+};
+
+/**
+ * Error raised when a cross-contract call fails. The `code` identifies the
+ * regressed interface/invariant and `contractMethod` identifies the boundary.
+ */
+export class CrossContractError extends BlockchainError {
+  constructor(
+    public readonly scenario: CrossContractFailureScenario,
+    public readonly contractMethod?: string,
+    message?: string,
+  ) {
+    super(
+      message ?? CROSS_CONTRACT_FAILURE_MESSAGES[scenario],
+      CROSS_CONTRACT_FAILURE_CODES[scenario],
+    );
+    this.name = 'CrossContractError';
+  }
+}
+
+/**
+ * Builds the error type expected for a given cross-contract failure scenario.
+ * Missing contracts surface as `ContractError`, ineligible listings and
+ * overlapping reservations as `AvailabilityError`, and downstream failures as
+ * `EscrowError` so callers can branch on the failure class.
+ */
+export function crossContractFailure(
+  context: CrossContractFailureContext,
+): ContractError | AvailabilityError | EscrowError {
+  const { scenario, contractMethod, cause } = context;
+  const message = CROSS_CONTRACT_FAILURE_MESSAGES[scenario];
+
+  switch (scenario) {
+    case 'missing_contract':
+      return new ContractError(message, contractMethod);
+    case 'inactive_listing':
+    case 'overlapping_reservation':
+      return new AvailabilityError(message);
+    case 'downstream_failure': {
+      const statusCode =
+        cause instanceof EscrowError ? cause.statusCode : undefined;
+      return new EscrowError(message, statusCode);
+    }
+    default: {
+      const exhaustive: never = scenario;
+      throw new Error(`Unhandled cross-contract failure scenario: ${String(exhaustive)}`);
+    }
+  }
+}

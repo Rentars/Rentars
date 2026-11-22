@@ -218,3 +218,215 @@ export interface SimulateTransactionParams {
   /** Optional override for the ledger used during simulation. */
   ledger_override?: number;
 }
+
+// ─── ABI Compatibility Assertions ─────────────────────────────────────────────
+//
+// The assertions below are compile-time only (they emit no runtime code) and
+// fail the TypeScript build if the shared types drift from the contract ABIs.
+// Each assertion names the TypeScript type and the ABI file it is derived from
+// so a regression points directly at the interface that changed.
+
+/** Exact (mutual) assignability check between two types. */
+type Exact<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
+
+/** Fails to compile unless `T` is exactly `true`. */
+type Assert<T extends true> = T;
+
+/** Compile-time assertion that `A` and `B` are exactly the same type. */
+type AssertExact<A, B, _Message extends string> = Assert<Exact<A, B>>;
+
+/**
+ * Enum variants as declared in `apps/contracts/booking_abi.json`.
+ * Update this list together with the ABI and the `BookingStatus` union.
+ */
+type BookingStatusAbiVariants =
+  | 'Pending'
+  | 'Confirmed'
+  | 'Cancelled'
+  | 'Completed'
+  | 'Disputed';
+
+/**
+ * Enum variants as declared in `apps/contracts/booking_abi.json`.
+ * Update this list together with the ABI and the `EscrowStatus` union.
+ */
+type EscrowStatusAbiVariants =
+  | 'NotFunded'
+  | 'Funded'
+  | 'Released'
+  | 'Refunded';
+
+/**
+ * Enum variants as declared in `apps/contracts/property_listing_abi.json`.
+ * Update this list together with the ABI and the `ListingStatus` union.
+ */
+type ListingStatusAbiVariants = 'Active' | 'Inactive' | 'Rented';
+
+/**
+ * Struct fields as declared in `apps/contracts/booking_abi.json` (`Booking`).
+ * Update this list together with the ABI and the `Booking` interface.
+ */
+type BookingAbiFields = {
+  id: bigint;
+  property_id: bigint;
+  tenant: string;
+  property_owner: string;
+  check_in: bigint;
+  check_out: bigint;
+  total_price: bigint;
+  status: BookingStatus;
+  escrow_id: string;
+  escrow_status: EscrowStatus;
+};
+
+/**
+ * Struct fields as declared in `apps/contracts/property_listing_abi.json`
+ * (`PropertyListing`). Update this list together with the ABI and the
+ * `PropertyListing` interface.
+ */
+type PropertyListingAbiFields = {
+  id: bigint;
+  owner: string;
+  title: string;
+  description: string;
+  price_per_night: bigint;
+  status: ListingStatus;
+};
+
+// Enum unions must match the ABI variants exactly (no missing/extra variants).
+type _BookingStatusMatchesAbi = AssertExact<
+  BookingStatus,
+  BookingStatusAbiVariants,
+  'BookingStatus must match enum variants in apps/contracts/booking_abi.json'
+>;
+type _EscrowStatusMatchesAbi = AssertExact<
+  EscrowStatus,
+  EscrowStatusAbiVariants,
+  'EscrowStatus must match enum variants in apps/contracts/booking_abi.json'
+>;
+type _ListingStatusMatchesAbi = AssertExact<
+  ListingStatus,
+  ListingStatusAbiVariants,
+  'ListingStatus must match enum variants in apps/contracts/property_listing_abi.json'
+>;
+
+// Struct interfaces must match the ABI field sets exactly.
+type _BookingMatchesAbi = AssertExact<
+  Booking,
+  BookingAbiFields,
+  'Booking must match struct fields in apps/contracts/booking_abi.json'
+>;
+type _PropertyListingMatchesAbi = AssertExact<
+  PropertyListing,
+  PropertyListingAbiFields,
+  'PropertyListing must match struct fields in apps/contracts/property_listing_abi.json'
+>;
+
+/**
+ * Runtime mirror of the compile-time assertions above. Import and call this in
+ * tests to surface a descriptive failure naming the type and ABI source when
+ * the shared types and contract ABIs diverge.
+ */
+export const ABI_COMPATIBILITY = {
+  bookingStatus: {
+    abi: 'apps/contracts/booking_abi.json',
+    type: 'BookingStatus',
+    variants: ['Pending', 'Confirmed', 'Cancelled', 'Completed', 'Disputed'] as const,
+  },
+  escrowStatus: {
+    abi: 'apps/contracts/booking_abi.json',
+    type: 'EscrowStatus',
+    variants: ['NotFunded', 'Funded', 'Released', 'Refunded'] as const,
+  },
+  listingStatus: {
+    abi: 'apps/contracts/property_listing_abi.json',
+    type: 'ListingStatus',
+    variants: ['Active', 'Inactive', 'Rented'] as const,
+  },
+  bookingFields: {
+    abi: 'apps/contracts/booking_abi.json',
+    type: 'Booking',
+    fields: [
+      'id',
+      'property_id',
+      'tenant',
+      'property_owner',
+      'check_in',
+      'check_out',
+      'total_price',
+      'status',
+      'escrow_id',
+      'escrow_status',
+    ] as const,
+  },
+  propertyListingFields: {
+    abi: 'apps/contracts/property_listing_abi.json',
+    type: 'PropertyListing',
+    fields: [
+      'id',
+      'owner',
+      'title',
+      'description',
+      'price_per_night',
+      'status',
+    ] as const,
+  },
+} as const;
+
+/**
+ * Asserts at runtime that the given enum value set matches the ABI variants
+ * recorded in {@link ABI_COMPATIBILITY}. Throws an error naming the TypeScript
+ * type and ABI source so a regression is easy to locate.
+ */
+export function assertEnumMatchesAbi(
+  type: 'BookingStatus' | 'EscrowStatus' | 'ListingStatus',
+  actual: readonly string[],
+): void {
+  const expected =
+    type === 'BookingStatus'
+      ? ABI_COMPATIBILITY.bookingStatus
+      : type === 'EscrowStatus'
+        ? ABI_COMPATIBILITY.escrowStatus
+        : ABI_COMPATIBILITY.listingStatus;
+
+  const expectedSet = new Set<string>(expected.variants);
+  const actualSet = new Set<string>(actual);
+  const missing = [...expectedSet].filter((v) => !actualSet.has(v));
+  const extra = [...actualSet].filter((v) => !expectedSet.has(v));
+
+  if (missing.length > 0 || extra.length > 0) {
+    throw new Error(
+      `${type} does not match enum variants in ${expected.abi}` +
+        (missing.length > 0 ? `; missing: ${missing.join(', ')}` : '') +
+        (extra.length > 0 ? `; unexpected: ${extra.join(', ')}` : ''),
+    );
+  }
+}
+
+/**
+ * Asserts at runtime that the given struct field names match the ABI fields
+ * recorded in {@link ABI_COMPATIBILITY}. Throws an error naming the TypeScript
+ * type and ABI source so a regression is easy to locate.
+ */
+export function assertStructMatchesAbi(
+  type: 'Booking' | 'PropertyListing',
+  actual: readonly string[],
+): void {
+  const expected =
+    type === 'Booking'
+      ? ABI_COMPATIBILITY.bookingFields
+      : ABI_COMPATIBILITY.propertyListingFields;
+
+  const expectedSet = new Set<string>(expected.fields);
+  const actualSet = new Set<string>(actual);
+  const missing = [...expectedSet].filter((f) => !actualSet.has(f));
+  const extra = [...actualSet].filter((f) => !expectedSet.has(f));
+
+  if (missing.length > 0 || extra.length > 0) {
+    throw new Error(
+      `${type} does not match struct fields in ${expected.abi}` +
+        (missing.length > 0 ? `; missing: ${missing.join(', ')}` : '') +
+        (extra.length > 0 ? `; unexpected: ${extra.join(', ')}` : ''),
+    );
+  }
+}
