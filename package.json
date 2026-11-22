@@ -10,18 +10,20 @@
   },
   "engines": {
     "node": ">=20.0.0",
-    "yarn": ">=1.22.0"
+    "yarn": ">=1.22.0",
+    "bun": ">=1.1.0"
   },
   "scripts": {
-    "dev": "concurrently --names \"backend,frontend\" --prefix-colors \"blue,green\" \"yarn workspace rentars-backend dev\" \"yarn workspace web dev\"",
-    "build": "yarn workspace rentars-backend build && yarn workspace web build",
-    "test": "yarn workspace rentars-backend test && yarn workspace web test",
+    "dev": "concurrently --names \"backend,frontend\" --prefix-colors \"blue,green\" \"bun --cwd apps/backend run dev\" \"yarn --cwd apps/web dev\"",
+    "build": "bun --cwd apps/backend run build && yarn --cwd apps/web build",
+    "test": "bun --cwd apps/backend run test && yarn --cwd apps/web test",
     "lint": "biome check .",
     "lint:fix": "biome check . --write",
     "format": "biome format --write .",
     "clean": "find . -name 'node_modules' -type d -prune -exec rm -rf '{}' + && find . -name 'dist' -type d -prune -exec rm -rf '{}' + && find . -name '.next' -type d -prune -exec rm -rf '{}' +",
     "engines:check": "bash scripts/check-engines.sh",
     "versions": "bash scripts/check-engines.sh",
+    "check:workspaces": "bash scripts/check-workspaces.sh",
     "release:validate": "bun run scripts/validate-changelog.ts",
     "release:manifest": "bun run scripts/generate-release-manifest.ts"
   },

@@ -4,6 +4,10 @@
   "private": true,
   "type": "module",
   "description": "Backend for Rentars — decentralized P2P rental platform on Stellar",
+  "engines": {
+    "bun": ">=1.1.0",
+    "node": ">=20.0.0"
+  },
   "scripts": {
     "dev": "bun run --watch src/index.ts",
     "build": "bun build ./src/index.ts --outdir ./dist",
