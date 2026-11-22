@@ -68,6 +68,31 @@ export interface ContractRegistryEntry {
    * Example: ">=1.0.0 <2.0.0"
    */
   compatibleApps: string;
+  /**
+   * Source commit hash the deployed WASM was built from.
+   * Set via SOURCE_COMMIT_<CONTRACT_NAME> env var.  Empty string when unknown.
+   */
+  sourceCommit: string;
+  /**
+   * Rust toolchain (e.g. "1.79.0") used to build the deployed WASM.
+   * Set via TOOLCHAIN_<CONTRACT_NAME> env var.  Empty string when unknown.
+   */
+  toolchain: string;
+  /**
+   * Build target triple (e.g. "wasm32-unknown-unknown").
+   * Set via BUILD_TARGET_<CONTRACT_NAME> env var.  Empty string when unknown.
+   */
+  buildTarget: string;
+  /**
+   * Transaction hash of the contract initialization call, if any.
+   * Set via INIT_TX_<CONTRACT_NAME> env var.  null when not applicable.
+   */
+  initTxHash: string | null;
+  /**
+   * Environment this entry was recorded for (e.g. "production", "staging").
+   * Derived from DEPLOY_ENV.  Defaults to NODE_ENV.
+   */
+  environment: string;
 }
 
 export interface ContractRegistryValidationError {
@@ -82,6 +107,10 @@ function resolveNetwork(): 'testnet' | 'mainnet' {
   return env.STELLAR_NETWORK;
 }
 
+function resolveEnvironment(): string {
+  return process.env.DEPLOY_ENV ?? env.NODE_ENV;
+}
+
 function buildEntry(
   name: string,
   contractId: string,
@@ -90,6 +119,7 @@ function buildEntry(
   deployTimeEnvKey: string,
   compatibleAppsEnvKey: string,
 ): ContractRegistryEntry {
+  const prefix = name.replace(/([A-Z])/g, '_$1').toUpperCase();
   return {
     name,
     contractId,
@@ -98,6 +128,11 @@ function buildEntry(
     network: resolveNetwork(),
     deployedAt: process.env[deployTimeEnvKey] ?? null,
     compatibleApps: process.env[compatibleAppsEnvKey] ?? '*',
+    sourceCommit: process.env[`SOURCE_COMMIT_${prefix}`] ?? '',
+    toolchain: process.env[`TOOLCHAIN_${prefix}`] ?? '',
+    buildTarget: process.env[`BUILD_TARGET_${prefix}`] ?? '',
+    initTxHash: process.env[`INIT_TX_${prefix}`] ?? null,
+    environment: resolveEnvironment(),
   };
 }
 
@@ -206,9 +241,144 @@ export function validateContractRegistry(
         );
       }
     }
+
+    // WASM hash must be a 64-char hex SHA-256 digest when present.
+    if (entry.wasmHash && !/^[0-9a-f]{64}$/i.test(entry.wasmHash)) {
+      errors.push({
+        contract: key,
+        field: 'wasmHash',
+        message: `WASM hash for '${key}' is not a valid SHA-256 hex digest: ${entry.wasmHash}`,
+      });
+    }
+
+    // Source commit: required in production so artifacts are traceable.
+    if (!entry.sourceCommit) {
+      if (strict) {
+        errors.push({
+          contract: key,
+          field: 'sourceCommit',
+          message: `Source commit for '${key}' is not set. Set SOURCE_COMMIT_${key.replace(/([A-Z])/g, '_$1').toUpperCase()} before deploying to production.`,
+        });
+      }
+    } else if (!/^[0-9a-f]{7,40}$/i.test(entry.sourceCommit)) {
+      errors.push({
+        contract: key,
+        field: 'sourceCommit',
+        message: `Source commit for '${key}' is not a valid git commit hash: ${entry.sourceCommit}`,
+      });
+    }
+
+    // Build target must be the Soroban WASM target when recorded.
+    if (entry.buildTarget && entry.buildTarget !== 'wasm32-unknown-unknown') {
+      errors.push({
+        contract: key,
+        field: 'buildTarget',
+        message: `Build target for '${key}' must be 'wasm32-unknown-unknown', got '${entry.buildTarget}'.`,
+      });
+    }
+
+    // Init transaction hash must look like a Stellar transaction hash when set.
+    if (entry.initTxHash && !/^[0-9a-f]{64}$/i.test(entry.initTxHash)) {
+      errors.push({
+        contract: key,
+        field: 'initTxHash',
+        message: `Init transaction hash for '${key}' is not a valid 32-byte hex hash: ${entry.initTxHash}`,
+      });
+    }
   }
 
   return errors;
+}
+
+// ─── Deployment verification ──────────────────────────────────────────────────
+
+export interface ContractVerificationResult {
+  contract: string;
+  ok: boolean;
+  /** Configured contract ID from backend config. */
+  configuredId: string;
+  /** Contract ID recorded in the deployment manifest/registry. */
+  manifestId: string;
+  /** Human-readable mismatch description, when ok === false. */
+  mismatch?: string;
+}
+
+/**
+ * Compare the deployed contract IDs recorded in the registry (i.e. the
+ * deployment manifest promoted into the environment) against the IDs the
+ * backend is actually configured to call.
+ *
+ * When a manifest entry is available for a contract, a mismatch is reported
+ * as an error.  When no manifest data is present (e.g. local development),
+ * the check is skipped and reported as ok so startup is not blocked.
+ *
+ * Never logs or returns secret material — only public contract identifiers.
+ */
+export function verifyDeployedContracts(): ContractVerificationResult[] {
+  const configured: Record<string, string> = {
+    booking: BOOKING_CONTRACT_ID,
+    propertyListing: PROPERTY_LISTING_CONTRACT_ID,
+    review: REVIEW_CONTRACT_ID,
+  };
+
+  const results: ContractVerificationResult[] = [];
+
+  for (const [key, entry] of Object.entries(CONTRACT_REGISTRY)) {
+    const configuredId = configured[key] ?? '';
+    const manifestId = entry.contractId ?? '';
+
+    if (!manifestId) {
+      results.push({
+        contract: key,
+        ok: true,
+        configuredId,
+        manifestId,
+        mismatch: 'No manifest entry recorded; verification skipped.',
+      });
+      continue;
+    }
+
+    if (manifestId !== configuredId) {
+      results.push({
+        contract: key,
+        ok: false,
+        configuredId,
+        manifestId,
+        mismatch: `Configured contract ID for '${key}' does not match the deployment manifest.`,
+      });
+      continue;
+    }
+
+    results.push({ contract: key, ok: true, configuredId, manifestId });
+  }
+
+  return results;
+}
+
+/**
+ * Startup guard: run registry validation plus manifest verification and
+ * throw if any hard error is found.  Call before the server accepts traffic.
+ */
+export function assertContractRegistryValid(
+  strict = env.NODE_ENV === 'production',
+): void {
+  const errors = validateContractRegistry(strict);
+  const mismatches = verifyDeployedContracts().filter((r) => !r.ok);
+
+  for (const m of mismatches) {
+    errors.push({
+      contract: m.contract,
+      field: 'contractId',
+      message: m.mismatch ?? 'Contract ID mismatch between manifest and configuration.',
+    });
+  }
+
+  if (errors.length > 0) {
+    const summary = errors
+      .map((e) => `  - [${e.contract}.${e.field}] ${e.message}`)
+      .join('\n');
+    throw new Error(`[contract-registry] Startup validation failed:\n${summary}`);
+  }
 }
 
 // ─── Accessor helpers ─────────────────────────────────────────────────────────
@@ -238,6 +408,11 @@ export interface PublicContractInfo {
   network: string;
   deployedAt: string | null;
   compatibleApps: string;
+  sourceCommit: string;
+  toolchain: string;
+  buildTarget: string;
+  initTxHash: string | null;
+  environment: string;
 }
 
 export function getPublicContractInfo(): PublicContractInfo[] {
@@ -249,5 +424,10 @@ export function getPublicContractInfo(): PublicContractInfo[] {
     network: e.network,
     deployedAt: e.deployedAt,
     compatibleApps: e.compatibleApps,
+    sourceCommit: e.sourceCommit,
+    toolchain: e.toolchain,
+    buildTarget: e.buildTarget,
+    initTxHash: e.initTxHash,
+    environment: e.environment,
   }));
 }

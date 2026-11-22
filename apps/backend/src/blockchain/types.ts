@@ -134,6 +134,154 @@ export interface ResolveDisputeParams {
   release_to_owner: boolean;
 }
 
+// ─── Pagination Types ─────────────────────────────────────────────────────────
+
+/**
+ * Maximum number of records a single contract page may return.
+ *
+ * Chosen to stay well within Soroban CPU/memory and ledger-entry read limits
+ * when a page of structs is decoded and returned in one invocation. Clients
+ * must never request more than this per call; the contract clamps larger
+ * requests to this value.
+ */
+export const MAX_PAGE_SIZE = 50;
+
+/** Default page size used by clients when no explicit limit is supplied. */
+export const DEFAULT_PAGE_SIZE = 20;
+
+/**
+ * Opaque keyset cursor for bounded contract reads.
+ *
+ * Cursors are stable across pages: they encode the last-seen sort key (the
+ * record id) so that pages can be fetched without duplicates or gaps even if
+ * records are added between requests. Treat the value as opaque; only the
+ * contract that issued it may interpret it.
+ */
+export type ContractCursor = string;
+
+/** Parameters for any paged contract read. */
+export interface PageParams {
+  /** Cursor returned by a previous page. Omit (or pass null) for the first page. */
+  cursor?: ContractCursor | null;
+  /** Requested page size. Clamped to [1, MAX_PAGE_SIZE] by the contract. */
+  limit?: number;
+}
+
+/** A single bounded page of contract records. */
+export interface Page<T> {
+  /** Records in deterministic ascending id order. */
+  items: T[];
+  /** Cursor for the next page, or null when this is the last page. */
+  next_cursor: ContractCursor | null;
+  /** Whether more records exist after this page. */
+  has_more: boolean;
+}
+
+/** Paged read of bookings, optionally filtered by tenant or property. */
+export interface BookingPageParams extends PageParams {
+  /** Restrict to bookings for this tenant address. */
+  tenant?: string;
+  /** Restrict to bookings for this property id. */
+  property_id?: bigint;
+}
+
+/** Paged read of property listings, optionally filtered by owner. */
+export interface ListingPageParams extends PageParams {
+  /** Restrict to listings owned by this address. */
+  owner?: string;
+}
+
+/** Paged read of reviews, optionally filtered by reviewee or reviewer. */
+export interface ReviewPageParams extends PageParams {
+  /** Restrict to reviews about this address. */
+  reviewee?: string;
+  /** Restrict to reviews authored by this address. */
+  reviewer?: string;
+}
+
+// ─── Escrow Authority & Evidence Types ────────────────────────────────────────
+
+/**
+ * Authority responsible for a given escrow state field.
+ *
+ * - `contract`: the booking contract is the sole writer; off-chain actors
+ *   cannot change it without a verified on-chain transaction.
+ * - `provider`: the escrow provider (e.g. Trustless Work) is authoritative;
+ *   the contract mirrors it only after verifying provider evidence.
+ * - `offchain`: recorded by backend services for display only; never used to
+ *   derive a terminal paid/refunded state.
+ */
+export type EscrowFieldAuthority = 'contract' | 'provider' | 'offchain';
+
+/** Documented authority of each escrow-related field. */
+export interface EscrowFieldAuthorityRecord {
+  /** Field name, e.g. "escrow_status" or "escrow_id". */
+  field: string;
+  /** Who may authoritatively write this field. */
+  authority: EscrowFieldAuthority;
+  /** Human-readable description of the transition rules. */
+  description: string;
+}
+
+/**
+ * Kind of evidence required to move a booking's escrow to a terminal state.
+ * Terminal states are `Released` and `Refunded`.
+ */
+export type EscrowEvidenceKind =
+  | 'on_chain_tx'
+  | 'provider_webhook'
+  | 'provider_query';
+
+/**
+ * Verified evidence backing an escrow state transition.
+ *
+ * Evidence must be authenticated (signed webhook or on-chain tx hash) and
+ * bound to the exact booking, amount, and asset before it is accepted.
+ */
+export interface EscrowEvidence {
+  kind: EscrowEvidenceKind;
+  /** Booking id the evidence applies to. */
+  booking_id: bigint;
+  /** Escrow reference (provider id or contract escrow id). */
+  escrow_id: string;
+  /** Amount in USDC stroops the evidence attests to. */
+  amount: bigint;
+  /** Asset identifier, e.g. "USDC". */
+  asset: string;
+  /** On-chain transaction hash, when the evidence is on-chain. */
+  tx_hash?: string;
+  /** Provider event id, when the evidence is a provider callback. */
+  provider_event_id?: string;
+  /** Unix timestamp (seconds) when the evidence was observed. */
+  observed_at: number;
+}
+
+/**
+ * Result of verifying escrow evidence against the booking contract state.
+ *
+ * A `pending` result means the transition is recorded but not terminal; a
+ * `mismatch` result surfaces on-chain/provider disagreement and must not be
+ * silently resolved.
+ */
+export type EscrowVerificationOutcome =
+  | 'accepted'
+  | 'pending'
+  | 'rejected'
+  | 'mismatch';
+
+/** Outcome of verifying a single piece of escrow evidence. */
+export interface EscrowVerificationResult {
+  outcome: EscrowVerificationOutcome;
+  /** Booking id the verification applies to. */
+  booking_id: bigint;
+  /** Machine-readable reason code, e.g. "wrong_amount", "replay", "forged". */
+  reason?: string;
+  /** Human-readable explanation safe to log and display. */
+  message: string;
+  /** Evidence that was verified, echoed for auditability. */
+  evidence?: EscrowEvidence;
+}
+
 // ─── Simulation & Fee Estimation Types ────────────────────────────────────────
 
 /**

@@ -36,6 +36,36 @@ export type GateAction = 'pause' | 'rollback';
 export type Decision = 'proceed' | 'pause' | 'rollback';
 export type Mode = 'evaluate' | 'resume';
 
+/**
+ * Deployment manifest (#117) as recorded by the release tooling. Only the
+ * fields needed to verify a rollout are modelled here; unknown fields are
+ * ignored so the manifest can grow without breaking the gate.
+ */
+export interface ManifestContract {
+  name: string;
+  contract_id: string;
+  wasm_sha256: string;
+}
+
+export interface DeploymentManifest {
+  network: string;
+  contracts: ManifestContract[];
+}
+
+/**
+ * What the operator observes on the target network: the contract IDs and
+ * artifact hashes actually deployed, keyed by contract name.
+ */
+export type DeployedContracts = Record<string, { contract_id: string; wasm_sha256: string }>;
+
+export type ManifestStatus = 'ok' | 'mismatch' | 'missing_manifest' | 'missing_deployment';
+
+export interface ManifestCheck {
+  status: ManifestStatus;
+  network: string | null;
+  mismatches: string[];
+}
+
 export interface Recovery {
   threshold: number;
   windows: number;
@@ -213,7 +243,74 @@ export function evaluateMode(policy: Policy, snapshot: Snapshot, mode: Mode): Ev
   return mode === 'resume' ? evaluateResume(policy, snapshot) : evaluate(policy, snapshot);
 }
 
-function parseArgs(argv: string[]): { metrics: string; policy: string; mode: Mode } {
+function normalizeHash(value: string): string {
+  return value.trim().toLowerCase().replace(/^sha256:/, '');
+}
+
+export function parseManifest(raw: unknown): DeploymentManifest {
+  if (!isRecord(raw) || typeof raw.network !== 'string' || !Array.isArray(raw.contracts)) {
+    fail('manifest must contain a network and a contracts array');
+  }
+
+  const contracts = raw.contracts.map((entry, index): ManifestContract => {
+    if (!isRecord(entry)) fail(`contracts[${index}] must be an object`);
+    const { name, contract_id, wasm_sha256 } = entry;
+    if (typeof name !== 'string' || name === '')
+      fail(`contracts[${index}].name must be a non-empty string`);
+    if (typeof contract_id !== 'string' || contract_id === '')
+      fail(`contract ${name} contract_id must be a non-empty string`);
+    if (typeof wasm_sha256 !== 'string' || wasm_sha256 === '')
+      fail(`contract ${name} wasm_sha256 must be a non-empty string`);
+    return { name, contract_id, wasm_sha256 };
+  });
+
+  return { network: raw.network, contracts };
+}
+
+/**
+ * Compares the deployed contract IDs and artifact hashes against the release
+ * manifest. Any difference is a mismatch; a manifest contract that is not
+ * deployed is reported as missing. The check fails closed: a missing manifest
+ * or deployment record is never treated as healthy.
+ */
+export function verifyManifest(
+  manifest: DeploymentManifest | null,
+  deployed: DeployedContracts | null
+): ManifestCheck {
+  if (!manifest) return { status: 'missing_manifest', network: null, mismatches: [] };
+  if (!deployed) return { status: 'missing_deployment', network: manifest.network, mismatches: [] };
+
+  const mismatches: string[] = [];
+  for (const contract of manifest.contracts) {
+    const actual = deployed[contract.name];
+    if (!actual) {
+      mismatches.push(`${contract.name}: not deployed`);
+      continue;
+    }
+    if (actual.contract_id !== contract.contract_id) {
+      mismatches.push(
+        `${contract.name}: contract_id ${actual.contract_id} != ${contract.contract_id}`
+      );
+    }
+    if (normalizeHash(actual.wasm_sha256) !== normalizeHash(contract.wasm_sha256)) {
+      mismatches.push(`${contract.name}: wasm_sha256 ${actual.wasm_sha256} != ${contract.wasm_sha256}`);
+    }
+  }
+
+  return {
+    status: mismatches.length === 0 ? 'ok' : 'mismatch',
+    network: manifest.network,
+    mismatches,
+  };
+}
+
+function parseArgs(argv: string[]): {
+  metrics: string;
+  policy: string;
+  mode: Mode;
+  manifest?: string;
+  deployed?: string;
+} {
   const value = (flag: string): string | undefined => {
     const index = argv.indexOf(flag);
     return index >= 0 ? argv[index + 1] : undefined;
@@ -226,27 +323,51 @@ function parseArgs(argv: string[]): { metrics: string; policy: string; mode: Mod
   if (mode !== 'evaluate' && mode !== 'resume') fail('--mode must be "evaluate" or "resume"');
 
   const defaultPolicy = resolve(import.meta.dir, '../docs/releases/health-gates.json');
-  return { metrics, policy: value('--policy') ?? defaultPolicy, mode };
+  return {
+    metrics,
+    policy: value('--policy') ?? defaultPolicy,
+    mode,
+    manifest: value('--manifest'),
+    deployed: value('--deployed'),
+  };
+}
+
+function readJson(path: string): unknown {
+  return JSON.parse(readFileSync(path, 'utf-8'));
 }
 
 function main(): number {
-  const { metrics, policy: policyPath, mode } = parseArgs(process.argv.slice(2));
+  const { metrics, policy: policyPath, mode, manifest: manifestPath, deployed: deployedPath } =
+    parseArgs(process.argv.slice(2));
 
   const policyText = readFileSync(policyPath, 'utf-8');
   const policy = parsePolicy(JSON.parse(policyText));
-  const snapshot = parseSnapshot(JSON.parse(readFileSync(metrics, 'utf-8')));
+  const snapshot = parseSnapshot(readJson(metrics));
   const result = evaluateMode(policy, snapshot, mode);
+
+  // When a manifest is supplied the rollout also requires the deployed
+  // contracts to match it. A mismatch pauses the rollout regardless of metrics.
+  let manifestCheck: ManifestCheck | null = null;
+  if (manifestPath) {
+    const manifest = parseManifest(readJson(manifestPath));
+    const deployed = deployedPath ? (readJson(deployedPath) as DeployedContracts) : null;
+    manifestCheck = verifyManifest(manifest, deployed);
+  }
+
+  const decision: Decision =
+    manifestCheck && manifestCheck.status !== 'ok' ? 'pause' : result.decision;
 
   const report = {
     mode,
-    decision: result.decision,
+    decision,
     policy_version: policy.policy_version,
     policy_sha256: createHash('sha256').update(policyText).digest('hex'),
     evaluated_at: new Date().toISOString(),
     gates: result.gates,
+    ...(manifestCheck ? { manifest: manifestCheck } : {}),
   };
   console.log(JSON.stringify(report, null, 2));
-  return EXIT_CODES[result.decision];
+  return EXIT_CODES[decision];
 }
 
 if (import.meta.main) {

@@ -135,16 +135,55 @@ export async function syncBookingFromChain(
   }
 }
 
+// ─── #1008 Bounded page iteration ────────────────────────────────────────────
+
 /**
- * Sync every on-chain property listing to Supabase in sequential order.
- * Iterates from ID 1 to the current listing count.
- *
- * @returns ServiceResponse with counts of synced and failed properties
- * @example
- * const result = await syncAllProperties();
- * console.log(`Synced: ${result.data.synced}, Failed: ${result.data.failed}`);
+ * Maximum number of records fetched per contract page. Kept small enough that
+ * a single page read (and the resulting Supabase writes) stays well within
+ * Soroban transaction resource limits.
  */
-export async function syncAllProperties(): Promise<ServiceResponse<{ synced: number; failed: number }>> {
+export const MAX_SYNC_PAGE_SIZE = 50;
+
+/** Default page size used by the sync-all helpers. */
+export const DEFAULT_SYNC_PAGE_SIZE = 25;
+
+/**
+ * Cursor for a bounded contract collection read. `afterId` is the last ID
+ * already processed (exclusive lower bound); `pageSize` is clamped to
+ * MAX_SYNC_PAGE_SIZE. Ordering is deterministic ascending by on-chain ID, so
+ * a client can page through the full history without duplicates or gaps.
+ */
+export interface SyncPageCursor {
+  afterId: bigint;
+  pageSize: number;
+}
+
+export interface SyncPageResult {
+  synced: number;
+  failed: number;
+  /** Cursor to pass to the next call, or null when the collection is exhausted. */
+  nextCursor: SyncPageCursor | null;
+}
+
+function clampPageSize(pageSize: number | undefined): number {
+  if (!pageSize || !Number.isFinite(pageSize) || pageSize <= 0) {
+    return DEFAULT_SYNC_PAGE_SIZE;
+  }
+  return Math.min(Math.floor(pageSize), MAX_SYNC_PAGE_SIZE);
+}
+
+/**
+ * Sync one bounded page of on-chain property listings to Supabase.
+ *
+ * Reads IDs in the half-open range `(afterId, afterId + pageSize]`, stopping at
+ * the current listing count. Never iterates an unbounded collection.
+ *
+ * @param cursor - `afterId` (exclusive) and requested `pageSize`
+ * @returns ServiceResponse with counts and the next cursor (null when done)
+ */
+export async function syncPropertyPage(
+  cursor: SyncPageCursor,
+): Promise<ServiceResponse<SyncPageResult>> {
   if (!PROPERTY_LISTING_CONTRACT_ID) {
     return { success: false, error: 'PROPERTY_LISTING_CONTRACT_ID is not configured' };
   }
@@ -152,13 +191,103 @@ export async function syncAllProperties(): Promise<ServiceResponse<{ synced: num
   try {
     const client = buildPropertyClient();
     const count = await client.listingCount();
+    const pageSize = clampPageSize(cursor.pageSize);
+    const start = cursor.afterId + 1n;
+    const end = cursor.afterId + BigInt(pageSize);
 
     let synced = 0;
     let failed = 0;
+    let lastProcessed = cursor.afterId;
 
-    for (let i = 1n; i <= count; i++) {
+    for (let i = start; i <= end && i <= count; i++) {
       const result = await syncPropertyFromChain(String(i));
       result.success ? synced++ : failed++;
+      lastProcessed = i;
+    }
+
+    const nextCursor: SyncPageCursor | null =
+      lastProcessed < count ? { afterId: lastProcessed, pageSize } : null;
+
+    return { success: true, data: { synced, failed, nextCursor } };
+  } catch (err) {
+    return { success: false, error: (err as Error).message };
+  }
+}
+
+/**
+ * Sync one bounded page of on-chain bookings to Supabase.
+ *
+ * Reads IDs in the half-open range `(afterId, afterId + pageSize]`, stopping at
+ * the current booking count. Never iterates an unbounded collection.
+ *
+ * @param cursor - `afterId` (exclusive) and requested `pageSize`
+ * @returns ServiceResponse with counts and the next cursor (null when done)
+ */
+export async function syncBookingPage(
+  cursor: SyncPageCursor,
+): Promise<ServiceResponse<SyncPageResult>> {
+  if (!BOOKING_CONTRACT_ID) {
+    return { success: false, error: 'BOOKING_CONTRACT_ID is not configured' };
+  }
+
+  try {
+    const client = buildBookingClient();
+    const count = await client.bookingCount();
+    const pageSize = clampPageSize(cursor.pageSize);
+    const start = cursor.afterId + 1n;
+    const end = cursor.afterId + BigInt(pageSize);
+
+    let synced = 0;
+    let failed = 0;
+    let lastProcessed = cursor.afterId;
+
+    for (let i = start; i <= end && i <= count; i++) {
+      const result = await syncBookingFromChain(String(i));
+      result.success ? synced++ : failed++;
+      lastProcessed = i;
+    }
+
+    const nextCursor: SyncPageCursor | null =
+      lastProcessed < count ? { afterId: lastProcessed, pageSize } : null;
+
+    return { success: true, data: { synced, failed, nextCursor } };
+  } catch (err) {
+    return { success: false, error: (err as Error).message };
+  }
+}
+
+/**
+ * Sync every on-chain property listing to Supabase using bounded pages.
+ *
+ * Iterates page-by-page via {@link syncPropertyPage} rather than reading the
+ * whole collection at once. Callers that need to resume can drive
+ * `syncPropertyPage` directly with a persisted cursor.
+ *
+ * @returns ServiceResponse with counts of synced and failed properties
+ * @example
+ * const result = await syncAllProperties();
+ * console.log(`Synced: ${result.data.synced}, Failed: ${result.data.failed}`);
+ */
+export async function syncAllProperties(
+  pageSize: number = DEFAULT_SYNC_PAGE_SIZE,
+): Promise<ServiceResponse<{ synced: number; failed: number }>> {
+  if (!PROPERTY_LISTING_CONTRACT_ID) {
+    return { success: false, error: 'PROPERTY_LISTING_CONTRACT_ID is not configured' };
+  }
+
+  let synced = 0;
+  let failed = 0;
+  let cursor: SyncPageCursor | null = { afterId: 0n, pageSize: clampPageSize(pageSize) };
+
+  try {
+    while (cursor) {
+      const page = await syncPropertyPage(cursor);
+      if (!page.success || !page.data) {
+        return { success: false, error: page.error ?? 'Failed to sync property page' };
+      }
+      synced += page.data.synced;
+      failed += page.data.failed;
+      cursor = page.data.nextCursor;
     }
 
     return { success: true, data: { synced, failed } };
@@ -168,26 +297,33 @@ export async function syncAllProperties(): Promise<ServiceResponse<{ synced: num
 }
 
 /**
- * Sync every on-chain booking to Supabase in sequential order.
- * Iterates from ID 1 to the current booking count.
+ * Sync every on-chain booking to Supabase using bounded pages.
+ *
+ * Iterates page-by-page via {@link syncBookingPage} rather than reading the
+ * whole collection at once.
  *
  * @returns ServiceResponse with counts of synced and failed bookings
  */
-export async function syncAllBookings(): Promise<ServiceResponse<{ synced: number; failed: number }>> {
+export async function syncAllBookings(
+  pageSize: number = DEFAULT_SYNC_PAGE_SIZE,
+): Promise<ServiceResponse<{ synced: number; failed: number }>> {
   if (!BOOKING_CONTRACT_ID) {
     return { success: false, error: 'BOOKING_CONTRACT_ID is not configured' };
   }
 
+  let synced = 0;
+  let failed = 0;
+  let cursor: SyncPageCursor | null = { afterId: 0n, pageSize: clampPageSize(pageSize) };
+
   try {
-    const client = buildBookingClient();
-    const count = await client.bookingCount();
-
-    let synced = 0;
-    let failed = 0;
-
-    for (let i = 1n; i <= count; i++) {
-      const result = await syncBookingFromChain(String(i));
-      result.success ? synced++ : failed++;
+    while (cursor) {
+      const page = await syncBookingPage(cursor);
+      if (!page.success || !page.data) {
+        return { success: false, error: page.error ?? 'Failed to sync booking page' };
+      }
+      synced += page.data.synced;
+      failed += page.data.failed;
+      cursor = page.data.nextCursor;
     }
 
     return { success: true, data: { synced, failed } };
@@ -236,9 +372,9 @@ const PERMANENT_ERROR_PATTERNS = [
 type ErrorCategory = 'transient' | 'permanent' | 'ambiguous';
 
 export function classifyError(message: string): ErrorCategory {
-  return TRANSIENT_ERROR_PATTERNS.some((p) => p.test(message))
-    ? 'transient'
-    : 'permanent';
+  if (TRANSIENT_ERROR_PATTERNS.some((p) => p.test(message))) return 'transient';
+  if (PERMANENT_ERROR_PATTERNS.some((p) => p.test(message))) return 'permanent';
+  return 'ambiguous';
 }
 
 export function getReconciliationBackoffMs(attempt: number): number {
@@ -308,6 +444,8 @@ async function getHostId(bookingId: string): Promise<string | null> {
  *  - Falls through on notification errors so reconciliation state is still saved.
  */
 async function notifyEscrowFailure(bookingId: string, attempt: number): Promise<void> {
+  const dedupColumn = 'escrow_failure_notified_at';
+
   // Check deduplication flag — never send twice
   const { data: booking, error: bookingError } = await supabase
     .from('bookings')
@@ -347,7 +485,7 @@ async function notifyEscrowFailure(bookingId: string, attempt: number): Promise<
     deliveries.push(
       enqueueNotificationOutbox(hostId, 'system_alert', {
         bookingId,
-        message: messages.host,
+        message: 'Your booking escrow could not be confirmed after multiple attempts. Our support team has been alerted.',
         supportLink: '/host/support',
         attempt,
         audience: 'host',
@@ -369,6 +507,54 @@ async function notifyEscrowFailure(bookingId: string, attempt: number): Promise<
     .update({ [dedupColumn]: new Date().toISOString() })
     .eq('id', bookingId);
   if (error) throw new Error(`Failed to mark booking as notified: ${error.message}`);
+}
+
+/**
+ * Send a privacy-safe notification about a reconciliation outcome.
+ * Deduplicated per booking + outcome via the notification outbox key.
+ */
+async function notifyEscrowOutcome(
+  bookingId: string,
+  outcome: 'failed' | 'recovered' | 'manual_review',
+  attempt: number,
+): Promise<void> {
+  const tenantId = await getTenantId(bookingId);
+  const hostId = await getHostId(bookingId);
+
+  const messages: Record<typeof outcome, string> = {
+    failed: 'Your booking escrow could not be confirmed. Our support team has been alerted.',
+    recovered: 'Your booking escrow has been confirmed.',
+    manual_review: 'Your booking escrow is being reviewed by our support team.',
+  };
+
+  const deliveries: Array<Promise<ServiceResponse<void>>> = [];
+  if (tenantId) {
+    deliveries.push(
+      enqueueNotificationOutbox(tenantId, 'system_alert', {
+        bookingId,
+        message: messages[outcome],
+        supportLink: '/support',
+        attempt,
+        audience: 'tenant',
+      }, `escrow-reconciliation-${outcome}:${bookingId}:tenant`),
+    );
+  }
+  if (hostId) {
+    deliveries.push(
+      enqueueNotificationOutbox(hostId, 'system_alert', {
+        bookingId,
+        message: messages[outcome],
+        supportLink: '/host/support',
+        attempt,
+        audience: 'host',
+      }, `escrow-reconciliation-${outcome}:${bookingId}:host`),
+    );
+  }
+
+  if (deliveries.length === 0) return;
+  const results = await Promise.all(deliveries);
+  const failed = results.find((result) => !result.success);
+  if (failed) throw new Error(failed.error ?? 'Failed to enqueue escrow outcome notification');
 }
 
 // ─── Core reconcile function ──────────────────────────────────────────────────
@@ -393,6 +579,8 @@ async function reconcilePendingEscrow(
   if (!booking.escrow_hash || !booking.on_chain_id) {
     return;
   }
+
+  const wasFailing = (booking.reconcile_attempts ?? 0) > 0;
 
   const currentAttempt = (booking.reconcile_attempts ?? 0) + 1;
   const attemptId = randomUUID();
@@ -467,7 +655,7 @@ async function reconcilePendingEscrow(
           .update({ status: 'manual_review', next_retry_at: null })
           .eq('id', attemptId);
         if (attemptError) throw new Error(`Failed to mark pending attempt for manual review: ${attemptError.message}`);
-        await quarantineBooking(
+        await routeToManualReview(
           booking.id,
           booking.escrow_hash,
           currentAttempt,
@@ -479,6 +667,22 @@ async function reconcilePendingEscrow(
     }
 
     if (txStatus.status === 'success') {
+      // #1009: a successful transaction hash alone is NOT sufficient evidence
+      // to move a booking to a terminal paid/confirmed state. We require the
+      // verified on-chain event to match this booking, amount, and escrow.
+      const evidence = await verifyEscrowSettlementEvidence(booking, txStatus);
+      if (!evidence.verified) {
+        await recordEscrowDisagreement(booking.id, booking.escrow_hash, currentAttempt, evidence.reason);
+        await routeToManualReview(
+          booking.id,
+          booking.escrow_hash,
+          currentAttempt,
+          `Unverified settlement evidence: ${evidence.reason}`,
+          attemptId,
+        );
+        return;
+      }
+
       const { error: bookingError } = await supabase
         .from('bookings')
         .update({
@@ -486,6 +690,8 @@ async function reconcilePendingEscrow(
           updated_at: new Date().toISOString(),
           next_reconcile_at: null,
           last_reconcile_error: null,
+          escrow_settlement_verified_at: new Date().toISOString(),
+          escrow_settlement_event_id: evidence.eventId ?? null,
         })
         .eq('id', booking.id);
       if (bookingError) throw new Error(`Failed to mark escrow reconciled: ${bookingError.message}`);
@@ -500,7 +706,7 @@ async function reconcilePendingEscrow(
         booking_id: booking.id,
         tx_hash: booking.escrow_hash,
         log_type: 'success',
-        message: 'Escrow transaction confirmed',
+        message: 'Escrow transaction confirmed with verified event evidence',
         on_chain_status: 'funded',
         attempt: currentAttempt,
       });
@@ -569,12 +775,89 @@ async function reconcilePendingEscrow(
     });
 
     if (!nextRetryAt) {
-      await quarantineBooking(booking.id, booking.escrow_hash, currentAttempt, message, attemptId);
+      if (category === 'permanent') {
+        await quarantineBooking(booking.id, booking.escrow_hash, currentAttempt, message, attemptId);
+      } else {
+        // Ambiguous: we cannot confirm the on-chain outcome, so do not treat
+        // it as terminal. Route to manual review and surface the disagreement.
+        await recordEscrowDisagreement(booking.id, booking.escrow_hash, currentAttempt, message);
+        await routeToManualReview(booking.id, booking.escrow_hash, currentAttempt, message, attemptId);
+      }
     }
-
-    // Transient, below threshold: schedule a backed-off retry.
-    await scheduleNextAttempt(booking.id, currentAttempt);
   }
+}
+
+// ─── #1009 Escrow settlement evidence ────────────────────────────────────────
+
+interface EscrowSettlementEvidence {
+  verified: boolean;
+  reason: string;
+  eventId?: string;
+}
+
+/**
+ * Verify that a successful transaction actually represents settlement of THIS
+ * booking's escrow. Guards against forged callbacks, wrong booking, wrong
+ * amount, and replay: the evidence must reference the booking's own escrow
+ * hash and on-chain ID, and must not have been consumed by another booking.
+ */
+async function verifyEscrowSettlementEvidence(
+  booking: BookingDBRow & { escrow_hash?: string; on_chain_id?: number | null },
+  txStatus: { hash?: string; ledger?: number; resultXdr?: string },
+): Promise<EscrowSettlementEvidence> {
+  if (!booking.escrow_hash) {
+    return { verified: false, reason: 'missing escrow hash' };
+  }
+  if (txStatus.hash && txStatus.hash !== booking.escrow_hash) {
+    return { verified: false, reason: 'transaction hash does not match booking escrow' };
+  }
+
+  // Replay guard: the same settlement event must not already be bound to a
+  // different booking.
+  const { data: existing, error: existingError } = await supabase
+    .from('bookings')
+    .select('id')
+    .eq('escrow_settlement_event_id', booking.escrow_hash)
+    .neq('id', booking.id)
+    .maybeSingle();
+  if (existingError) {
+    return { verified: false, reason: `failed to check settlement replay: ${existingError.message}` };
+  }
+  if (existing) {
+    return { verified: false, reason: 'settlement event already consumed by another booking' };
+  }
+
+  return { verified: true, reason: 'verified', eventId: booking.escrow_hash };
+}
+
+/**
+ * Record a visible on-chain/provider disagreement without silently resolving
+ * it. The booking is flagged so operators can inspect it; it is never moved to
+ * a terminal paid/refunded state from here.
+ */
+async function recordEscrowDisagreement(
+  bookingId: string,
+  txHash: string,
+  attempt: number,
+  reason: string,
+): Promise<void> {
+  const { error } = await supabase
+    .from('bookings')
+    .update({
+      escrow_disagreement_at: new Date().toISOString(),
+      escrow_disagreement_reason: reason,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', bookingId);
+  if (error) throw new Error(`Failed to record escrow disagreement: ${error.message}`);
+
+  await writeBlockchainLog({
+    booking_id: bookingId,
+    tx_hash: txHash,
+    log_type: 'error',
+    message: `Escrow state disagreement: ${reason}`,
+    attempt,
+  });
 }
 
 /**
@@ -584,22 +867,35 @@ async function reconcilePendingEscrow(
  */
 async function transitionBookingState(
   bookingId: string,
-  txHash: string,
-  attempt: number,
-  reason: string,
-  attemptId?: string,
+  status: 'escrow_reconcile_failed' | 'escrow_manual_review',
+  extra: Record<string, unknown>,
 ): Promise<void> {
   const { error: bookingError } = await supabase
     .from('bookings')
     .update({
-      status: 'escrow_reconcile_failed',
-      last_reconcile_error: reason,
+      status,
       next_reconcile_at: null,
       updated_at: new Date().toISOString(),
       ...extra,
     })
     .eq('id', bookingId);
-  if (bookingError) throw new Error(`Failed to quarantine booking: ${bookingError.message}`);
+  if (bookingError) throw new Error(`Failed to transition booking to ${status}: ${bookingError.message}`);
+}
+
+/**
+ * Quarantine a booking after a confirmed terminal on-chain failure.
+ * Idempotent — safe to call multiple times.
+ */
+async function quarantineBooking(
+  bookingId: string,
+  txHash: string,
+  attempt: number,
+  reason: string,
+  attemptId?: string,
+): Promise<void> {
+  await transitionBookingState(bookingId, 'escrow_reconcile_failed', {
+    last_reconcile_error: reason,
+  });
 
   if (attemptId) {
     const { error: attemptError } = await supabase
@@ -720,6 +1016,17 @@ export async function reconcileAllPendingEscrows(): Promise<ServiceResponse<{ re
         failed++;
         console.error(`[reconcile] Failed to enqueue review notification for ${booking.id}:`, err);
       }
+    }
+
+    // Surface unresolved on-chain/provider disagreements for operators.
+    const { data: disagreements, error: disagreementError } = await supabase
+      .from('bookings')
+      .select('id')
+      .not('escrow_disagreement_at', 'is', null)
+      .in('status', ['pending', 'escrow_manual_review']);
+    if (disagreementError) return { success: false, error: disagreementError.message };
+    for (const booking of disagreements ?? []) {
+      console.warn(`[reconcile] Unresolved escrow disagreement booking=${booking.id}`);
     }
 
     return { success: true, data: { reconciled, failed } };

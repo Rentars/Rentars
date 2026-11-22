@@ -49,6 +49,7 @@ import routes from './routes/index.js';
 import { setupOpenApiRoutes } from './config/swagger.js';
 import { validateBlockchainConfig } from './blockchain/config.js';
 import { validateContractRegistry } from './blockchain/contractRegistry.js';
+import { verifyDeploymentManifest } from './blockchain/deploymentManifest.js';
 import { startSyncScheduler } from './services/cleanup-schedular.js';
 import { startRateRefreshLoop } from './services/exchangeRate.service.js';
 import { startProbeScheduler, stopProbeScheduler } from './services/probe-scheduler.js';
@@ -81,6 +82,49 @@ if (registryErrors.length > 0) {
     details: errorDetails,
   });
   process.exit(1);
+}
+
+// ── Verify configured contract IDs against the deployment manifest ───────────
+// The manifest is optional: when it is absent (e.g. local dev) verification is
+// skipped.  When present, mismatches are fatal in production and warnings
+// elsewhere.  Only non-secret identifiers are ever logged.
+const manifestVerification = verifyDeploymentManifest();
+if (manifestVerification.status === 'mismatch') {
+  const errorDetails = manifestVerification.mismatches
+    .map((m) => `  - ${m.contract}.${m.field}: configured=${m.configured} manifest=${m.manifest}`)
+    .join('\n');
+  const isProduction = env.NODE_ENV === 'production';
+  structuredLog({
+    level: isProduction ? 'error' : 'warn',
+    message: isProduction
+      ? 'Deployment manifest verification failed — configured contract IDs do not match the signed deployment manifest'
+      : 'Deployment manifest verification mismatch (non-production, continuing)',
+    timestamp: new Date().toISOString(),
+    manifestPath: manifestVerification.manifestPath,
+    network: manifestVerification.network,
+    commit: manifestVerification.commit,
+    details: errorDetails,
+  });
+  if (isProduction) {
+    process.exit(1);
+  }
+} else if (manifestVerification.status === 'verified') {
+  structuredLog({
+    level: 'info',
+    message: 'Deployment manifest verified — configured contract IDs match the manifest',
+    timestamp: new Date().toISOString(),
+    manifestPath: manifestVerification.manifestPath,
+    network: manifestVerification.network,
+    commit: manifestVerification.commit,
+  });
+} else if (manifestVerification.status === 'error') {
+  structuredLog({
+    level: 'warn',
+    message: 'Deployment manifest could not be verified',
+    timestamp: new Date().toISOString(),
+    manifestPath: manifestVerification.manifestPath,
+    reason: manifestVerification.reason,
+  });
 }
 
 export const app = express();

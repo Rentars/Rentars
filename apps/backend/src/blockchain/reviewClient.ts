@@ -22,6 +22,26 @@ import type { Review, SubmitReviewParams } from './types.js';
 const ABI_VERSION = '0.1.0';
 const CONTRACT_NAME = 'review-contract';
 
+// ─── Pagination limits ───────────────────────────────────────────────────────
+
+/**
+ * Maximum number of review IDs the contract will return in a single page.
+ * Chosen to stay well within Soroban CPU/memory limits for a single
+ * simulation; the contract enforces the same cap.
+ */
+export const MAX_REVIEW_PAGE_SIZE = 50;
+
+/** A single bounded page of review IDs plus the cursor for the next page. */
+export interface ReviewIdPage {
+  /** Review IDs in deterministic (ascending) order. */
+  ids: bigint[];
+  /**
+   * Cursor to pass as `start` for the next page, or `null` when the
+   * collection has been fully traversed.
+   */
+  nextCursor: bigint | null;
+}
+
 // ─── Client ──────────────────────────────────────────────────────────────────
 
 export class ReviewClient {
@@ -54,16 +74,84 @@ export class ReviewClient {
   }
 
   /**
-   * Return all review IDs submitted for a given reviewee.
+   * Return a bounded page of review IDs submitted for a given reviewee.
    *
-   * ABI: get_reviews_for_user(reviewee: Address) -> Vec<u64>
+   * ABI: get_reviews_for_user_paged(reviewee: Address, start: u64, limit: u32)
+   *        -> Vec<u64>
+   *
+   * `start` is an exclusive keyset cursor: the first returned ID is strictly
+   * greater than `start`. Pass `0n` to begin from the start of the collection.
+   * `limit` is clamped to [1, MAX_REVIEW_PAGE_SIZE].
+   *
+   * `nextCursor` is `null` when fewer than `limit` IDs were returned, meaning
+   * the collection has been fully traversed.
    */
-  async getReviewsForUser(reviewee: string): Promise<bigint[]> {
-    const result = await this.simulateReadOnly('get_reviews_for_user', [
+  async getReviewsForUserPage(
+    reviewee: string,
+    start: bigint = 0n,
+    limit: number = MAX_REVIEW_PAGE_SIZE,
+  ): Promise<ReviewIdPage> {
+    if (start < 0n) {
+      throw new RangeError(`Cursor must be non-negative, got ${start}`);
+    }
+    const pageSize = Math.min(
+      Math.max(Math.trunc(limit), 1),
+      MAX_REVIEW_PAGE_SIZE,
+    );
+
+    const result = await this.simulateReadOnly('get_reviews_for_user_paged', [
       nativeToScVal(reviewee, { type: 'address' }),
+      nativeToScVal(start, { type: 'u64' }),
+      nativeToScVal(pageSize, { type: 'u32' }),
     ]);
     const native = scValToNative(result) as (number | string)[];
-    return native.map((v) => BigInt(v));
+    const ids = native.map((v) => BigInt(v));
+
+    const nextCursor =
+      ids.length < pageSize ? null : ids[ids.length - 1] ?? null;
+
+    return { ids, nextCursor };
+  }
+
+  /**
+   * Iterate over every review ID for a reviewee using bounded pages.
+   *
+   * Yields IDs in deterministic ascending order with no duplicates or gaps.
+   * Each page is fetched lazily, so callers can stop early without paying for
+   * the remainder of the collection.
+   */
+  async *iterateReviewsForUser(
+    reviewee: string,
+    pageSize: number = MAX_REVIEW_PAGE_SIZE,
+  ): AsyncGenerator<bigint, void, undefined> {
+    let cursor = 0n;
+    for (;;) {
+      const page = await this.getReviewsForUserPage(reviewee, cursor, pageSize);
+      for (const id of page.ids) {
+        yield id;
+      }
+      if (page.nextCursor === null) {
+        return;
+      }
+      cursor = page.nextCursor;
+    }
+  }
+
+  /**
+   * Collect the complete review history for a reviewee by paging internally.
+   *
+   * Prefer {@link iterateReviewsForUser} for large histories; this helper is
+   * provided for callers that need the full list in memory.
+   */
+  async getAllReviewsForUser(
+    reviewee: string,
+    pageSize: number = MAX_REVIEW_PAGE_SIZE,
+  ): Promise<bigint[]> {
+    const all: bigint[] = [];
+    for await (const id of this.iterateReviewsForUser(reviewee, pageSize)) {
+      all.push(id);
+    }
+    return all;
   }
 
   /**

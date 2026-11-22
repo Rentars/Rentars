@@ -1324,6 +1324,177 @@ mod tests {
         assert_eq!(bookings.len(), 0);
     }
 
+    // ─── Pagination Tests ─────────────────────────────────────────────────────
+
+    /// Maximum page size the contract will ever return for a bounded read.
+    const MAX_PAGE_SIZE: u32 = 20;
+
+    /// Create `count` bookings for a single property, returning their IDs in
+    /// creation order. Each booking uses a distinct, non-overlapping date range
+    /// so the property stays bookable across the whole run.
+    fn seed_property_bookings(
+        env: &Env,
+        booking_cid: &Address,
+        listing_cid: &Address,
+        count: u32,
+    ) -> (u64, soroban_sdk::Vec<u64>) {
+        let client = BookingContractClient::new(env, booking_cid);
+        let owner = Address::generate(env);
+        let tenant = Address::generate(env);
+        let property_id = create_property(env, listing_cid, &owner);
+
+        let mut ids = soroban_sdk::Vec::new(env);
+        for i in 0..count {
+            let start = 1_000_u64 + (i as u64) * 10;
+            let id = client.create_booking(
+                &tenant,
+                &property_id,
+                &start,
+                &(start + 5),
+                &100_i128,
+            );
+            ids.push_back(id);
+        }
+        (property_id, ids)
+    }
+
+    #[test]
+    fn test_get_property_bookings_page_returns_bounded_slice() {
+        let (env, booking_cid, listing_cid, _admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+
+        // Seed more bookings than a single page can hold.
+        let (property_id, ids) =
+            seed_property_bookings(&env, &booking_cid, &listing_cid, MAX_PAGE_SIZE + 5);
+        assert_eq!(ids.len(), MAX_PAGE_SIZE + 5);
+
+        // First page is capped at MAX_PAGE_SIZE and is a prefix of creation order.
+        let page = client.get_property_bookings_page(&property_id, &0_u32, &MAX_PAGE_SIZE);
+        assert_eq!(page.len(), MAX_PAGE_SIZE);
+        for i in 0..MAX_PAGE_SIZE {
+            assert_eq!(page.get(i).unwrap(), ids.get(i).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_get_property_bookings_page_clamps_oversized_request() {
+        let (env, booking_cid, listing_cid, _admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+
+        let (property_id, _ids) =
+            seed_property_bookings(&env, &booking_cid, &listing_cid, MAX_PAGE_SIZE + 3);
+
+        // Asking for far more than the max page size must not return the whole
+        // unbounded vector — the contract clamps to MAX_PAGE_SIZE.
+        let page =
+            client.get_property_bookings_page(&property_id, &0_u32, &u32::MAX);
+        assert_eq!(page.len(), MAX_PAGE_SIZE);
+    }
+
+    #[test]
+    fn test_get_property_bookings_page_cursor_walks_full_history() {
+        let (env, booking_cid, listing_cid, _admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+
+        let total = MAX_PAGE_SIZE + 7;
+        let (property_id, ids) =
+            seed_property_bookings(&env, &booking_cid, &listing_cid, total);
+
+        // Walk the full history using keyset pagination (cursor = last seen id).
+        let mut collected = soroban_sdk::Vec::new(&env);
+        let mut cursor: u64 = 0;
+        loop {
+            let page = client.get_property_bookings_page(&property_id, &cursor, &MAX_PAGE_SIZE);
+            if page.len() == 0 {
+                break;
+            }
+            for i in 0..page.len() {
+                collected.push_back(page.get(i).unwrap());
+            }
+            cursor = page.get(page.len() - 1).unwrap();
+        }
+
+        // No duplicates, no gaps, deterministic order.
+        assert_eq!(collected.len(), total);
+        for i in 0..total {
+            assert_eq!(collected.get(i).unwrap(), ids.get(i).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_get_property_bookings_page_cursor_is_stable_across_calls() {
+        let (env, booking_cid, listing_cid, _admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+
+        let (property_id, _ids) =
+            seed_property_bookings(&env, &booking_cid, &listing_cid, MAX_PAGE_SIZE + 2);
+
+        let first = client.get_property_bookings_page(&property_id, &0_u32, &5_u32);
+        let second = client.get_property_bookings_page(&property_id, &0_u32, &5_u32);
+        assert_eq!(first.len(), second.len());
+        for i in 0..first.len() {
+            assert_eq!(first.get(i).unwrap(), second.get(i).unwrap());
+        }
+
+        // Resuming from the last id of the first page yields the next slice.
+        let cursor = first.get(first.len() - 1).unwrap();
+        let next = client.get_property_bookings_page(&property_id, &cursor, &5_u32);
+        assert_eq!(next.len(), 5);
+        assert!(next.get(0).unwrap() > cursor);
+    }
+
+    #[test]
+    fn test_get_property_bookings_page_empty_and_past_end() {
+        let (env, booking_cid, listing_cid, _admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+
+        // Unknown property → empty page.
+        let empty = client.get_property_bookings_page(&999_u64, &0_u32, &MAX_PAGE_SIZE);
+        assert_eq!(empty.len(), 0);
+
+        // Cursor past the end → empty page.
+        let (property_id, ids) =
+            seed_property_bookings(&env, &booking_cid, &listing_cid, 3);
+        let last = ids.get(ids.len() - 1).unwrap();
+        let past = client.get_property_bookings_page(&property_id, &last, &MAX_PAGE_SIZE);
+        assert_eq!(past.len(), 0);
+    }
+
+    #[test]
+    fn test_get_property_bookings_page_zero_limit_is_empty() {
+        let (env, booking_cid, listing_cid, _admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+
+        let (property_id, _ids) =
+            seed_property_bookings(&env, &booking_cid, &listing_cid, 3);
+        let page = client.get_property_bookings_page(&property_id, &0_u32, &0_u32);
+        assert_eq!(page.len(), 0);
+    }
+
+    #[test]
+    fn test_get_property_bookings_page_within_resource_limits() {
+        let (env, booking_cid, listing_cid, _admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+
+        // Seed a collection larger than one page.
+        let (property_id, _ids) =
+            seed_property_bookings(&env, &booking_cid, &listing_cid, MAX_PAGE_SIZE + 10);
+
+        // Measure resource consumption of a single bounded page read.
+        env.budget().reset_unlimited();
+        let page = client.get_property_bookings_page(&property_id, &0_u32, &MAX_PAGE_SIZE);
+        assert_eq!(page.len(), MAX_PAGE_SIZE);
+
+        let cpu = env.budget().cpu_instruction_cost();
+        let mem = env.budget().memory_bytes_cost();
+
+        // A bounded page read must stay well under Soroban's per-tx limits.
+        // These ceilings are intentionally generous but far below the cost of
+        // iterating the entire unbounded vector.
+        assert!(cpu < 100_000_000, "cpu cost too high: {}", cpu);
+        assert!(mem < 10_000_000, "memory cost too high: {}", mem);
+    }
+
     #[test]
     #[should_panic(expected = "Booking not found")]
     fn test_booking_not_found() {
