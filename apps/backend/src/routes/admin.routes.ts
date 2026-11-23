@@ -38,6 +38,8 @@ import {
   changeUserRoleHandler,
   // Property management
   listAdminProperties,
+  listPropertyModerationQueue,
+  bulkModerateProperties,
   suspendProperty,
   activateProperty,
   // Bookings
@@ -45,6 +47,8 @@ import {
   getEscrowReconciliationHandler,
   // Disputes
   listDisputes,
+  getDisputeEvidence,
+  getDisputeTimeline,
   resolveDispute,
   // Dashboard
   getDashboard,
@@ -84,6 +88,21 @@ router.patch('/users/:id/role', requireScope('admin:users:role'), changeUserRole
 // Scope: admin:properties:activate → admin, moderator
 // Scope: admin:properties:feature  → admin, moderator
 router.get('/properties', requireScope('admin:properties:read'), listAdminProperties);
+// GET /api/v1/admin/properties/moderation-queue — filtered moderation queue (#979)
+// Must be registered before /properties/:id-style routes to avoid capture.
+router.get(
+  '/properties/moderation-queue',
+  requireScope('admin:properties:read'),
+  listPropertyModerationQueue,
+);
+// POST /api/v1/admin/properties/bulk-moderate — version-guarded bulk status changes (#979)
+// Requires explicit selection, per-item expected versions, a reason, and per-item results.
+// Scope: admin:properties:suspend (HIGH-RISK — dual approval required)
+router.post(
+  '/properties/bulk-moderate',
+  requireScope('admin:properties:suspend'),
+  bulkModerateProperties,
+);
 router.post('/properties/:id/suspend', requireScope('admin:properties:suspend'), suspendProperty);
 router.post('/properties/:id/activate', requireScope('admin:properties:activate'), activateProperty);
 router.put('/properties/:id/featured', requireScope('admin:properties:feature'), setFeaturedHandler);
@@ -108,6 +127,11 @@ router.get(
 // Scope: admin:disputes:read    → admin, moderator, support, finance
 // Scope: admin:disputes:resolve → admin, moderator (HIGH-RISK — dual approval required)
 router.get('/disputes', requireScope('admin:disputes:read'), listDisputes);
+// Evidence access is restricted to authorized administrators (#980).
+router.get('/disputes/:id/evidence', requireScope('admin:disputes:read'), getDisputeEvidence);
+// Auditable decision/status timeline for a dispute (#980).
+router.get('/disputes/:id/timeline', requireScope('admin:disputes:read'), getDisputeTimeline);
+// Resolution uses the explicit decision payload (evidence, reviewer, decision, payment consequence).
 router.post('/disputes/:id/resolve', requireScope('admin:disputes:resolve'), resolveDispute);
 
 // ── Rate-limit summary ────────────────────────────────────────────────────────

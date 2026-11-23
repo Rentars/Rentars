@@ -44,6 +44,8 @@ export interface Property {
   id: string;
   owner_id?: string;
   title: string;
+  /** Optimistic-concurrency token for moderation writes (see moderateProperty). */
+  version?: number;
   description?: string;
   price_per_night?: number;
   status?: string;
@@ -89,6 +91,8 @@ export interface Property {
   // Moderation visibility (migration 00065) — independent of deleted_at
   moderation_state?: 'visible' | 'hidden';
   moderation_updated_at?: string | null;
+  moderation_reason?: string | null;
+  moderation_updated_by?: string | null;
   // Stay rules that bookings are priced and validated against
   min_nights?: number;
   max_nights?: number | null;
@@ -1720,6 +1724,251 @@ export function getDraftCompletionStatus(property: Property): {
     .map(([key]) => key);
 
   return { percentage, missingFields };
+}
+
+// ─── Moderation ───────────────────────────────────────────────────────────────
+
+/** Moderation actions accepted by the admin review endpoints. */
+export type ModerationAction = 'approve' | 'reject' | 'hide' | 'restore';
+
+/** Moderation states a listing can be in for admin review. */
+export type ModerationState = 'visible' | 'hidden';
+
+/** Filters accepted by the admin moderation queue. */
+export interface ModerationQueueFilters {
+  /** Listing status (e.g. 'available', 'draft'). */
+  status?: string;
+  /** Moderation visibility. */
+  moderation_state?: ModerationState;
+  /** Free-text match on title, city or country. */
+  search?: string;
+  page?: number;
+  pageSize?: number;
+}
+
+/** One item in a bulk moderation request. */
+export interface BulkModerationItem {
+  id: string;
+  /** The `version` (or `updated_at`) the admin reviewed. Required. */
+  expectedVersion: number | string;
+  action: ModerationAction;
+  /** Human-readable justification, recorded in the audit trail. Required. */
+  reason: string;
+}
+
+/** Per-item outcome of a bulk moderation request. */
+export interface BulkModerationResult {
+  id: string;
+  success: boolean;
+  action: ModerationAction;
+  /** Populated on success with the new moderation state. */
+  moderation_state?: ModerationState;
+  /** Populated on success with the new version token. */
+  version?: number;
+  /** Machine-readable failure code (e.g. STALE_VERSION, NOT_FOUND). */
+  code?: string;
+  /** Human-readable failure message. */
+  error?: string;
+}
+
+/** Maximum number of items accepted in a single bulk moderation request. */
+export const BULK_MODERATION_MAX_ITEMS = 100;
+
+/** Map a moderation action to the resulting visibility state. */
+function moderationStateForAction(action: ModerationAction): ModerationState {
+  return action === 'hide' || action === 'reject' ? 'hidden' : 'visible';
+}
+
+/**
+ * Admin moderation queue with filters and pagination.
+ *
+ * Unlike the public listing paths this deliberately includes hidden and
+ * soft-deleted listings so moderators can review and restore them.
+ */
+export async function getModerationQueue(
+  filters: ModerationQueueFilters = {},
+): Promise<ServiceResponse<PaginatedResult<Property>>> {
+  const page = Math.max(filters.page ?? 1, 1);
+  const pageSize = Math.min(filters.pageSize ?? 20, 100);
+
+  let query = supabase.from('properties').select('*', { count: 'exact' });
+
+  if (filters.status) {
+    query = query.eq('status', filters.status);
+  }
+  if (filters.moderation_state) {
+    query = query.eq('moderation_state', filters.moderation_state);
+  }
+  if (filters.search) {
+    // Escape PostgREST `or` metacharacters so user input cannot alter the filter.
+    const term = filters.search.replace(/[,()%]/g, ' ').trim();
+    if (term) {
+      query = query.or(
+        `title.ilike.%${term}%,city.ilike.%${term}%,country.ilike.%${term}%`,
+      );
+    }
+  }
+
+  query = query.order('updated_at', { ascending: false });
+
+  const response = await executePaginatedQuery(query, page, pageSize);
+  if (response.error) return { success: false, error: response.error };
+  return { success: true, data: response.result };
+}
+
+/**
+ * Apply a single moderation status change guarded by an optimistic-concurrency
+ * check on the listing's `version` (falling back to `updated_at`).
+ *
+ * The write is a compare-and-set: it only applies when the stored row still
+ * carries the version the admin reviewed. A stale version is reported as a
+ * conflict and nothing is changed.
+ *
+ * @param id              - UUID of the property.
+ * @param action          - Moderation action to apply.
+ * @param reason          - Required justification, stored on the row.
+ * @param expectedVersion - The version (number) or updated_at (string) reviewed.
+ * @param actorId         - UUID of the acting administrator.
+ */
+export async function moderateProperty(
+  id: string,
+  action: ModerationAction,
+  reason: string,
+  expectedVersion: number | string,
+  actorId: string,
+): Promise<ServiceResponse<Property>> {
+  if (!id) return { success: false, error: 'Property ID is required', statusCode: 400 };
+  if (!reason || reason.trim().length === 0) {
+    return { success: false, error: 'A reason is required for moderation changes', statusCode: 400 };
+  }
+  if (expectedVersion === undefined || expectedVersion === null || expectedVersion === '') {
+    return { success: false, error: 'expectedVersion is required', statusCode: 400 };
+  }
+  if (!actorId) {
+    return { success: false, error: 'Actor ID is required', statusCode: 400 };
+  }
+
+  const nextState = moderationStateForAction(action);
+  const now = new Date().toISOString();
+
+  let writeQuery = supabase
+    .from('properties')
+    .update({
+      moderation_state: nextState,
+      moderation_updated_at: now,
+      moderation_reason: reason.trim(),
+      moderation_updated_by: actorId,
+    })
+    .eq('id', id);
+
+  if (typeof expectedVersion === 'number') {
+    writeQuery = writeQuery.eq('version', expectedVersion);
+  } else {
+    writeQuery = writeQuery.eq('updated_at', expectedVersion);
+  }
+
+  const { data, error } = await writeQuery.select().maybeSingle();
+
+  if (error) {
+    return { success: false, error: error.message, statusCode: 500 };
+  }
+
+  if (!data) {
+    // Nothing matched: either the listing is gone or the version is stale.
+    const { data: current } = await supabase
+      .from('properties')
+      .select('id')
+      .eq('id', id)
+      .maybeSingle();
+    if (!current) {
+      return { success: false, error: 'Property not found', statusCode: 404, code: 'NOT_FOUND' };
+    }
+    return {
+      success: false,
+      error: 'Listing was changed since it was reviewed',
+      statusCode: 409,
+      conflict: true,
+      code: 'STALE_VERSION',
+    };
+  }
+
+  const updated = data as Property;
+
+  // Audit the applied change.
+  await recordPropertyVersion(
+    id,
+    { moderation_state: updated.moderation_state },
+    { moderation_state: nextState },
+    actorId,
+    `moderation_${action}`,
+    reason.trim(),
+  ).catch((err) => console.warn('[moderateProperty] audit failed:', err));
+
+  // Hidden listings must disappear from public search immediately.
+  await invalidatePropertyCaches(id);
+
+  return { success: true, data: updated };
+}
+
+/**
+ * Apply moderation actions to an explicitly selected set of listings.
+ *
+ * Each item is processed independently with its own version guard, so a stale
+ * or unauthorized item is reported in the result list and never silently
+ * changed. The response is always a per-item outcome array.
+ *
+ * @param items   - Selected listings with their reviewed versions.
+ * @param actorId - UUID of the acting administrator.
+ */
+export async function bulkModerateProperties(
+  items: BulkModerationItem[],
+  actorId: string,
+): Promise<ServiceResponse<BulkModerationResult[]>> {
+  if (!Array.isArray(items) || items.length === 0) {
+    return { success: false, error: 'No listings selected', statusCode: 400 };
+  }
+  if (items.length > BULK_MODERATION_MAX_ITEMS) {
+    return {
+      success: false,
+      error: `At most ${BULK_MODERATION_MAX_ITEMS} listings may be moderated at once`,
+      statusCode: 400,
+    };
+  }
+  if (!actorId) {
+    return { success: false, error: 'Actor ID is required', statusCode: 400 };
+  }
+
+  const results: BulkModerationResult[] = [];
+
+  for (const item of items) {
+    const result = await moderateProperty(
+      item.id,
+      item.action,
+      item.reason,
+      item.expectedVersion,
+      actorId,
+    );
+
+    if (result.success && result.data) {
+      results.push({
+        id: item.id,
+        success: true,
+        action: item.action,
+        moderation_state: result.data.moderation_state,
+        version: result.data.version,
+      });
+    } else {
+      results.push({
+        id: item.id,
+        success: false,
+        action: item.action,
+        code: result.code ?? (result.statusCode === 404 ? 'NOT_FOUND' : 'FAILED'),
+        error: result.error,
+      });
+    }
+  }
+
+  return { success: true, data: results };
 }
 
 // ─── Version history ──────────────────────────────────────────────────────────

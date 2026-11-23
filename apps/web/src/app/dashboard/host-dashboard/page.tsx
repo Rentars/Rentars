@@ -25,6 +25,7 @@ import ComparativeGrowth from './components/ComparativeGrowth';
 import OccupancyInsights from './components/OccupancyInsights';
 import OccupancyHeatmap from './components/OccupancyHeatmap';
 import ExportReportButton from './components/ExportReportButton';
+import MetricMetadataPanel from './components/MetricMetadataPanel';
 import { mockHostData } from './mockData';
 
 export default function HostDashboard() {
@@ -66,10 +67,7 @@ export default function HostDashboard() {
             </p>
           </div>
           <div className="flex items-center gap-3">
-            <ExportReportButton
-              monthlyMetrics={mockHostData.monthlyMetrics}
-              payoutHistory={mockHostData.payoutHistory}
-            />
+            <ExportReportButton />
             <button
               onClick={() => setShowAddProperty(true)}
               className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-4 rounded-lg transition"
@@ -105,6 +103,10 @@ export default function HostDashboard() {
             description="Once your property gets bookings, revenue and occupancy totals will appear here."
           />
         )}
+
+        {/* Metric definitions, window, timezone and currency come from the
+            backend so cards, charts and exports share one definition. */}
+        <MetricMetadataPanel />
 
         {/* Available Balance (kept from existing earnings flow) */}
         <AvailableBalance

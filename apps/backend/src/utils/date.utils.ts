@@ -138,3 +138,242 @@ export function normalizeStayRange(
 
   return { checkIn, checkOut, nights: nightsBetween(checkIn, checkOut) };
 }
+
+// ---------------------------------------------------------------------------
+// Host analytics shared calculation windows (#982 / Issue 087)
+//
+// Host dashboards (earnings, occupancy, property views, comparative growth)
+// must agree on: which calendar days a window covers, which timezone those
+// days are interpreted in, which bookings count (booked vs completed), and
+// whether money is gross or net. These helpers are the single source of truth
+// for all of that; every aggregate should carry the metadata they build.
+// ---------------------------------------------------------------------------
+
+/** Inclusive calendar-day window, expressed in the analytics timezone. */
+export interface AnalyticsRange {
+  /** First calendar day included in the window (inclusive). */
+  startDate: CalendarDate;
+  /** Last calendar day included in the window (inclusive). */
+  endDate: CalendarDate;
+  /** IANA timezone the calendar days are interpreted in. */
+  timezone: string;
+  /** Number of calendar days covered (endDate - startDate + 1). */
+  days: number;
+  /** UTC instant at which the window opens (start of startDate in `timezone`). */
+  startUtc: Date;
+  /** UTC instant at which the window closes (exclusive; start of day after endDate). */
+  endUtc: Date;
+  /** True when the window was clamped to "today" (i.e. it includes the current day). */
+  partial: boolean;
+}
+
+/** Which bookings are counted in an aggregate. */
+export type BookingInclusion = 'booked' | 'completed';
+
+/** Whether monetary amounts are before or after fees/refunds. */
+export type AmountBasis = 'gross' | 'net';
+
+/** Metadata attached to every analytics aggregate so cards/charts/exports agree. */
+export interface MetricMetadata {
+  metric: string;
+  range: {
+    startDate: CalendarDate;
+    endDate: CalendarDate;
+    days: number;
+    partial: boolean;
+    startUtc: string;
+    endUtc: string;
+  };
+  timezone: string;
+  bookingInclusion: BookingInclusion;
+  amountBasis: AmountBasis;
+  currency: string;
+  /** Human-readable definition, identical across widgets and exports. */
+  definition: string;
+}
+
+const DEFAULT_ANALYTICS_TIMEZONE = 'UTC';
+const MAX_ANALYTICS_RANGE_DAYS = 3660; // ~10 years; guards against absurd inputs
+
+/**
+ * Resolve the analytics timezone. Accepts an IANA zone name; falls back to
+ * UTC when unset or invalid so a bad client value can never shift windows.
+ */
+export function resolveTimezone(input?: string | null): string {
+  if (!input) return DEFAULT_ANALYTICS_TIMEZONE;
+  const candidate = input.trim();
+  if (!candidate) return DEFAULT_ANALYTICS_TIMEZONE;
+  try {
+    // Intl throws RangeError for unknown zones; also rejects non-IANA junk.
+    new Intl.DateTimeFormat('en-US', { timeZone: candidate });
+    return candidate;
+  } catch {
+    return DEFAULT_ANALYTICS_TIMEZONE;
+  }
+}
+
+/** Offset (ms) of `timezone` from UTC at the given instant. */
+function timezoneOffsetMs(instant: Date, timezone: string): number {
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    hour12: false,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+  const parts = dtf.formatToParts(instant);
+  const get = (type: string): number => Number(parts.find((p) => p.type === type)?.value ?? '0');
+  const asUtc = Date.UTC(
+    get('year'),
+    get('month') - 1,
+    get('day'),
+    get('hour') % 24,
+    get('minute'),
+    get('second'),
+  );
+  return asUtc - instant.getTime();
+}
+
+/** UTC instant for the start (00:00:00) of a calendar date in `timezone`. */
+export function startOfDayInTimezone(date: CalendarDate, timezone: string): Date {
+  const [y, m, d] = date.split('-').map(Number);
+  const naiveUtc = Date.UTC(y, m - 1, d, 0, 0, 0, 0);
+  // Two-pass correction handles DST transitions where the offset changes.
+  let offset = timezoneOffsetMs(new Date(naiveUtc), timezone);
+  offset = timezoneOffsetMs(new Date(naiveUtc - offset), timezone);
+  return new Date(naiveUtc - offset);
+}
+
+/** Add `days` calendar days to a canonical calendar date. */
+export function addCalendarDays(date: CalendarDate, days: number): CalendarDate {
+  const base = toUtcMidnight(date);
+  const shifted = new Date(base.getTime() + days * 24 * 60 * 60 * 1000);
+  return formatCalendarDate(shifted.getUTCFullYear(), shifted.getUTCMonth() + 1, shifted.getUTCDate());
+}
+
+/** Inclusive day count between two canonical calendar dates. */
+export function calendarDaysInclusive(start: CalendarDate, end: CalendarDate): number {
+  return nightsBetween(start, end) + 1;
+}
+
+export interface ParseAnalyticsRangeInput {
+  /** Inclusive start date ("YYYY-MM-DD" or ISO instant). Defaults to 30 days before `end`. */
+  startDate?: string | Date | null;
+  /** Inclusive end date ("YYYY-MM-DD" or ISO instant). Defaults to "today" in `timezone`. */
+  endDate?: string | Date | null;
+  /** IANA timezone; defaults to UTC. */
+  timezone?: string | null;
+  /** "Now" override for deterministic tests. */
+  now?: Date;
+  /** Default window length (days) when `startDate` is omitted. */
+  defaultDays?: number;
+}
+
+/**
+ * Parse and normalize a host analytics date window. All dashboard widgets,
+ * charts and exports must use this so boundaries are identical everywhere.
+ *
+ * - Both endpoints are inclusive calendar days in `timezone`.
+ * - Missing `endDate` = today in `timezone`; missing `startDate` = `defaultDays`
+ *   before the end (inclusive), so a 30-day window covers 30 calendar days.
+ * - Windows are clamped so they never extend past today (partial periods are
+ *   flagged via `partial` rather than silently truncated).
+ *
+ * Throws RangeError for unparseable dates or inverted ranges.
+ */
+export function parseAnalyticsRange(input: ParseAnalyticsRangeInput = {}): AnalyticsRange {
+  const timezone = resolveTimezone(input.timezone);
+  const now = input.now ?? new Date();
+  const today = toCalendarDate(now);
+  if (!today) throw new RangeError('Unable to resolve current date');
+
+  const endDate = input.endDate != null ? toCalendarDate(input.endDate) : today;
+  if (!endDate) throw new RangeError('endDate must be a valid calendar date (YYYY-MM-DD)');
+
+  const defaultDays = Math.max(1, Math.floor(input.defaultDays ?? 30));
+  const startDate =
+    input.startDate != null
+      ? toCalendarDate(input.startDate)
+      : addCalendarDays(endDate, -(defaultDays - 1));
+  if (!startDate) throw new RangeError('startDate must be a valid calendar date (YYYY-MM-DD)');
+
+  if (isBeforeCalendarDate(endDate, startDate)) {
+    throw new RangeError('startDate must be on or before endDate');
+  }
+
+  const days = calendarDaysInclusive(startDate, endDate);
+  if (days > MAX_ANALYTICS_RANGE_DAYS) {
+    throw new RangeError(`Analytics range exceeds ${MAX_ANALYTICS_RANGE_DAYS} days`);
+  }
+
+  return {
+    startDate,
+    endDate,
+    timezone,
+    days,
+    startUtc: startOfDayInTimezone(startDate, timezone),
+    endUtc: startOfDayInTimezone(addCalendarDays(endDate, 1), timezone),
+    partial: !isBeforeCalendarDate(endDate, today),
+  };
+}
+
+export interface BuildMetricMetadataInput {
+  /** Metric identifier, e.g. "earnings", "occupancy", "views", "growth". */
+  metric: string;
+  /** Window the aggregate was computed over (from `parseAnalyticsRange`). */
+  range: AnalyticsRange;
+  /** Which bookings were counted. Defaults to "completed". */
+  bookingInclusion?: BookingInclusion;
+  /** Whether amounts are gross or net. Defaults to "net". */
+  amountBasis?: AmountBasis;
+  /** ISO 4217 currency code. Defaults to "USD". */
+  currency?: string | null;
+  /** Optional override for the human-readable definition. */
+  definition?: string;
+}
+
+const DEFAULT_DEFINITIONS: Record<string, string> = {
+  earnings:
+    'Sum of amounts for counted bookings whose stay overlaps the window, in the reported currency and amount basis.',
+  occupancy:
+    'Booked nights divided by available nights in the window; nights counted per calendar day in the analytics timezone.',
+  views:
+    'Total property detail views recorded within the window (inclusive start, exclusive end instant).',
+  growth:
+    'Percent change of the metric versus the immediately preceding window of equal length.',
+};
+
+/**
+ * Build the metadata block returned alongside every analytics aggregate so
+ * cards, charts and exports share one definition of the metric.
+ */
+export function buildMetricMetadata(input: BuildMetricMetadataInput): MetricMetadata {
+  const { range } = input;
+  const bookingInclusion: BookingInclusion = input.bookingInclusion ?? 'completed';
+  const amountBasis: AmountBasis = input.amountBasis ?? 'net';
+  const currency = (input.currency ?? 'USD').trim().toUpperCase() || 'USD';
+  const definition =
+    input.definition ??
+    DEFAULT_DEFINITIONS[input.metric] ??
+    `Aggregate "${input.metric}" computed over the reported window and inclusion rules.`;
+
+  return {
+    metric: input.metric,
+    range: {
+      startDate: range.startDate,
+      endDate: range.endDate,
+      days: range.days,
+      partial: range.partial,
+      startUtc: range.startUtc.toISOString(),
+      endUtc: range.endUtc.toISOString(),
+    },
+    timezone: range.timezone,
+    bookingInclusion,
+    amountBasis,
+    currency,
+    definition,
+  };
+}

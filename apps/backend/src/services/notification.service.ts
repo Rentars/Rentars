@@ -33,7 +33,9 @@ export type NotificationType =
   | 'message_received'
   | 'appeal_submitted'
   | 'report_notification'
-  | 'moderation_decision';
+  | 'moderation_decision'
+  | 'dispute_decision_recorded'
+  | 'dispute_settled';
 
 /** Coarse bucket used for filtering the notification list. */
 export type NotificationCategory =
@@ -82,6 +84,8 @@ export function categoryForType(type: NotificationType): NotificationCategory {
       return 'review';
     case 'dispute_initiated':
     case 'booking_disputed':
+    case 'dispute_decision_recorded':
+    case 'dispute_settled':
       return 'dispute';
     case 'message_received':
       return 'message';
@@ -145,6 +149,8 @@ const EMAIL_TEMPLATES: Partial<Record<NotificationType, string>> = {
   review_submitted: 'New Review Submitted',
   host_response: 'Host Responded to Your Review',
   dispute_initiated: 'Dispute Initiated',
+  dispute_decision_recorded: 'Dispute Decision Recorded',
+  dispute_settled: 'Dispute Settlement Update',
   new_property: 'New Listing from a Host You Follow',
   system_alert: 'System Alert',
   report_created: 'New Report Submitted',
@@ -174,6 +180,8 @@ const VALID_NOTIFICATION_TYPES: ReadonlyArray<NotificationType> = [
   'appeal_submitted',
   'report_notification',
   'moderation_decision',
+  'dispute_decision_recorded',
+  'dispute_settled',
 ];
 
 /**
@@ -761,6 +769,157 @@ export async function createNotificationWithAllChannels(
 }
 
 export { EMAIL_TEMPLATES };
+
+// ─── Dispute outcome notifications ────────────────────────────────────────────
+
+/**
+ * Privacy-safe summary of a dispute decision, shared with both parties.
+ *
+ * Deliberately excludes evidence contents, internal reviewer notes, reviewer
+ * identity, and any other administrator-only fields. Only the documented
+ * outcome, the reasoning intended for the parties, and the follow-up payment
+ * state are exposed.
+ */
+export interface DisputeOutcomeSummary {
+  /** UUID of the dispute. */
+  disputeId: string;
+  /** UUID of the booking the dispute relates to. */
+  bookingId: string;
+  /** Documented decision outcome, e.g. 'refund_full', 'release_to_host', 'split'. */
+  decision: string;
+  /** Human-readable reasoning intended for the parties (never internal notes). */
+  reasoning: string;
+  /** Follow-up payment state, e.g. 'pending', 'processing', 'completed', 'failed'. */
+  paymentState: string;
+  /** Optional amount (in the booking currency) affected by the decision. */
+  amount?: number | null;
+  /** ISO currency code for `amount`, if provided. */
+  currency?: string | null;
+  /** ISO timestamp when the decision was recorded. */
+  decidedAt?: string | null;
+  /** ISO timestamp when the financial settlement completed, if it has. */
+  settledAt?: string | null;
+}
+
+/**
+ * Build the privacy-safe notification payload for a dispute outcome.
+ *
+ * Only fields from {@link DisputeOutcomeSummary} are copied — any extra keys
+ * present on the input (e.g. evidence, reviewer notes) are dropped so they can
+ * never leak into a notification row or email.
+ */
+function buildDisputeOutcomePayload(
+  summary: DisputeOutcomeSummary,
+): Record<string, unknown> {
+  return {
+    disputeId: summary.disputeId,
+    bookingId: summary.bookingId,
+    decision: summary.decision,
+    reasoning: summary.reasoning,
+    paymentState: summary.paymentState,
+    ...(summary.amount !== undefined && { amount: summary.amount }),
+    ...(summary.currency !== undefined && { currency: summary.currency }),
+    ...(summary.decidedAt !== undefined && { decidedAt: summary.decidedAt }),
+    ...(summary.settledAt !== undefined && { settledAt: summary.settledAt }),
+  };
+}
+
+/**
+ * Notify both parties that a dispute decision has been recorded.
+ *
+ * A recorded decision does NOT imply financial settlement — the payload's
+ * `paymentState` communicates the current follow-up payment state so parties
+ * understand that money movement is still pending verification.
+ *
+ * Evidence contents and internal reviewer notes are never included.
+ *
+ * @param partyUserIds - User IDs of the parties to notify (host and guest).
+ * @param summary      - Privacy-safe outcome summary.
+ * @returns            - Count of notifications successfully created.
+ */
+export async function notifyDisputeDecisionRecorded(
+  partyUserIds: string[],
+  summary: DisputeOutcomeSummary,
+): Promise<ServiceResponse<{ notified: number }>> {
+  const recipients = Array.from(new Set(partyUserIds.filter((id) => !!id)));
+  if (recipients.length === 0) {
+    return { success: false, error: 'At least one party user id is required' };
+  }
+
+  const payload = buildDisputeOutcomePayload(summary);
+  const deepLink = `/disputes/${summary.disputeId}`;
+
+  let notified = 0;
+  for (const userId of recipients) {
+    try {
+      const send = await shouldSendInApp(userId, 'dispute_decision_recorded');
+      if (!send) continue;
+
+      const eventId = `dispute_decision_recorded:${summary.disputeId}:${userId}`;
+      const result = await createNotification(userId, 'dispute_decision_recorded', payload, {
+        deepLink,
+        eventId,
+      });
+      if (result.success) notified++;
+    } catch (err) {
+      console.error(
+        `[notifyDisputeDecisionRecorded] Failed to notify user ${userId}:`,
+        err,
+      );
+    }
+  }
+
+  return { success: true, data: { notified } };
+}
+
+/**
+ * Notify both parties that a dispute's financial settlement has completed
+ * (or failed) after verification.
+ *
+ * This is separate from {@link notifyDisputeDecisionRecorded}: a decision is
+ * recorded first, and settlement is only announced once the refund/release
+ * has been verified by the payment service.
+ *
+ * Evidence contents and internal reviewer notes are never included.
+ *
+ * @param partyUserIds - User IDs of the parties to notify (host and guest).
+ * @param summary      - Privacy-safe outcome summary including settlement state.
+ * @returns            - Count of notifications successfully created.
+ */
+export async function notifyDisputeSettled(
+  partyUserIds: string[],
+  summary: DisputeOutcomeSummary,
+): Promise<ServiceResponse<{ notified: number }>> {
+  const recipients = Array.from(new Set(partyUserIds.filter((id) => !!id)));
+  if (recipients.length === 0) {
+    return { success: false, error: 'At least one party user id is required' };
+  }
+
+  const payload = buildDisputeOutcomePayload(summary);
+  const deepLink = `/disputes/${summary.disputeId}`;
+
+  let notified = 0;
+  for (const userId of recipients) {
+    try {
+      const send = await shouldSendInApp(userId, 'dispute_settled');
+      if (!send) continue;
+
+      const eventId = `dispute_settled:${summary.disputeId}:${userId}`;
+      const result = await createNotification(userId, 'dispute_settled', payload, {
+        deepLink,
+        eventId,
+      });
+      if (result.success) notified++;
+    } catch (err) {
+      console.error(
+        `[notifyDisputeSettled] Failed to notify user ${userId}:`,
+        err,
+      );
+    }
+  }
+
+  return { success: true, data: { notified } };
+}
 
 // ─── Host-follow new-listing fan-out ──────────────────────────────────────────
 

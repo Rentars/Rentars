@@ -157,6 +157,21 @@ export interface CreateRefundRequestParams {
   correlationId?: string;
 }
 
+export interface CompleteDisputeSettlementParams {
+  /** Refund request created for the dispute decision. */
+  refundId: string;
+  /** Dispute the settlement belongs to (for audit correlation). */
+  disputeId: string;
+  /** Administrator who recorded the underlying decision. */
+  decidedBy: string;
+  /** Correlation ID from the originating request. */
+  correlationId?: string;
+  /** Provider submission callback. Must be safe to call at most once per operation key. */
+  submit: SubmitRefundParams['submit'];
+  /** Provider state query used to reconcile ambiguous outcomes. */
+  queryProviderState: SubmitRefundParams['queryProviderState'];
+}
+
 export interface SubmitRefundParams {
   refundId: string;
   /** Provider submission callback. Must be safe to call at most once per operation key. */
@@ -799,6 +814,92 @@ export async function transitionRefundStatus(
   }
 
   return { success: true, data: request };
+}
+
+/**
+ * Settlement-completion hook for dispute decisions (#980).
+ *
+ * A dispute decision is recorded *before* any funds move.  This hook is the
+ * only path from a recorded decision to actual settlement, and it keeps the
+ * two concerns distinct in the audit trail:
+ *
+ *   - `dispute.decision.settlement_started` — settlement attempt began
+ *   - `dispute.decision.settlement_completed` — funds verified as returned
+ *   - `dispute.decision.settlement_failed` — settlement did not complete
+ *
+ * The decision remains "pending settlement" until this returns success with a
+ * `confirmed` refund request.  Ambiguous provider outcomes stay in `submitted`
+ * and are reported as failures so the decision is never marked settled early.
+ */
+export async function completeDisputeSettlement(
+  params: CompleteDisputeSettlementParams,
+): Promise<ServiceResponse<RefundRequest>> {
+  if (!params.refundId) return { success: false, error: 'refundId is required' };
+  if (!params.disputeId) return { success: false, error: 'disputeId is required' };
+
+  const auditMeta = {
+    disputeId: params.disputeId,
+    refundId: params.refundId,
+    decidedBy: params.decidedBy,
+    correlationId: params.correlationId ?? null,
+  };
+
+  await auditLogger.log({
+    actorId: params.decidedBy,
+    action: 'dispute.decision.settlement_started',
+    resourceType: 'payment',
+    resourceId: params.refundId,
+    meta: auditMeta,
+  });
+
+  const submitted = await submitRefund({
+    refundId: params.refundId,
+    submit: params.submit,
+    queryProviderState: params.queryProviderState,
+    context: { correlationId: params.correlationId },
+  });
+
+  if (!submitted.success || !submitted.data) {
+    await auditLogger.log({
+      actorId: params.decidedBy,
+      action: 'dispute.decision.settlement_failed',
+      resourceType: 'payment',
+      resourceId: params.refundId,
+      meta: { ...auditMeta, error: submitted.error ?? 'unknown' },
+    });
+    return { success: false, error: submitted.error ?? 'Refund settlement failed' };
+  }
+
+  if (submitted.data.status !== 'confirmed') {
+    // Submitted but not verified — decision stays pending settlement.
+    await auditLogger.log({
+      actorId: params.decidedBy,
+      action: 'dispute.decision.settlement_failed',
+      resourceType: 'payment',
+      resourceId: params.refundId,
+      meta: { ...auditMeta, status: submitted.data.status, reason: 'not_verified' },
+    });
+    return {
+      success: false,
+      error: `Refund settlement not verified (status: ${submitted.data.status})`,
+    };
+  }
+
+  await auditLogger.log({
+    actorId: params.decidedBy,
+    action: 'dispute.decision.settlement_completed',
+    resourceType: 'payment',
+    resourceId: params.refundId,
+    meta: {
+      ...auditMeta,
+      status: submitted.data.status,
+      txHash: submitted.data.tx_hash,
+      providerRef: submitted.data.provider_ref,
+      refundAmount: submitted.data.refund_amount,
+    },
+  });
+
+  return { success: true, data: submitted.data };
 }
 
 /**

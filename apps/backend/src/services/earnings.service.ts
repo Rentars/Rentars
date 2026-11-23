@@ -5,8 +5,16 @@ import {
   recordBookingSettlement,
   type PeriodFilter,
 } from './ledger.service.js';
+import {
+  parseDateRange,
+  isCountedBookingStatus,
+  isReleasedBookingStatus,
+  roundMoney,
+  type MetricMetadata,
+} from './metrics.service.js';
 
 const PLATFORM_FEE_RATE = 0.05;
+const DEFAULT_CURRENCY = 'USD';
 
 export interface EarningsSummary {
   gross: number;
@@ -14,6 +22,10 @@ export interface EarningsSummary {
   net: number;
   pending: number;
   released: number;
+  /** ISO 4217 currency code the amounts are expressed in. */
+  currency: string;
+  /** Explicit window / inclusion metadata shared with dashboard widgets and exports. */
+  metadata: MetricMetadata;
 }
 
 export class EarningsService {
@@ -21,20 +33,23 @@ export class EarningsService {
     hostId: string,
     from: string,
     to: string,
+    currency: string = DEFAULT_CURRENCY,
   ): Promise<ServiceResponse<EarningsSummary>> {
     if (!hostId) return { success: false, error: 'hostId is required' };
-    if (!from || !to) return { success: false, error: 'from and to date range are required' };
-    if (new Date(to) < new Date(from)) {
-      return { success: false, error: 'to must be on or after from' };
+
+    const range = parseDateRange(from, to);
+    if (!range.success || !range.data) {
+      return { success: false, error: range.error ?? 'invalid date range' };
     }
+    const window = range.data;
 
     const { data, error } = await supabase
       .from('bookings')
       .select('total_price, status, properties!inner(owner_id)')
       .eq('properties.owner_id', hostId)
-      .not('status', 'eq', 'Cancelled')
-      .gte('created_at', from)
-      .lte('created_at', to);
+      .in('status', ['Confirmed', 'Completed', 'Pending'])
+      .gte('created_at', window.from)
+      .lte('created_at', window.to);
 
     if (error) return { success: false, error: error.message };
 
@@ -43,28 +58,38 @@ export class EarningsService {
     let released = 0;
 
     for (const row of (data ?? []) as Array<{ total_price: number; status: string }>) {
+      if (!isCountedBookingStatus(row.status)) continue;
       const price = Number(row.total_price) || 0;
       gross += price;
-      if (row.status === 'Confirmed' || row.status === 'Completed') {
+      if (isReleasedBookingStatus(row.status)) {
         released += price;
       } else {
         pending += price;
       }
     }
 
-    const platform_fees = Math.round(gross * PLATFORM_FEE_RATE * 100) / 100;
-    const net = Math.round((gross - platform_fees) * 100) / 100;
-    const releasedNet = Math.round(released * 0.95 * 100) / 100;
-    const pendingNet = Math.round(pending * 0.95 * 100) / 100;
+    const platform_fees = roundMoney(gross * PLATFORM_FEE_RATE);
+    const net = roundMoney(gross - platform_fees);
+    const releasedNet = roundMoney(released * (1 - PLATFORM_FEE_RATE));
+    const pendingNet = roundMoney(pending * (1 - PLATFORM_FEE_RATE));
 
     return {
       success: true,
       data: {
-        gross: Math.round(gross * 100) / 100,
+        gross: roundMoney(gross),
         platform_fees,
         net,
         pending: pendingNet,
         released: releasedNet,
+        currency,
+        metadata: {
+          metric: 'earnings',
+          window,
+          currency,
+          gross_or_net: 'net',
+          includes_cancelled: false,
+          booked_or_completed: 'booked',
+        },
       },
     };
   }
@@ -77,14 +102,22 @@ export class EarningsService {
   async getReconciledEarnings(
     hostId: string,
     filter: PeriodFilter,
+    currency: string = DEFAULT_CURRENCY,
   ): Promise<ServiceResponse<EarningsSummary>> {
     if (!hostId) return { success: false, error: 'hostId is required' };
-    if (!filter.from || !filter.to) {
-      return { success: false, error: 'from and to date range are required' };
+
+    const range = parseDateRange(filter.from, filter.to);
+    if (!range.success || !range.data) {
+      return { success: false, error: range.error ?? 'invalid date range' };
     }
+    const window = range.data;
 
     // Derive balance from the ledger (credits − debits)
-    const balanceResult = await getHostLedgerBalance(hostId, filter);
+    const balanceResult = await getHostLedgerBalance(hostId, {
+      ...filter,
+      from: window.from,
+      to: window.to,
+    });
     if (!balanceResult.success || !balanceResult.data) {
       return { success: false, error: balanceResult.error };
     }
@@ -96,9 +129,9 @@ export class EarningsService {
       .from('bookings')
       .select('total_price, status, properties!inner(owner_id)')
       .eq('properties.owner_id', hostId)
-      .not('status', 'eq', 'Cancelled')
-      .gte('created_at', filter.from)
-      .lte('created_at', filter.to);
+      .in('status', ['Confirmed', 'Completed', 'Pending'])
+      .gte('created_at', window.from)
+      .lte('created_at', window.to);
 
     if (error) return { success: false, error: error.message };
 
@@ -106,8 +139,9 @@ export class EarningsService {
     let released = 0;
 
     for (const row of (data ?? []) as Array<{ total_price: number; status: string }>) {
+      if (!isCountedBookingStatus(row.status)) continue;
       const price = Number(row.total_price) || 0;
-      if (row.status === 'Confirmed' || row.status === 'Completed') {
+      if (isReleasedBookingStatus(row.status)) {
         released += price;
       } else {
         pending += price;
@@ -117,11 +151,20 @@ export class EarningsService {
     return {
       success: true,
       data: {
-        gross: balance.total_credits,
-        platform_fees: balance.total_debits,
-        net: balance.net,
-        pending: Math.round(pending * 0.95 * 100) / 100,
-        released: Math.round(released * 0.95 * 100) / 100,
+        gross: roundMoney(balance.total_credits),
+        platform_fees: roundMoney(balance.total_debits),
+        net: roundMoney(balance.net),
+        pending: roundMoney(pending * (1 - PLATFORM_FEE_RATE)),
+        released: roundMoney(released * (1 - PLATFORM_FEE_RATE)),
+        currency,
+        metadata: {
+          metric: 'earnings',
+          window,
+          currency,
+          gross_or_net: 'net',
+          includes_cancelled: false,
+          booked_or_completed: 'booked',
+        },
       },
     };
   }

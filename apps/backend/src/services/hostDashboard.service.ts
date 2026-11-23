@@ -1,5 +1,14 @@
 import { supabase } from '@/config/supabase.js';
 import type { ServiceResponse } from './index.js';
+import {
+  DEFAULT_CURRENCY,
+  DEFAULT_TIMEZONE,
+  PLATFORM_FEE_RATE,
+  resolveDateRange,
+  toRangeMetadata,
+  type DateRangeInput,
+  type MetricMetadata,
+} from './analyticsWindow.service.js';
 
 export interface HostDashboardSummary {
   total_properties: number;
@@ -7,6 +16,7 @@ export interface HostDashboardSummary {
   upcoming_reservations: number;
   total_revenue: number;
   net_revenue: number;
+  metadata: MetricMetadata;
 }
 
 export interface HostProperty {
@@ -26,10 +36,18 @@ export interface HostProperty {
 /**
  * Returns a summary of the host's properties, bookings, and revenue
  * for use in the host dashboard overview section.
+ *
+ * All aggregates share the same calculation window, timezone and inclusion
+ * rules so that dashboard widgets and exports report identical numbers.
  */
 export async function getHostDashboardSummary(
   hostId: string,
+  rangeInput?: DateRangeInput,
+  timezone: string = DEFAULT_TIMEZONE,
+  currency: string = DEFAULT_CURRENCY,
 ): Promise<ServiceResponse<HostDashboardSummary>> {
+  const range = resolveDateRange(rangeInput, timezone);
+
   // Fetch all properties for the host
   const { data: properties, error: propError } = await supabase
     .from('properties')
@@ -41,6 +59,17 @@ export async function getHostDashboardSummary(
   const propertyIds = (properties ?? []).map((p: { id: string }) => p.id);
   const total_properties = propertyIds.length;
 
+  const metadata = toRangeMetadata(range, currency, {
+    total_properties: 'Count of all properties owned by the host (not windowed).',
+    active_bookings:
+      'Confirmed bookings whose stay overlaps the window and has not been cancelled.',
+    upcoming_reservations:
+      'Confirmed bookings with check-in inside the window and not yet checked out.',
+    total_revenue:
+      'Gross total_price of non-cancelled bookings whose check-in falls inside the window.',
+    net_revenue: `Gross revenue minus a ${Math.round(PLATFORM_FEE_RATE * 100)}% platform fee.`,
+  });
+
   if (total_properties === 0) {
     return {
       success: true,
@@ -50,42 +79,46 @@ export async function getHostDashboardSummary(
         upcoming_reservations: 0,
         total_revenue: 0,
         net_revenue: 0,
+        metadata,
       },
     };
   }
 
-  const now = new Date().toISOString();
-  const sevenDaysFromNow = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+  const windowStart = range.start.toISOString();
+  const windowEnd = range.end.toISOString();
 
-  // Active bookings (Confirmed status, not yet checked out)
+  // Active bookings (Confirmed, stay overlaps window, not cancelled)
   const { count: activeCount } = await supabase
     .from('bookings')
     .select('id', { count: 'exact', head: true })
     .in('property_id', propertyIds)
     .eq('status', 'Confirmed')
-    .gte('check_out', now);
+    .gte('check_out', windowStart)
+    .lte('check_in', windowEnd);
 
-  // Upcoming reservations (check-in within next 7 days)
+  // Upcoming reservations (Confirmed, check-in inside window)
   const { count: upcomingCount } = await supabase
     .from('bookings')
     .select('id', { count: 'exact', head: true })
     .in('property_id', propertyIds)
     .eq('status', 'Confirmed')
-    .gte('check_in', now)
-    .lte('check_in', sevenDaysFromNow);
+    .gte('check_in', windowStart)
+    .lte('check_in', windowEnd);
 
-  // Total revenue from completed bookings
+  // Gross revenue from non-cancelled bookings checked in within the window
   const { data: revenueData } = await supabase
     .from('bookings')
     .select('total_price')
     .in('property_id', propertyIds)
-    .in('status', ['Confirmed', 'Completed']);
+    .in('status', ['Confirmed', 'Completed'])
+    .gte('check_in', windowStart)
+    .lte('check_in', windowEnd);
 
   const total_revenue = (revenueData ?? []).reduce(
     (sum: number, b: { total_price: number }) => sum + (Number(b.total_price) || 0),
     0,
   );
-  const net_revenue = Math.round(total_revenue * 0.95 * 100) / 100; // 5% platform fee
+  const net_revenue = Math.round(total_revenue * (1 - PLATFORM_FEE_RATE) * 100) / 100;
 
   return {
     success: true,
@@ -95,6 +128,7 @@ export async function getHostDashboardSummary(
       upcoming_reservations: upcomingCount ?? 0,
       total_revenue: Math.round(total_revenue * 100) / 100,
       net_revenue,
+      metadata,
     },
   };
 }

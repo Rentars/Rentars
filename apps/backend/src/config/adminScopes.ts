@@ -38,10 +38,12 @@ export type AdminScope =
   | 'admin:properties:activate'
   | 'admin:properties:feature'
   | 'admin:properties:moderate_images' // approve / reject / remove property photos (#922)
+  | 'admin:properties:bulk_moderate'   // bulk status changes with version checks (#979)
   // Booking management
   | 'admin:bookings:read'
   // Dispute management
   | 'admin:disputes:read'
+  | 'admin:disputes:evidence'  // access dispute evidence attachments (#980)
   | 'admin:disputes:resolve'   // HIGH-RISK: financial settlement
   // Audit logs
   | 'admin:audit:read'
@@ -84,8 +86,10 @@ export const ROLE_SCOPES: Record<AdminRole, AdminScope[]> = {
     'admin:properties:activate',
     'admin:properties:feature',
     'admin:properties:moderate_images',
+    'admin:properties:bulk_moderate',
     'admin:bookings:read',
     'admin:disputes:read',
+    'admin:disputes:evidence',
     'admin:disputes:resolve',
     'admin:audit:read',
     'admin:ratelimits:read',
@@ -105,8 +109,10 @@ export const ROLE_SCOPES: Record<AdminRole, AdminScope[]> = {
     'admin:properties:activate',
     'admin:properties:feature',
     'admin:properties:moderate_images',
+    'admin:properties:bulk_moderate',
     'admin:bookings:read',
     'admin:disputes:read',
+    'admin:disputes:evidence',
     'admin:disputes:resolve',
     'admin:audit:read',
     'admin:notifications:read',

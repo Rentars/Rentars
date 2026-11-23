@@ -10,6 +10,8 @@ interface AdminProperty {
   id: string;
   title: string;
   status: string;
+  moderation_state?: string;
+  updated_at?: string;
   owner_id: string;
   price_per_night: number;
   created_at: string;
@@ -20,6 +22,20 @@ interface ConfirmAction {
   action: 'suspend' | 'activate';
 }
 
+type BulkAction = 'approve' | 'reject';
+
+interface BulkResultItem {
+  id: string;
+  success: boolean;
+  error?: string;
+}
+
+interface BulkResponse {
+  results?: BulkResultItem[];
+}
+
+const MODERATION_STATES = ['pending', 'approved', 'rejected'] as const;
+
 export default function AdminPropertiesPage() {
   const [properties, setProperties] = useState<AdminProperty[]>([]);
   const [loading, setLoading] = useState(true);
@@ -27,33 +43,123 @@ export default function AdminPropertiesPage() {
   const [confirm, setConfirm] = useState<ConfirmAction | null>(null);
   const [actionLoading, setActionLoading] = useState(false);
 
+  const [statusFilter, setStatusFilter] = useState<string>('all');
+  const [moderationFilter, setModerationFilter] = useState<string>('all');
+  const [search, setSearch] = useState('');
+  const [selected, setSelected] = useState<Record<string, string | undefined>>({});
+  const [reason, setReason] = useState('');
+  const [bulkLoading, setBulkLoading] = useState(false);
+  const [bulkResults, setBulkResults] = useState<BulkResultItem[] | null>(null);
+  const [bulkError, setBulkError] = useState<string | null>(null);
+
   const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null;
 
-  const fetchProperties = (status?: string) => {
+  const fetchProperties = (status?: string, moderationState?: string, searchTerm?: string) => {
     setLoading(true);
+    setError(null);
     const url = new URL(`${API_URL}/api/v1/admin/properties`);
-    if (status) url.searchParams.set('status', status);
+    if (status && status !== 'all') url.searchParams.set('status', status);
+    if (moderationState && moderationState !== 'all') {
+      url.searchParams.set('moderation_state', moderationState);
+    }
+    if (searchTerm && searchTerm.trim()) url.searchParams.set('search', searchTerm.trim());
     fetch(url.toString(), {
       headers: { Authorization: `Bearer ${token}` },
     })
       .then((r) => r.json())
-      .then((json) => setProperties(json.data ?? []))
+      .then((json) => {
+        setProperties(json.data ?? []);
+        setSelected({});
+      })
       .catch(() => setError('Failed to load properties'))
       .finally(() => setLoading(false));
   };
 
   useEffect(() => { fetchProperties(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  const applyFilters = () => {
+    fetchProperties(statusFilter, moderationFilter, search);
+  };
+
+  const toggleSelected = (p: AdminProperty) => {
+    setSelected((prev) => {
+      const next = { ...prev };
+      if (next[p.id]) {
+        delete next[p.id];
+      } else {
+        next[p.id] = p.updated_at;
+      }
+      return next;
+    });
+  };
+
+  const selectedIds = Object.keys(selected);
+  const allSelected = properties.length > 0 && selectedIds.length === properties.length;
+
+  const toggleSelectAll = () => {
+    if (allSelected) {
+      setSelected({});
+      return;
+    }
+    const next: Record<string, string | undefined> = {};
+    properties.forEach((p) => { next[p.id] = p.updated_at; });
+    setSelected(next);
+  };
+
+  const handleBulkAction = async (action: BulkAction) => {
+    setBulkError(null);
+    setBulkResults(null);
+    if (selectedIds.length === 0) {
+      setBulkError('Select at least one property.');
+      return;
+    }
+    if (!reason.trim()) {
+      setBulkError('A reason is required for moderation changes.');
+      return;
+    }
+    setBulkLoading(true);
+    try {
+      const res = await fetch(`${API_URL}/api/v1/admin/properties/bulk`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          action,
+          reason: reason.trim(),
+          items: selectedIds.map((id) => ({ id, expected_updated_at: selected[id] })),
+        }),
+      });
+      if (!res.ok) {
+        setBulkError('Bulk action failed. Please retry.');
+        return;
+      }
+      const json: BulkResponse = await res.json();
+      setBulkResults(json.results ?? []);
+      setReason('');
+      fetchProperties(statusFilter, moderationFilter, search);
+    } catch {
+      setBulkError('Bulk action failed. Please retry.');
+    } finally {
+      setBulkLoading(false);
+    }
+  };
+
   const handleAction = async () => {
     if (!confirm) return;
     setActionLoading(true);
     try {
-      await fetch(`${API_URL}/api/v1/admin/properties/${confirm.propertyId}/${confirm.action}`, {
+      const res = await fetch(`${API_URL}/api/v1/admin/properties/${confirm.propertyId}/${confirm.action}`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` },
       });
+      if (!res.ok) {
+        setError('Action failed');
+        return;
+      }
       setConfirm(null);
-      fetchProperties();
+      fetchProperties(statusFilter, moderationFilter, search);
     } catch {
       setError('Action failed');
     } finally {
@@ -72,9 +178,12 @@ export default function AdminPropertiesPage() {
           {(['all', 'active', 'suspended'] as const).map((s) => (
             <Button
               key={s}
-              variant="outline"
+              variant={statusFilter === s ? 'default' : 'outline'}
               size="sm"
-              onClick={() => fetchProperties(s === 'all' ? undefined : s)}
+              onClick={() => {
+                setStatusFilter(s);
+                fetchProperties(s, moderationFilter, search);
+              }}
             >
               {s.charAt(0).toUpperCase() + s.slice(1)}
             </Button>
@@ -82,12 +191,104 @@ export default function AdminPropertiesPage() {
         </div>
       </div>
 
+      <div className="bg-white rounded-lg border border-gray-200 p-4 space-y-3">
+        <div className="flex flex-wrap items-end gap-3">
+          <div className="flex flex-col gap-1">
+            <label htmlFor="moderation-filter" className="text-xs font-medium text-gray-500 uppercase">
+              Moderation
+            </label>
+            <select
+              id="moderation-filter"
+              className="border border-gray-300 rounded-md px-2 py-1 text-sm"
+              value={moderationFilter}
+              onChange={(e) => setModerationFilter(e.target.value)}
+            >
+              <option value="all">All</option>
+              {MODERATION_STATES.map((m) => (
+                <option key={m} value={m}>{m.charAt(0).toUpperCase() + m.slice(1)}</option>
+              ))}
+            </select>
+          </div>
+          <div className="flex flex-col gap-1 flex-1 min-w-[200px]">
+            <label htmlFor="search-filter" className="text-xs font-medium text-gray-500 uppercase">
+              Search
+            </label>
+            <input
+              id="search-filter"
+              type="text"
+              className="border border-gray-300 rounded-md px-2 py-1 text-sm"
+              placeholder="Search by title or owner"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') applyFilters(); }}
+            />
+          </div>
+          <Button size="sm" onClick={applyFilters}>Apply filters</Button>
+        </div>
+
+        <div className="flex flex-wrap items-end gap-3 border-t border-gray-100 pt-3">
+          <div className="flex flex-col gap-1 flex-1 min-w-[240px]">
+            <label htmlFor="bulk-reason" className="text-xs font-medium text-gray-500 uppercase">
+              Reason (required)
+            </label>
+            <input
+              id="bulk-reason"
+              type="text"
+              className="border border-gray-300 rounded-md px-2 py-1 text-sm"
+              placeholder="Reason for moderation change"
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+            />
+          </div>
+          <Button
+            size="sm"
+            onClick={() => handleBulkAction('approve')}
+            disabled={bulkLoading || selectedIds.length === 0}
+          >
+            {bulkLoading ? 'Processing…' : `Approve selected (${selectedIds.length})`}
+          </Button>
+          <Button
+            size="sm"
+            variant="destructive"
+            onClick={() => handleBulkAction('reject')}
+            disabled={bulkLoading || selectedIds.length === 0}
+          >
+            {bulkLoading ? 'Processing…' : `Reject selected (${selectedIds.length})`}
+          </Button>
+        </div>
+
+        {bulkError && <p className="text-sm text-red-600">{bulkError}</p>}
+
+        {bulkResults && (
+          <div className="border-t border-gray-100 pt-3">
+            <h2 className="text-sm font-semibold text-gray-900 mb-2">Bulk results</h2>
+            <ul className="space-y-1 text-sm">
+              {bulkResults.map((r) => (
+                <li key={r.id} className={r.success ? 'text-green-700' : 'text-red-600'}>
+                  {r.success ? 'Applied' : 'Not applied'} — {r.id}
+                  {r.error ? `: ${r.error}` : ''}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
+
       <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
         <table className="w-full text-sm">
           <thead className="bg-gray-50 border-b border-gray-200">
             <tr>
+              <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
+                <input
+                  type="checkbox"
+                  aria-label="Select all properties"
+                  checked={allSelected}
+                  onChange={toggleSelectAll}
+                />
+              </th>
               <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Title</th>
               <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
+              <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Moderation</th>
               <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Price/night</th>
               <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Created</th>
               <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Actions</th>
@@ -95,14 +296,23 @@ export default function AdminPropertiesPage() {
           </thead>
           <tbody className="divide-y divide-gray-100">
             {properties.length === 0 && (
-              <tr><td colSpan={5} className="px-4 py-6 text-center text-gray-400">No properties found</td></tr>
+              <tr><td colSpan={7} className="px-4 py-6 text-center text-gray-400">No properties found</td></tr>
             )}
             {properties.map((p) => (
               <tr key={p.id} className="hover:bg-gray-50">
+                <td className="px-4 py-3">
+                  <input
+                    type="checkbox"
+                    aria-label={`Select ${p.title}`}
+                    checked={Boolean(selected[p.id])}
+                    onChange={() => toggleSelected(p)}
+                  />
+                </td>
                 <td className="px-4 py-3 font-medium text-gray-900">{p.title}</td>
                 <td className="px-4 py-3">
                   <Badge variant={p.status === 'active' ? 'default' : 'destructive'}>{p.status}</Badge>
                 </td>
+                <td className="px-4 py-3 text-gray-600">{p.moderation_state ?? '—'}</td>
                 <td className="px-4 py-3 text-gray-600">${Number(p.price_per_night).toFixed(2)}</td>
                 <td className="px-4 py-3 text-gray-600">{new Date(p.created_at).toLocaleDateString()}</td>
                 <td className="px-4 py-3 space-x-2">

@@ -207,6 +207,106 @@ export interface BookingModification {
   updated_at?: string;
 }
 
+// ─── Dispute administration ───────────────────────────────────────────────────
+
+/** The outcome an administrator may decide for a dispute. */
+export type DisputeDecision = 'refund_tenant' | 'release_to_host';
+
+/**
+ * Financial consequence of a dispute decision, tracked independently of the
+ * decision itself. A decision is recorded first; settlement is only marked
+ * `settled` once the refund/release service confirms the money actually moved.
+ */
+export type DisputeSettlementStatus =
+  | 'pending'
+  | 'in_progress'
+  | 'settled'
+  | 'failed'
+  | 'not_applicable';
+
+/** A single entry in a dispute's auditable status timeline. */
+export interface DisputeStatusTransition {
+  id: string;
+  booking_id: string;
+  from_status?: string | null;
+  status: string;
+  actor_id?: string | null;
+  actor_role?: string | null;
+  reason?: string | null;
+  created_at: string;
+}
+
+/** The recorded decision for a dispute, including reviewer and evidence refs. */
+export interface DisputeDecisionRecord {
+  id: string;
+  booking_id: string;
+  reviewer_id: string;
+  reviewer_role?: string | null;
+  decision: DisputeDecision;
+  reasoning?: string | null;
+  /** Opaque references to evidence items (never raw evidence content). */
+  evidence_refs?: string[] | null;
+  payment_consequence?: string | null;
+  settlement_status: DisputeSettlementStatus;
+  settlement_reference?: string | null;
+  settlement_error?: string | null;
+  settled_at?: string | null;
+  created_at: string;
+  updated_at?: string;
+}
+
+/** A stored evidence item attached to a dispute. */
+export interface DisputeEvidence {
+  id: string;
+  booking_id: string;
+  submitted_by: string;
+  description?: string | null;
+  /** Storage reference / URL — only returned to authorized administrators. */
+  content_ref?: string | null;
+  created_at: string;
+}
+
+/** Combined, party-safe view of a dispute's decision and timeline. */
+export interface DisputeTimeline {
+  booking_id: string;
+  decision: DisputeDecisionRecord | null;
+  transitions: DisputeStatusTransition[];
+  /** Privacy-safe summary suitable for showing to either party. */
+  summary: string;
+}
+
+/** Roles permitted to read dispute evidence and resolve disputes. */
+const DISPUTE_ADMIN_ROLES = ['admin', 'moderator'] as const;
+
+function isDisputeAdmin(role?: string | null): boolean {
+  return !!role && (DISPUTE_ADMIN_ROLES as readonly string[]).includes(role);
+}
+
+/**
+ * Build a privacy-safe, party-facing summary of a dispute decision. Never
+ * includes reviewer identity, internal reasoning, or evidence references.
+ */
+function buildDisputePartySummary(
+  decision: DisputeDecision,
+  settlementStatus: DisputeSettlementStatus,
+): string {
+  const outcome =
+    decision === 'refund_tenant'
+      ? 'The dispute was resolved in favor of the tenant.'
+      : 'The dispute was resolved in favor of the host.';
+
+  const settlement =
+    settlementStatus === 'settled'
+      ? ' The related payment has been settled.'
+      : settlementStatus === 'failed'
+        ? ' The related payment could not be completed and is under review.'
+        : settlementStatus === 'not_applicable'
+          ? ''
+          : ' The related payment is still being processed.';
+
+  return `${outcome}${settlement}`;
+}
+
 export interface CreateBookingInput {
   property_id: string;
   tenant_id: string;
@@ -1982,7 +2082,325 @@ export class BookingService {
 
     loggingService.logBlockchainOperation('raiseDispute', { bookingId, userId, reason });
 
+    // Record the opening of the dispute on its auditable timeline.
+    await this.recordDisputeStatusTransition(bookingId, {
+      fromStatus: booking.status ?? 'Confirmed',
+      status: 'Disputed',
+      actorId: userId,
+      actorRole: booking.tenant_id === userId ? 'tenant' : 'host',
+      reason: reason ?? null,
+    });
+
     return { success: true, data: transitionResult.data! };
+  }
+
+  // ── Dispute administration ─────────────────────────────────────────────────
+
+  /**
+   * Append an entry to a dispute's auditable status timeline. Best-effort:
+   * a failure is logged but never fails the caller, since the booking state
+   * remains the source of truth.
+   */
+  async recordDisputeStatusTransition(
+    bookingId: string,
+    entry: {
+      fromStatus?: string | null;
+      status: string;
+      actorId?: string | null;
+      actorRole?: string | null;
+      reason?: string | null;
+    },
+  ): Promise<ServiceResponse<DisputeStatusTransition>> {
+    if (!bookingId) {
+      return { success: false, error: 'Booking ID is required' };
+    }
+
+    try {
+      const { data, error } = await supabase
+        .from('dispute_status_history')
+        .insert({
+          booking_id: bookingId,
+          from_status: entry.fromStatus ?? null,
+          status: entry.status,
+          actor_id: entry.actorId ?? null,
+          actor_role: entry.actorRole ?? null,
+          reason: entry.reason ?? null,
+        })
+        .select()
+        .single();
+
+      if (error) {
+        console.error(
+          `[BookingService] CRITICAL: dispute status history insert failed for booking=${bookingId} -> ${entry.status}:`,
+          error,
+        );
+        return { success: false, error: error.message };
+      }
+
+      return { success: true, data: data as DisputeStatusTransition };
+    } catch (e) {
+      console.error(
+        `[BookingService] CRITICAL: dispute status history insert threw for booking=${bookingId} -> ${entry.status}:`,
+        e,
+      );
+      return { success: false, error: String(e) };
+    }
+  }
+
+  /**
+   * Record an administrator's dispute decision (reviewer, decision, reasoning,
+   * evidence references, and the intended payment consequence).
+   *
+   * This records the DECISION only. It does not move money: settlement is
+   * tracked separately via `settlement_status` and only marked `settled` once
+   * the refund/release service confirms success (see `resolveDispute`).
+   *
+   * @param bookingId - UUID of the booking
+   * @param actor     - Authenticated caller; must be an admin/moderator
+   * @param input     - Decision, reasoning, evidence refs, payment consequence
+   */
+  async recordDisputeDecision(
+    bookingId: string,
+    actor: BookingActor,
+    input: {
+      decision: DisputeDecision;
+      reasoning?: string;
+      evidenceRefs?: string[];
+      paymentConsequence?: string;
+    },
+  ): Promise<ServiceResponse<DisputeDecisionRecord>> {
+    if (!bookingId) {
+      return { success: false, error: 'Booking ID is required' };
+    }
+
+    if (!isDisputeAdmin(actor.role)) {
+      await auditLogger.log({
+        actorId: actor.id,
+        action: 'dispute.decide',
+        resourceType: 'booking',
+        resourceId: bookingId,
+        success: false,
+        error: 'insufficient role',
+        meta: { actor_role: actor.role ?? null },
+      });
+      return {
+        success: false,
+        error: 'Forbidden: only admins or moderators may record a dispute decision',
+        statusCode: 403,
+      };
+    }
+
+    if (input.decision !== 'refund_tenant' && input.decision !== 'release_to_host') {
+      return { success: false, error: 'Invalid dispute decision' };
+    }
+
+    // Reject a conflicting reviewer: a decision already recorded by a different
+    // reviewer cannot be silently overwritten.
+    const { data: existing } = await supabase
+      .from('dispute_decisions')
+      .select('id, reviewer_id')
+      .eq('booking_id', bookingId)
+      .maybeSingle();
+
+    if (existing && (existing as { reviewer_id: string }).reviewer_id !== actor.id) {
+      await auditLogger.log({
+        actorId: actor.id,
+        action: 'dispute.decide',
+        resourceType: 'booking',
+        resourceId: bookingId,
+        success: false,
+        error: 'conflicting reviewer',
+        meta: { actor_role: actor.role ?? null },
+      });
+      return {
+        success: false,
+        error: 'A decision for this dispute was already recorded by another reviewer',
+        statusCode: 409,
+        code: 'DISPUTE_CONFLICTING_REVIEWER',
+      };
+    }
+
+    const now = new Date().toISOString();
+    const { data, error } = await supabase
+      .from('dispute_decisions')
+      .upsert(
+        {
+          booking_id: bookingId,
+          reviewer_id: actor.id,
+          reviewer_role: actor.role ?? null,
+          decision: input.decision,
+          reasoning: input.reasoning ?? null,
+          evidence_refs: input.evidenceRefs ?? [],
+          payment_consequence: input.paymentConsequence ?? null,
+          settlement_status: 'pending',
+          updated_at: now,
+        },
+        { onConflict: 'booking_id' },
+      )
+      .select()
+      .single();
+
+    if (error) {
+      return { success: false, error: error.message };
+    }
+
+    await auditLogger.log({
+      actorId: actor.id,
+      action: 'dispute.decide',
+      resourceType: 'booking',
+      resourceId: bookingId,
+      success: true,
+      meta: {
+        actor_role: actor.role ?? null,
+        decision: input.decision,
+        evidence_count: input.evidenceRefs?.length ?? 0,
+      },
+    });
+
+    return { success: true, data: data as DisputeDecisionRecord };
+  }
+
+  /**
+   * Update the settlement status of a recorded dispute decision. Called only
+   * after the refund/release service confirms (or fails) the money movement.
+   */
+  async updateDisputeSettlement(
+    bookingId: string,
+    settlement: {
+      status: DisputeSettlementStatus;
+      reference?: string | null;
+      error?: string | null;
+    },
+  ): Promise<ServiceResponse<DisputeDecisionRecord>> {
+    if (!bookingId) {
+      return { success: false, error: 'Booking ID is required' };
+    }
+
+    const patch: Record<string, unknown> = {
+      settlement_status: settlement.status,
+      settlement_reference: settlement.reference ?? null,
+      settlement_error: settlement.error ?? null,
+      updated_at: new Date().toISOString(),
+    };
+    if (settlement.status === 'settled') {
+      patch.settled_at = new Date().toISOString();
+    }
+
+    const { data, error } = await supabase
+      .from('dispute_decisions')
+      .update(patch)
+      .eq('booking_id', bookingId)
+      .select()
+      .maybeSingle();
+
+    if (error) {
+      return { success: false, error: error.message };
+    }
+    if (!data) {
+      return { success: false, error: 'No dispute decision recorded for this booking' };
+    }
+
+    return { success: true, data: data as DisputeDecisionRecord };
+  }
+
+  /**
+   * Fetch the auditable timeline for a dispute: the recorded decision (if any)
+   * plus every status transition. Accessible to the booking's parties and to
+   * administrators; the returned summary is privacy-safe for either party.
+   */
+  async getDisputeTimeline(
+    bookingId: string,
+    actor: BookingActor,
+  ): Promise<ServiceResponse<DisputeTimeline>> {
+    if (!bookingId) {
+      return { success: false, error: 'Booking ID is required' };
+    }
+
+    const decision = await bookingAuthorizationService.authorize('read', bookingId, actor);
+    if (!decision.allowed) {
+      return { success: false, error: decision.reason, statusCode: decision.status };
+    }
+
+    const [decisionResult, transitionsResult] = await Promise.all([
+      supabase.from('dispute_decisions').select('*').eq('booking_id', bookingId).maybeSingle(),
+      supabase
+        .from('dispute_status_history')
+        .select('*')
+        .eq('booking_id', bookingId)
+        .order('created_at', { ascending: true }),
+    ]);
+
+    if (decisionResult.error) {
+      return { success: false, error: decisionResult.error.message };
+    }
+    if (transitionsResult.error) {
+      return { success: false, error: transitionsResult.error.message };
+    }
+
+    const decisionRecord = (decisionResult.data as DisputeDecisionRecord | null) ?? null;
+    const transitions = (transitionsResult.data ?? []) as DisputeStatusTransition[];
+
+    // Parties see a privacy-safe summary; administrators see the same summary
+    // here and can fetch full evidence via getDisputeEvidence.
+    const summary = decisionRecord
+      ? buildDisputePartySummary(decisionRecord.decision, decisionRecord.settlement_status)
+      : 'This dispute is still under review.';
+
+    return {
+      success: true,
+      data: { booking_id: bookingId, decision: decisionRecord, transitions, summary },
+    };
+  }
+
+  /**
+   * Fetch the evidence attached to a dispute. Restricted to administrators:
+   * parties never receive raw evidence content.
+   */
+  async getDisputeEvidence(
+    bookingId: string,
+    actor: BookingActor,
+  ): Promise<ServiceResponse<DisputeEvidence[]>> {
+    if (!bookingId) {
+      return { success: false, error: 'Booking ID is required' };
+    }
+
+    if (!isDisputeAdmin(actor.role)) {
+      await auditLogger.log({
+        actorId: actor.id,
+        action: 'dispute.evidence.read',
+        resourceType: 'booking',
+        resourceId: bookingId,
+        success: false,
+        error: 'insufficient role',
+        meta: { actor_role: actor.role ?? null },
+      });
+      return {
+        success: false,
+        error: 'Forbidden: only admins or moderators may access dispute evidence',
+        statusCode: 403,
+      };
+    }
+
+    const { data, error } = await supabase
+      .from('dispute_evidence')
+      .select('*')
+      .eq('booking_id', bookingId)
+      .order('created_at', { ascending: true });
+
+    if (error) {
+      return { success: false, error: error.message };
+    }
+
+    await auditLogger.log({
+      actorId: actor.id,
+      action: 'dispute.evidence.read',
+      resourceType: 'booking',
+      resourceId: bookingId,
+      success: true,
+      meta: { actor_role: actor.role ?? null },
+    });
+
+    return { success: true, data: (data ?? []) as DisputeEvidence[] };
   }
 
   /**
@@ -2000,6 +2418,7 @@ export class BookingService {
     resolution: 'refund_tenant' | 'release_to_host',
     adminNotes?: string,
     userRole?: string,
+    evidenceRefs?: string[],
   ): Promise<ServiceResponse<Booking>> {
     if (!bookingId) {
       return { success: false, error: 'Booking ID is required' };
@@ -2010,7 +2429,16 @@ export class BookingService {
     }
 
     // Authorization: only admin or moderator can resolve disputes
-    if (!['admin', 'moderator'].includes(userRole ?? '')) {
+    if (!isDisputeAdmin(userRole)) {
+      await auditLogger.log({
+        actorId: userId,
+        action: 'dispute.resolve',
+        resourceType: 'booking',
+        resourceId: bookingId,
+        success: false,
+        error: 'insufficient role',
+        meta: { actor_role: userRole ?? null },
+      });
       return {
         success: false,
         error: 'Forbidden: only admins or moderators may resolve disputes',
@@ -2035,8 +2463,42 @@ export class BookingService {
       return { success: false, error: 'No active dispute on this booking' };
     }
 
-    // Handle escrow resolution
+    const paymentConsequence =
+      resolution === 'release_to_host'
+        ? 'Escrow released to host'
+        : 'Escrow refunded to tenant';
+
+    // 1. Record the DECISION first (reviewer, reasoning, evidence, consequence).
+    //    This is separate from settlement: the decision is auditable even if the
+    //    money movement later fails.
+    const decisionResult = await this.recordDisputeDecision(
+      bookingId,
+      { id: userId, role: userRole },
+      {
+        decision: resolution,
+        reasoning: adminNotes,
+        evidenceRefs,
+        paymentConsequence,
+      },
+    );
+    if (!decisionResult.success) return decisionResult;
+
+    await this.recordDisputeStatusTransition(bookingId, {
+      fromStatus: 'Disputed',
+      status: 'decision_recorded',
+      actorId: userId,
+      actorRole: userRole ?? null,
+      reason: adminNotes ?? null,
+    });
+
+    // 2. Attempt settlement. A decision does NOT imply financial settlement.
+    let settlementStatus: DisputeSettlementStatus = 'not_applicable';
+    let settlementError: string | null = null;
+
     if (booking.escrow_id) {
+      settlementStatus = 'in_progress';
+      await this.updateDisputeSettlement(bookingId, { status: 'in_progress' });
+
       loggingService.logBlockchainOperation('resolveDisputeEscrow', {
         bookingId,
         userId,
@@ -2049,13 +2511,43 @@ export class BookingService {
         } else {
           await trustlessWorkClient.cancelEscrow(booking.escrow_id);
         }
+
+        // Verify the provider actually settled before marking settled.
+        const settledEscrow = await trustlessWorkClient.getEscrowStatus(booking.escrow_id);
+        const expected = resolution === 'release_to_host' ? 'released' : 'cancelled';
+        if (settledEscrow.status === expected) {
+          settlementStatus = 'settled';
+          await this.updateDisputeSettlement(bookingId, {
+            status: 'settled',
+            reference: booking.escrow_id,
+          });
+        } else {
+          settlementStatus = 'in_progress';
+          await this.updateDisputeSettlement(bookingId, {
+            status: 'in_progress',
+            reference: booking.escrow_id,
+          });
+        }
       } catch (err) {
+        settlementStatus = 'failed';
+        settlementError = String(err);
+        await this.updateDisputeSettlement(bookingId, {
+          status: 'failed',
+          error: settlementError,
+        });
         loggingService.logBlockchainOperation(
           'resolveDisputeEscrow',
           { bookingId, userId, resolution },
           undefined,
           String(err)
         );
+        await this.recordDisputeStatusTransition(bookingId, {
+          fromStatus: 'decision_recorded',
+          status: 'settlement_failed',
+          actorId: userId,
+          actorRole: userRole ?? null,
+          reason: 'Payment settlement failed',
+        });
         return {
           success: false,
           error: `Failed to resolve escrow: ${String(err)}`,
@@ -2079,21 +2571,48 @@ export class BookingService {
     );
     if (!transitionResult.success) return transitionResult;
 
+    await this.recordDisputeStatusTransition(bookingId, {
+      fromStatus: 'Disputed',
+      status: resolvedStatus,
+      actorId: userId,
+      actorRole: userRole ?? null,
+      reason: resolutionMessage,
+    });
+
     const hostId = booking.properties.owner_id;
+
+    // 3. Notify both parties with a privacy-safe summary (no reviewer identity,
+    //    reasoning, or evidence references).
+    const partySummary = buildDisputePartySummary(resolution, settlementStatus);
 
     if (booking.tenant_id) {
       createNotification(booking.tenant_id, 'system_alert', {
         booking_id: bookingId,
-        message: resolutionMessage,
+        message: partySummary,
+        settlement_status: settlementStatus,
       }).catch(() => {});
     }
 
     if (hostId) {
       createNotification(hostId, 'system_alert', {
         booking_id: bookingId,
-        message: resolutionMessage,
+        message: partySummary,
+        settlement_status: settlementStatus,
       }).catch(() => {});
     }
+
+    await auditLogger.log({
+      actorId: userId,
+      action: 'dispute.resolve',
+      resourceType: 'booking',
+      resourceId: bookingId,
+      success: true,
+      meta: {
+        actor_role: userRole ?? null,
+        decision: resolution,
+        settlement_status: settlementStatus,
+      },
+    });
 
     loggingService.logBlockchainOperation('resolveDispute', { bookingId, userId, resolution });
 

@@ -8,6 +8,17 @@ import type { AdminRequest } from '@/middleware/admin.middleware.js';
 import { changeUserRole } from '@/services/roleAssignment.service.js';
 import { ASSIGNABLE_ROLES } from '@/config/roleTransitions.js';
 import type { RequestWithId } from '@/middleware/logging.middleware.js';
+import {
+  listModerationQueue as listModerationQueueService,
+  bulkModerateProperties as bulkModeratePropertiesService,
+  MODERATION_ACTIONS,
+  MODERATION_STATES,
+} from '@/services/propertyModeration.service.js';
+import {
+  recordDisputeDecision,
+  getDisputeDecision,
+  DisputeDecisionError,
+} from '@/services/disputeDecision.service.js';
 import { z } from 'zod';
 
 function getRouteId(value: string | string[] | undefined): string | null {

@@ -56,6 +56,7 @@ export type AuditAction =
   | 'property.publish'
   | 'property.unpublish'
   | 'property.change_owner'
+  | 'property.bulk_moderate'
   // Bookings
   | 'booking.create'
   | 'booking.cancel'
@@ -73,6 +74,14 @@ export type AuditAction =
   | 'dispute.open'
   | 'dispute.resolve'
   | 'dispute.modify'
+  | 'dispute.decision_recorded'
+  | 'dispute.settlement_completed'
+  | 'dispute.reopened'
+  | 'dispute.evidence_accessed'
+  // Exports (reports / analytics)
+  | 'export.generated'
+  | 'export.downloaded'
+  | 'export.denied'
   // Account
   | 'account.email_change'
   | 'account.role_change'
@@ -94,6 +103,7 @@ export type AuditAction =
   | 'admin.user_delete'
   | 'admin.property_suspend'
   | 'admin.property_activate'
+  | 'admin.property_bulk_moderate'
   | 'admin.featured_set'
   | 'admin.featured_clear'
   | 'admin.refund_approve'
@@ -112,7 +122,8 @@ export type ResourceType =
   | 'auth'
   | 'admin'
   | 'account'
-  | 'session';
+  | 'session'
+  | 'export';
 
 export interface AuditLogEntry {
   actorId?: string;
@@ -132,7 +143,7 @@ export interface AuditLogEntry {
  * raw provider or message payloads, and free-text bodies.
  */
 const SENSITIVE_META_KEYS =
-  /token|secret|password|passwd|seed|mnemonic|key|pin|card|ssn|cvv|signature|private|cookie|authorization|payload|raw|body|content/i;
+  /token|secret|password|passwd|seed|mnemonic|key|pin|card|ssn|cvv|signature|private|cookie|authorization|payload|raw|body|content|file|blob|buffer|attachment|evidence_text|evidence_body|download_url|signed_url/i;
 
 /**
  * Sanitize metadata to prevent logging of sensitive data.

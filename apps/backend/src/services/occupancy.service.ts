@@ -14,6 +14,13 @@
 import { supabase } from '@/config/supabase.js';
 import { RESERVING_BOOKING_STATUSES } from './booking.service.js';
 import type { ServiceResponse } from './index.js';
+import {
+  DEFAULT_CALENDAR_TIMEZONE,
+  dateRange as calendarDateRange,
+  coversDate as calendarCoversDate,
+  parseCalendarDate,
+  type AnalyticsWindowMetadata,
+} from './analytics-window.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -35,26 +42,18 @@ export interface OccupancyHeatmapResult {
     available: number;
     total:     number;
   };
+  /** Explicit window, timezone and inclusion rules for this aggregate. */
+  metadata: AnalyticsWindowMetadata;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/** Return every calendar date (YYYY-MM-DD) in the range [from, to] inclusive. */
-function dateRange(from: string, to: string): string[] {
-  const dates: string[] = [];
-  const cursor = new Date(from + 'T00:00:00Z');
-  const end    = new Date(to   + 'T00:00:00Z');
-  while (cursor <= end) {
-    dates.push(cursor.toISOString().slice(0, 10));
-    cursor.setUTCDate(cursor.getUTCDate() + 1);
-  }
-  return dates;
-}
-
-/** Return true if [rangeStart, rangeEnd) overlaps with the given date. */
+/**
+ * Return true if [rangeStart, rangeEnd) overlaps with the given date.
+ * check_in <= date < check_out  (check_out is the departure day, not a night)
+ */
 function coversDate(rangeStart: string, rangeEnd: string, date: string): boolean {
-  // check_in <= date < check_out  (check_out is the departure day, not a night)
-  return rangeStart <= date && date < rangeEnd;
+  return calendarCoversDate(rangeStart, rangeEnd, date);
 }
 
 // ─── Service ──────────────────────────────────────────────────────────────────
@@ -73,10 +72,10 @@ export async function getOccupancyHeatmap(
 ): Promise<ServiceResponse<OccupancyHeatmapResult>> {
   if (!propertyId) return { success: false, error: 'propertyId is required' };
 
-  const fromDate = new Date(from + 'T00:00:00Z');
-  const toDate   = new Date(to   + 'T00:00:00Z');
+  const fromDate = parseCalendarDate(from);
+  const toDate   = parseCalendarDate(to);
 
-  if (isNaN(fromDate.getTime()) || isNaN(toDate.getTime())) {
+  if (!fromDate || !toDate) {
     return { success: false, error: 'Invalid date format. Use YYYY-MM-DD.' };
   }
 
@@ -119,7 +118,7 @@ export async function getOccupancyHeatmap(
   const blockedDays = new Set<string>();
 
   for (const b of (bookings ?? []) as { check_in: string; check_out: string; status: string }[]) {
-    for (const d of dateRange(
+    for (const d of calendarDateRange(
       b.check_in  > from ? b.check_in  : from,
       b.check_out < to   ? b.check_out : to,
     )) {
@@ -128,7 +127,7 @@ export async function getOccupancyHeatmap(
   }
 
   for (const bl of (blocks ?? []) as { start_date: string; end_date: string }[]) {
-    for (const d of dateRange(
+    for (const d of calendarDateRange(
       bl.start_date > from ? bl.start_date : from,
       bl.end_date   < to   ? bl.end_date   : to,
     )) {
@@ -137,7 +136,7 @@ export async function getOccupancyHeatmap(
   }
 
   // ── Assemble per-day entries ────────────────────────────────────────────
-  const allDates = dateRange(from, to);
+  const allDates = calendarDateRange(from, to);
   const days: DayEntry[] = allDates.map((date) => {
     let status: DayStatus = 'available';
     if (bookedDays.has(date))       status = 'booked';
@@ -152,8 +151,22 @@ export async function getOccupancyHeatmap(
     total:     days.length,
   };
 
+  const metadata: AnalyticsWindowMetadata = {
+    metric: 'occupancy_heatmap',
+    from,
+    to,
+    timezone: DEFAULT_CALENDAR_TIMEZONE,
+    windowType: 'calendar_days_inclusive',
+    inclusionRules: {
+      bookedStatuses: [...RESERVING_BOOKING_STATUSES],
+      nightRule: 'check_in <= date < check_out',
+      blockedSource: 'availability_ranges.is_available = false',
+      precedence: 'booked_over_blocked',
+    },
+  };
+
   return {
     success: true,
-    data: { propertyId, from, to, days, summary },
+    data: { propertyId, from, to, days, summary, metadata },
   };
 }

@@ -2,6 +2,13 @@ import type { Response } from 'express';
 import type { AuthRequest } from '../middleware/auth.middleware.js';
 import { submitReport, listReports, resolveReport } from '../services/report.service.js';
 import type { ReportStatus, ReportTargetType } from '../services/report.service.js';
+import {
+  createExport,
+  getExportDownload,
+  listExportsForOwner,
+  isExportDataset,
+  isExportRole,
+} from '../services/export.service.js';
 
 export async function createReport(req: AuthRequest, res: Response): Promise<void> {
   const reporterId = req.userId;
@@ -226,6 +233,81 @@ export async function getReportImpactHandler(req: AuthRequest, res: Response): P
 
   if (!result.success) {
     res.status(500).json({ error: result.error });
+    return;
+  }
+
+  res.json(result.data);
+}
+
+// ─── Report & Analytics Exports ──────────────────────────────────────────────
+
+export async function createExportHandler(req: AuthRequest, res: Response): Promise<void> {
+  const ownerId = req.userId;
+  if (!ownerId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const { dataset, role } = req.body ?? {};
+  if (!isExportDataset(dataset)) {
+    res.status(400).json({ error: 'Unsupported dataset' });
+    return;
+  }
+  if (!isExportRole(role)) {
+    res.status(400).json({ error: 'Unsupported role projection' });
+    return;
+  }
+
+  const result = await createExport({ ownerId, dataset, role });
+
+  if (!result.success) {
+    res.status(result.statusCode ?? 400).json({ error: result.error });
+    return;
+  }
+
+  res.status(201).json(result.data);
+}
+
+export async function downloadExportHandler(req: AuthRequest, res: Response): Promise<void> {
+  const requesterId = req.userId;
+  if (!requesterId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const token = req.params.token;
+  if (!token) {
+    res.status(400).json({ error: 'token is required' });
+    return;
+  }
+
+  const result = await getExportDownload(token, requesterId);
+
+  if (!result.success) {
+    res.status(result.statusCode ?? 400).json({ error: result.error });
+    return;
+  }
+
+  res.setHeader('Content-Type', result.data.contentType);
+  res.setHeader('Content-Disposition', `attachment; filename="${result.data.filename}"`);
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+
+  // Stream the bounded-memory export body to the client.
+  result.data.stream.pipe(res);
+}
+
+export async function listExportsHandler(req: AuthRequest, res: Response): Promise<void> {
+  const ownerId = req.userId;
+  if (!ownerId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const result = await listExportsForOwner(ownerId);
+
+  if (!result.success) {
+    res.status(result.statusCode ?? 500).json({ error: result.error });
     return;
   }
 
