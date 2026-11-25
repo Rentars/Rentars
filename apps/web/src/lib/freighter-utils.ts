@@ -1,13 +1,24 @@
-import { isConnected, getAddress, signTransaction, getNetwork } from '@stellar/freighter-api';
 import { validateNetworkConsistency } from '@/lib/network-utils';
+import { isValidStellarAddress } from '@/lib/isValidStellarAddress';
+
+// ── Lazy Freighter API ──────────────────────────────────────────────────────
+// @stellar/freighter-api (~150KB) is only needed when the wallet/booking flow
+// runs. Import it on demand so public pages don't carry the wallet SDK.
+
+let _freighterApi: typeof import('@stellar/freighter-api') | null = null;
+
+async function freighterApi(): Promise<typeof import('@stellar/freighter-api')> {
+  if (!_freighterApi) {
+    _freighterApi = await import('@stellar/freighter-api');
+  }
+  return _freighterApi;
+}
 
 export interface WalletState {
   isConnected: boolean;
   address: string | null;
   network: 'testnet' | 'mainnet';
   networkMismatch: boolean;
-  /** True once wallet, frontend env, and backend have all been confirmed to
-   *  agree on the same network.  Remains false until the three-way check runs. */
   networkValidated: boolean;
   isLoading: boolean;
   error: string | null;
@@ -54,27 +65,20 @@ export function getFreighterErrorMessage(
   return fallback;
 }
 
-/**
- * Get the wallet's current network from Freighter
- */
 export async function getWalletNetwork(): Promise<'testnet' | 'mainnet'> {
   try {
-    const result = await getNetwork();
+    const api = await freighterApi();
+    const result = await api.getNetwork();
     if (result.error) {
       throw new FreighterError('Failed to get wallet network', 'NETWORK_ERROR');
     }
-    // Freighter returns 'TESTNET' or 'PUBLIC' for mainnet
     return result.network === 'PUBLIC' ? 'mainnet' : 'testnet';
   } catch (error) {
     if (error instanceof FreighterError) throw error;
-    // Default to testnet if we can't determine
     return 'testnet';
   }
 }
 
-/**
- * Check if wallet network matches the expected network
- */
 export async function checkNetworkMatch(expectedNetwork: 'testnet' | 'mainnet'): Promise<boolean> {
   try {
     const walletNetwork = await getWalletNetwork();
@@ -84,32 +88,25 @@ export async function checkNetworkMatch(expectedNetwork: 'testnet' | 'mainnet'):
   }
 }
 
-/**
- * Check if Freighter wallet is installed and connected
- */
 export async function isFreighterInstalled(): Promise<boolean> {
   try {
-    const result = await isConnected();
+    const api = await freighterApi();
+    const result = await api.isConnected();
     return result.isConnected;
   } catch (error) {
     return false;
   }
 }
 
-/**
- * Get the currently connected Freighter wallet public key/address
- */
 export async function getFreighterPublicKey(): Promise<string> {
   try {
-    const result = await getAddress();
+    const api = await freighterApi();
+    const result = await api.getAddress();
     if (result.error) {
       if (result.error.message?.includes('Not connected')) {
         throw new FreighterError('Wallet not connected. Please open Freighter and connect.', 'NOT_CONNECTED');
       }
-      throw new FreighterError(
-        result.error.message || 'Failed to get wallet address',
-        'NETWORK_ERROR'
-      );
+      throw new FreighterError(result.error.message || 'Failed to get wallet address', 'NETWORK_ERROR');
     }
     if (!result.address) {
       throw new FreighterError('No address returned from wallet', 'NOT_CONNECTED');
@@ -124,18 +121,14 @@ export async function getFreighterPublicKey(): Promise<string> {
   }
 }
 
-/**
- * Sign a transaction with Freighter wallet
- */
 export async function signWithFreighter(
-  xdr: string, 
+  xdr: string,
   network: 'testnet' | 'mainnet',
   options?: { timeout?: number }
 ): Promise<string> {
-  const timeout = options?.timeout ?? 60000; // 60 seconds default
-  
+  const timeout = options?.timeout ?? 60000;
+
   try {
-    // Check network match before signing
     const walletNetwork = await getWalletNetwork();
     if (walletNetwork !== network) {
       throw new FreighterError(
@@ -145,9 +138,8 @@ export async function signWithFreighter(
     }
 
     const networkPassphrase = getNetworkPassphrase(network);
-    
-    // Wrap signing in a timeout promise
-    const signPromise = signTransaction(xdr, { networkPassphrase });
+
+    const signPromise = (await freighterApi()).signTransaction(xdr, { networkPassphrase });
     const timeoutPromise = new Promise<never>((_, reject) => {
       setTimeout(() => reject(new FreighterError('Signing request timed out', 'TIMEOUT')), timeout);
     });
@@ -158,10 +150,7 @@ export async function signWithFreighter(
       if (result.error.message?.includes('rejected')) {
         throw new FreighterError('Transaction signing rejected by user', 'USER_REJECTED');
       }
-      throw new FreighterError(
-        result.error.message || 'Failed to sign transaction',
-        'SIGN_FAILED'
-      );
+      throw new FreighterError(result.error.message || 'Failed to sign transaction', 'SIGN_FAILED');
     }
 
     if (!result.signedTxXdr || !result.signedTxXdr.trim()) {
@@ -178,9 +167,6 @@ export async function signWithFreighter(
   }
 }
 
-/**
- * Get network passphrase for transaction signing
- */
 export function getNetworkPassphrase(network: 'testnet' | 'mainnet'): string {
   const passphrases = {
     testnet: 'Test SDF Network ; September 2015',
@@ -189,18 +175,6 @@ export function getNetworkPassphrase(network: 'testnet' | 'mainnet'): string {
   return passphrases[network];
 }
 
-/**
- * Verify if an address is a valid Stellar public key
- */
-export function isValidStellarAddress(address: string): boolean {
-  // Stellar public keys start with 'G' and are base32 encoded (56 chars)
-  return /^G[A-Z2-7]{55}$/.test(address);
-}
-
-/**
- * Connect to Freighter wallet
- * @throws FreighterError if wallet is not installed or connection fails
- */
 export async function connectFreighterWallet(
   expectedNetwork?: 'testnet' | 'mainnet',
   apiUrl?: string,
@@ -218,7 +192,6 @@ export async function connectFreighterWallet(
     throw new FreighterError('Invalid wallet address format', 'NETWORK_ERROR');
   }
 
-  // Check network match if expected network is provided
   if (expectedNetwork) {
     const walletNetwork = await getWalletNetwork();
     if (walletNetwork !== expectedNetwork) {
@@ -229,7 +202,6 @@ export async function connectFreighterWallet(
     }
   }
 
-  // Three-way check: also verify the backend agrees on the same network.
   if (expectedNetwork && apiUrl) {
     const mismatchReason = await validateNetworkConsistency(expectedNetwork, apiUrl);
     if (mismatchReason) {
@@ -240,9 +212,6 @@ export async function connectFreighterWallet(
   return address;
 }
 
-/**
- * Get wallet status without throwing
- */
 export async function getWalletStatus(
   expectedNetwork?: 'testnet' | 'mainnet',
   apiUrl?: string,
@@ -265,7 +234,6 @@ export async function getWalletStatus(
     const walletNetwork = await getWalletNetwork();
     const localMismatch = expectedNetwork ? walletNetwork !== expectedNetwork : false;
 
-    // Three-way network consistency check (wallet + frontend env + backend).
     let networkMismatch = localMismatch;
     let networkValidated = false;
     let errorMsg: string | null = localMismatch

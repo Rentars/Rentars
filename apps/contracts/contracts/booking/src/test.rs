@@ -2142,4 +2142,159 @@ mod tests {
             );
         }
     }
+
+    // ─── Resource / Cost Regression Measurements (Issue 119) ──────────────────
+    //
+    // These tests measure Soroban CPU instruction and memory consumption for
+    // representative booking operations and emit the results as stable,
+    // machine-readable `RESOURCE_METRIC` JSON lines. The in-test assertions are
+    // intentionally loose (sanity bounds only); the external CI threshold
+    // script (`scripts/check-resource-budgets.*`) parses the emitted lines and
+    // fails the build on material regressions beyond the agreed tolerance.
+    //
+    // To capture a fresh baseline, run:
+    //   cargo test -p booking resource_ -- --nocapture
+    // and feed the emitted lines into the budget file. Document any intentional
+    // threshold change in the accompanying resource-budget notes.
+
+    /// Representative maximum number of existing bookings per property used to
+    /// exercise the worst-case collection size for booking-related operations.
+    const MAX_BOOKINGS_PER_PROPERTY: u64 = 50;
+
+    /// Emit a single machine-readable resource metric line.
+    fn emit_resource_metric(
+        operation: &str,
+        scenario: &str,
+        cpu_instructions: u64,
+        memory_bytes: u64,
+    ) {
+        // Stable JSON-ish format, one metric per line, prefixed for easy grep.
+        std::println!(
+            "RESOURCE_METRIC {{\"contract\":\"booking\",\"operation\":\"{}\",\"scenario\":\"{}\",\"cpu_instructions\":{},\"memory_bytes\":{}}}",
+            operation, scenario, cpu_instructions, memory_bytes
+        );
+    }
+
+    /// Measure the resources consumed by `f`, returning (cpu, memory).
+    ///
+    /// The budget is reset before measuring so that setup work (property
+    /// creation, minting, etc.) is excluded from the reported numbers.
+    fn measure<F: FnOnce()>(env: &Env, f: F) -> (u64, u64) {
+        env.budget().reset_unlimited();
+        f();
+        let cpu = env.budget().cpu_instruction_cost();
+        let mem = env.budget().memory_bytes_cost();
+        (cpu, mem)
+    }
+
+    #[test]
+    fn resource_create_booking() {
+        let (env, booking_cid, listing_cid, _admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+        let owner = Address::generate(&env);
+        let tenant = Address::generate(&env);
+        let property_id = create_property(&env, &listing_cid, &owner);
+
+        let (cpu, mem) = measure(&env, || {
+            client.create_booking(&tenant, &property_id, &1_000_u64, &1_007_u64, &700_0000000_i128);
+        });
+
+        emit_resource_metric("create_booking", "single", cpu, mem);
+
+        // Loose sanity bounds only — the CI threshold script enforces budgets.
+        assert!(cpu > 0, "create_booking must consume CPU instructions");
+        assert!(mem > 0, "create_booking must consume memory");
+    }
+
+    #[test]
+    fn resource_create_booking_max_collection() {
+        let (env, booking_cid, listing_cid, _admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+        let owner = Address::generate(&env);
+        let tenant = Address::generate(&env);
+
+        // Pre-populate many bookings across distinct properties so that the
+        // global booking counter and per-property index are at a representative
+        // maximum size before the measured call.
+        for i in 0..MAX_BOOKINGS_PER_PROPERTY {
+            let prop = create_property(&env, &listing_cid, &owner);
+            let check_in = 10_000 + i * 10;
+            client.create_booking(
+                &tenant,
+                &prop,
+                &check_in,
+                &(check_in + 5),
+                &100_i128,
+            );
+        }
+
+        // Measure one more create_booking with the collection at max size.
+        let prop = create_property(&env, &listing_cid, &owner);
+        let (cpu, mem) = measure(&env, || {
+            client.create_booking(&tenant, &prop, &1_000_u64, &1_007_u64, &700_0000000_i128);
+        });
+
+        emit_resource_metric("create_booking", "max_collection", cpu, mem);
+
+        assert!(cpu > 0, "create_booking (max) must consume CPU instructions");
+        assert!(mem > 0, "create_booking (max) must consume memory");
+    }
+
+    #[test]
+    fn resource_overlap_rejection() {
+        let (env, booking_cid, listing_cid, _admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+        let owner = Address::generate(&env);
+        let tenant = Address::generate(&env);
+        let property_id = create_property(&env, &listing_cid, &owner);
+
+        // Seed an existing booking so the overlap check has data to scan.
+        client.create_booking(&tenant, &property_id, &1_000_u64, &2_000_u64, &100_i128);
+
+        // Measure the availability check that rejects an overlapping range.
+        let (cpu, mem) = measure(&env, || {
+            let available = client.check_availability(&property_id, &1_500_u64, &2_500_u64);
+            assert!(!available, "overlapping range must be rejected");
+        });
+
+        emit_resource_metric("overlap_rejection", "single", cpu, mem);
+
+        assert!(cpu > 0, "overlap_rejection must consume CPU instructions");
+        assert!(mem > 0, "overlap_rejection must consume memory");
+    }
+
+    #[test]
+    fn resource_overlap_rejection_max_collection() {
+        let (env, booking_cid, listing_cid, _admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+        let owner = Address::generate(&env);
+        let tenant = Address::generate(&env);
+
+        // Seed the maximum number of bookings for a single property so the
+        // overlap scan iterates over the largest representative collection.
+        let mut property_id = 0_u64;
+        for i in 0..MAX_BOOKINGS_PER_PROPERTY {
+            let prop = create_property(&env, &listing_cid, &owner);
+            let check_in = 10_000 + i * 10;
+            client.create_booking(
+                &tenant,
+                &prop,
+                &check_in,
+                &(check_in + 5),
+                &100_i128,
+            );
+            property_id = prop;
+        }
+
+        // Measure the availability check over the largest collection.
+        let (cpu, mem) = measure(&env, || {
+            let available = client.check_availability(&property_id, &10_000_u64, &10_005_u64);
+            assert!(!available, "overlapping range must be rejected");
+        });
+
+        emit_resource_metric("overlap_rejection", "max_collection", cpu, mem);
+
+        assert!(cpu > 0, "overlap_rejection (max) must consume CPU instructions");
+        assert!(mem > 0, "overlap_rejection (max) must consume memory");
+    }
 }

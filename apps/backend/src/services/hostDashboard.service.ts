@@ -1,5 +1,6 @@
 import { supabase } from '@/config/supabase.js';
 import type { ServiceResponse } from './index.js';
+import { getHostLedgerBalanceBreakdown } from './ledger.service.js';
 
 export interface HostDashboardSummary {
   total_properties: number;
@@ -7,6 +8,12 @@ export interface HostDashboardSummary {
   upcoming_reservations: number;
   total_revenue: number;
   net_revenue: number;
+  /** Available (withdrawable) balance from the ledger — net − paid_out − disputed. */
+  available_balance?: number;
+  /** Reserved funds from Pending bookings (in escrow, NOT withdrawable). */
+  pending_payout?: number;
+  /** Disputed-booking funds on hold (NOT withdrawable). */
+  disputed_balance?: number;
 }
 
 export interface HostProperty {
@@ -15,6 +22,8 @@ export interface HostProperty {
   location: string;
   price_per_night: number;
   status: string;
+  draft_status: string;
+  moderation_state: string;
   active_bookings: number;
   total_bookings: number;
   average_rating: number;
@@ -50,6 +59,9 @@ export async function getHostDashboardSummary(
         upcoming_reservations: 0,
         total_revenue: 0,
         net_revenue: 0,
+        available_balance: 0,
+        pending_payout: 0,
+        disputed_balance: 0,
       },
     };
   }
@@ -74,18 +86,34 @@ export async function getHostDashboardSummary(
     .gte('check_in', now)
     .lte('check_in', sevenDaysFromNow);
 
-  // Total revenue from completed bookings
-  const { data: revenueData } = await supabase
-    .from('bookings')
-    .select('total_price')
-    .in('property_id', propertyIds)
-    .in('status', ['Confirmed', 'Completed']);
+  // Total + net revenue are derived from the canonical append-only ledger so
+  // the dashboard reconciles with the earnings view (Feature 4). Previously
+  // this summed booking totals as cash-available, which overstated withdrawable
+  // funds by ignoring fees, refunds, payouts, and disputed holds.
+  const breakdown = await getHostLedgerBalanceBreakdown(hostId);
+  const b = breakdown.success && breakdown.data ? breakdown.data : null;
 
-  const total_revenue = (revenueData ?? []).reduce(
-    (sum: number, b: { total_price: number }) => sum + (Number(b.total_price) || 0),
-    0,
-  );
-  const net_revenue = Math.round(total_revenue * 0.95 * 100) / 100; // 5% platform fee
+  // Reserved (Pending) and held (Disputed) funds from bookings not yet settled
+  // or on hold — never presented as withdrawable.
+  const { data: heldBookings } = await supabase
+    .from('bookings')
+    .select('total_price, status')
+    .in('property_id', propertyIds)
+    .in('status', ['Pending', 'Disputed']);
+
+  let pendingPayout = 0;
+  let disputedBalance = 0;
+  for (const hb of (heldBookings ?? []) as Array<{ total_price: number | string; status: string }>) {
+    const net = (Number(hb.total_price) || 0) * 0.95;
+    if (hb.status === 'Pending') pendingPayout += net;
+    else if (hb.status === 'Disputed') disputedBalance += net;
+  }
+
+  const round2 = (n: number) => Math.round(n * 100) / 100;
+  const gross = b?.gross ?? 0;
+  const settledNet = b?.net ?? 0;
+  const paidOut = b?.paid_out ?? 0;
+  const available = round2(settledNet - paidOut - disputedBalance);
 
   return {
     success: true,
@@ -93,39 +121,59 @@ export async function getHostDashboardSummary(
       total_properties,
       active_bookings: activeCount ?? 0,
       upcoming_reservations: upcomingCount ?? 0,
-      total_revenue: Math.round(total_revenue * 100) / 100,
-      net_revenue,
+      total_revenue: round2(gross),
+      net_revenue: available,
+      available_balance: available,
+      pending_payout: round2(pendingPayout),
+      disputed_balance: round2(disputedBalance),
     },
   };
 }
 
 /**
  * Returns the host's properties enriched with booking counts and ratings.
+ * Supports optional `status` filter and `search` (title ilike) query.
  */
 export async function getHostProperties(
   hostId: string,
   page = 1,
   limit = 20,
+  status = '',
+  search = '',
 ): Promise<ServiceResponse<{ properties: HostProperty[]; total: number }>> {
   const offset = (page - 1) * limit;
 
-  const { data, error, count } = await supabase
+  let query = supabase
     .from('properties')
-    .select('id, title, location, price_per_night, status, images, average_rating, review_count, created_at', {
-      count: 'exact',
-    })
+    .select(
+      'id, title, city, country, price_per_night, status, draft_status, moderation_state, images, average_rating, review_count, created_at',
+      { count: 'exact' },
+    )
     .eq('owner_id', hostId)
+    .is('deleted_at', null)
     .order('created_at', { ascending: false })
     .range(offset, offset + limit - 1);
+
+  if (status) {
+    query = query.eq('status', status);
+  }
+  if (search) {
+    query = query.ilike('title', `%${search}%`);
+  }
+
+  const { data, error, count } = await query;
 
   if (error) return { success: false, error: error.message };
 
   const propertyRows = (data ?? []) as Array<{
     id: string;
     title: string;
-    location: string;
+    city: string | null;
+    country: string | null;
     price_per_night: number;
     status: string;
+    draft_status: string | null;
+    moderation_state: string | null;
     images: string[] | null;
     average_rating: number | null;
     review_count: number | null;
@@ -157,9 +205,11 @@ export async function getHostProperties(
   const properties: HostProperty[] = propertyRows.map((p) => ({
     id: p.id,
     title: p.title,
-    location: p.location ?? '',
+    location: [p.city, p.country].filter(Boolean).join(', '),
     price_per_night: p.price_per_night ?? 0,
     status: p.status ?? 'draft',
+    draft_status: p.draft_status ?? '',
+    moderation_state: p.moderation_state ?? '',
     active_bookings: bookingsByProp[p.id]?.active ?? 0,
     total_bookings: bookingsByProp[p.id]?.total ?? 0,
     average_rating: p.average_rating ?? 0,

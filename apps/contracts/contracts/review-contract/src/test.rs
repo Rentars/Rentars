@@ -647,6 +647,133 @@ mod tests {
         assert_eq!(review.rating, 5);
     }
 
+    // ─── Resource Budget Regression Tests (Issue 119) ─────────────────────────
+
+    /// Maximum comment length used for resource measurements. Mirrors the
+    /// largest representative payload the contract is expected to persist.
+    const MAX_COMMENT_LEN: u32 = 256;
+
+    /// Number of pre-existing reviews used to exercise the "large collection"
+    /// path for a single reviewee.
+    const MAX_REVIEWS_PER_REVIEWEE: u32 = 50;
+
+    /// Build a comment string of exactly `len` characters.
+    fn comment_of_len(env: &Env, len: u32) -> String {
+        let mut s = String::from_str(env, "");
+        for _ in 0..len {
+            s.push_str(&String::from_str(env, "x"));
+        }
+        s
+    }
+
+    /// Emit a machine-readable metric line consumed by the CI comparison
+    /// script (`scripts/check-resource-budgets.sh`).
+    fn emit_metric(name: &str, cpu: u64, mem: u64) {
+        std::println!(
+            "RESOURCE_METRIC {{\"contract\":\"review-contract\",\"operation\":\"{}\",\"cpu_instructions\":{},\"memory_bytes\":{}}}",
+            name, cpu, mem
+        );
+    }
+
+    /// Measure resources for a single `submit_review` call with a
+    /// maximum-length comment.
+    #[test]
+    fn test_resource_submit_review_max_comment() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.budget().reset_unlimited();
+
+        let contract_id = env.register_contract(None, ReviewContract);
+        let client = ReviewContractClient::new(&env, &contract_id);
+
+        let reviewer = Address::generate(&env);
+        let reviewee = Address::generate(&env);
+        let comment = comment_of_len(&env, MAX_COMMENT_LEN);
+
+        let cpu_before = env.budget().cpu_instruction_count();
+        let mem_before = env.budget().memory_bytes_count();
+
+        let id = client.submit_review(&reviewer, &reviewee, &5_u32, &comment);
+        assert_eq!(client.get_review(&id).comment, comment);
+
+        let cpu = env.budget().cpu_instruction_count() - cpu_before;
+        let mem = env.budget().memory_bytes_count() - mem_before;
+
+        emit_metric("submit_review_max_comment", cpu, mem);
+    }
+
+    /// Measure resources for `submit_review` when the reviewee already has a
+    /// large number of reviews (worst-case index append).
+    #[test]
+    fn test_resource_submit_review_large_collection() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.budget().reset_unlimited();
+
+        let contract_id = env.register_contract(None, ReviewContract);
+        let client = ReviewContractClient::new(&env, &contract_id);
+
+        let reviewee = Address::generate(&env);
+        let comment = String::from_str(&env, "seed");
+
+        // Seed the reviewee with the maximum representative number of reviews.
+        for _ in 0..MAX_REVIEWS_PER_REVIEWEE {
+            let reviewer = Address::generate(&env);
+            client.submit_review(&reviewer, &reviewee, &4_u32, &comment);
+        }
+        assert_eq!(
+            client.get_reviews_for_user(&reviewee).len(),
+            MAX_REVIEWS_PER_REVIEWEE
+        );
+
+        // Measure the marginal cost of one more submission.
+        let reviewer = Address::generate(&env);
+        let cpu_before = env.budget().cpu_instruction_count();
+        let mem_before = env.budget().memory_bytes_count();
+
+        client.submit_review(&reviewer, &reviewee, &5_u32, &comment);
+
+        let cpu = env.budget().cpu_instruction_count() - cpu_before;
+        let mem = env.budget().memory_bytes_count() - mem_before;
+
+        emit_metric("submit_review_large_collection", cpu, mem);
+    }
+
+    /// Measure resources for the read paths used by booking/search flows:
+    /// `get_reviews_for_user` and `get_reputation` over a large collection.
+    #[test]
+    fn test_resource_query_large_collection() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.budget().reset_unlimited();
+
+        let contract_id = env.register_contract(None, ReviewContract);
+        let client = ReviewContractClient::new(&env, &contract_id);
+
+        let reviewee = Address::generate(&env);
+        let comment = String::from_str(&env, "seed");
+        for _ in 0..MAX_REVIEWS_PER_REVIEWEE {
+            let reviewer = Address::generate(&env);
+            client.submit_review(&reviewer, &reviewee, &3_u32, &comment);
+        }
+
+        let cpu_before = env.budget().cpu_instruction_count();
+        let mem_before = env.budget().memory_bytes_count();
+        let ids = client.get_reviews_for_user(&reviewee);
+        assert_eq!(ids.len(), MAX_REVIEWS_PER_REVIEWEE);
+        let cpu = env.budget().cpu_instruction_count() - cpu_before;
+        let mem = env.budget().memory_bytes_count() - mem_before;
+        emit_metric("get_reviews_for_user_large_collection", cpu, mem);
+
+        let cpu_before = env.budget().cpu_instruction_count();
+        let mem_before = env.budget().memory_bytes_count();
+        let rep = client.get_reputation(&reviewee);
+        assert_eq!(rep, 300);
+        let cpu = env.budget().cpu_instruction_count() - cpu_before;
+        let mem = env.budget().memory_bytes_count() - mem_before;
+        emit_metric("get_reputation_large_collection", cpu, mem);
+    }
+
     /// Deployment validation: contract IDs are deterministic given the same
     /// deployer and salt.
     ///

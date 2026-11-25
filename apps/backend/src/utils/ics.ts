@@ -5,14 +5,41 @@
  * support so check-in / check-out dates display correctly in any calendar
  * client regardless of daylight-saving transitions.
  *
- * Key design decisions:
- *  - Dates stored as bare dates (YYYY-MM-DD) in the DB are treated as
- *    local dates in the property's timezone.  We emit them as DATE-only
- *    DTSTART/DTEND with a TZID param so the client anchors them locally.
- *  - Full datetime strings (ISO-8601 with time) are emitted with TZID when
- *    a timezone is provided, or as UTC "Z" timestamps when it is not.
- *  - Cancelled events carry STATUS:CANCELLED + an incremented SEQUENCE so
- *    calendar clients replace rather than duplicate the event.
+ * ── Supported iCalendar profile ─────────────────────────────────────────────
+ *
+ * Format: iCalendar (RFC 5545) version 2.0, METHOD:PUBLISH, CALSCALE:GREGORIAN.
+ *
+ * Line endings & folding:
+ *  - Every line is terminated with CRLF ("\r\n").
+ *  - Lines longer than 75 octets are folded per RFC 5545 §3.1 by inserting a
+ *    CRLF followed by a single space; continuation lines carry at most 74
+ *    octets of content.  Unfolding (removing CRLF + space) restores the value.
+ *
+ * Text escaping (RFC 5545 §3.3.11):
+ *  - Backslash, semicolon and comma are backslash-escaped in TEXT values
+ *    (SUMMARY, DESCRIPTION, LOCATION, UID).
+ *  - CR/LF sequences are encoded as the literal two-character sequence "\n".
+ *
+ * Date / time semantics:
+ *  - All-day events (bare "YYYY-MM-DD" input) are emitted as DATE-only values
+ *    (VALUE=DATE) with no time component.  DTEND is the *exclusive* end date
+ *    per RFC 5545 §3.6.1, so a booking checking out on 2026-07-05 has
+ *    DTEND;VALUE=DATE:20260705 and the last occupied night is 2026-07-04.
+ *  - When a timezone is supplied, DATE and DATE-TIME values carry a TZID
+ *    parameter and a VTIMEZONE component is emitted for every referenced TZID.
+ *  - When no timezone is supplied, DATE-TIME values are emitted in UTC with a
+ *    trailing "Z".  DTSTAMP and CREATED are always UTC.
+ *
+ * Identity & updates:
+ *  - UID is caller-supplied and must be stable across regenerations so clients
+ *    update rather than duplicate events.
+ *  - Cancelled bookings are emitted with STATUS:CANCELLED and an incremented
+ *    SEQUENCE so clients replace the prior occurrence.
+ *
+ * Privacy:
+ *  - Only SUMMARY, DESCRIPTION and LOCATION provided by the caller are
+ *    emitted; callers are responsible for omitting private guest/property
+ *    details from those fields.
  */
 
 export interface IcsEventInput {
@@ -58,17 +85,36 @@ function pad(n: number): string {
 
 /**
  * Fold long iCalendar lines at 75 octets (RFC 5545 §3.1).
+ *
+ * Folding is measured in UTF-8 octets, not UTF-16 code units, and never
+ * splits a multi-byte character across a fold boundary.  Continuation lines
+ * begin with a single space and carry at most 74 octets of content.
  */
 function foldLine(line: string): string {
-  if (line.length <= 75) return line;
+  const encoder = new TextEncoder();
+  if (encoder.encode(line).length <= 75) return line;
+
   const chunks: string[] = [];
-  chunks.push(line.slice(0, 75));
-  let i = 75;
-  while (i < line.length) {
-    chunks.push(' ' + line.slice(i, i + 74));
-    i += 74;
+  let current = '';
+  let currentBytes = 0;
+  // First line allows 75 octets; continuation lines reserve 1 octet for the
+  // leading space, leaving 74 octets of content.
+  let limit = 75;
+
+  for (const char of line) {
+    const charBytes = encoder.encode(char).length;
+    if (currentBytes + charBytes > limit) {
+      chunks.push(current);
+      current = '';
+      currentBytes = 0;
+      limit = 74;
+    }
+    current += char;
+    currentBytes += charBytes;
   }
-  return chunks.join('\r\n');
+  if (current.length > 0) chunks.push(current);
+
+  return chunks[0] + chunks.slice(1).map((c) => '\r\n ' + c).join('');
 }
 
 /**
@@ -151,17 +197,16 @@ function buildDateTimeLine(
         pad(next.getUTCDate());
     }
 
-    if (timezone) {
-      return foldLine(`${prop};TZID=${timezone};VALUE=DATE:${dateStr}`);
-    }
-    return `${prop};VALUE=DATE:${dateStr}`;
+    // DATE values are floating local dates; a TZID param is not permitted on
+    // VALUE=DATE per RFC 5545 §3.3.4, so it is intentionally omitted.
+    return foldLine(`${prop};VALUE=DATE:${dateStr}`);
   }
 
   // Has time component.
   if (timezone) {
     return foldLine(`${prop};TZID=${timezone}:${toLocalDateTime(iso)}`);
   }
-  return `${prop}:${toUtcDateTime(iso)}`;
+  return foldLine(`${prop}:${toUtcDateTime(iso)}`);
 }
 
 /**
@@ -181,7 +226,7 @@ function buildVTimezone(timezone: string): string[] {
     'BEGIN:VTIMEZONE',
     foldLine(`TZID:${timezone}`),
     foldLine(`TZURL:https://www.tzurl.org/zoneinfo/${timezone}`),
-    'X-LIC-LOCATION:' + timezone,
+    foldLine(`X-LIC-LOCATION:${timezone}`),
     'END:VTIMEZONE',
   ];
 }
@@ -194,7 +239,10 @@ function buildVTimezone(timezone: string): string[] {
 function buildVEvent(event: IcsEventInput): string[] {
   const stamp = toUtcDateTime(event.created ?? new Date().toISOString());
   const status = event.status ?? 'CONFIRMED';
-  const sequence = event.sequence ?? 0;
+  // Cancelled events must advance SEQUENCE so clients replace the prior
+  // occurrence; ensure at least 1 for cancellations even if caller passes 0.
+  const sequence =
+    status === 'CANCELLED' ? Math.max(event.sequence ?? 0, 1) : event.sequence ?? 0;
 
   return [
     'BEGIN:VEVENT',

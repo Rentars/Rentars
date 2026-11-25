@@ -3,6 +3,7 @@ import type { ServiceResponse } from './index.js';
 import { RESERVING_BOOKING_STATUSES } from '@/utils/bookingStatus.js';
 import { toDay } from '@/utils/availabilityRange.js';
 import { nightsBetween } from './availability.service.js';
+import type { IcsEventInput } from '@/utils/ics.js';
 
 export interface AvailabilityWindow {
   date: string;
@@ -15,6 +16,61 @@ export interface CalendarMonth {
   year: number;
   month: number;
   days: AvailabilityWindow[];
+}
+
+/**
+ * Booking statuses that appear in the calendar feed. Reserving statuses are
+ * exported as confirmed events; cancelled bookings are exported as cancelled
+ * events so clients can remove previously published occurrences.
+ */
+export const CALENDAR_FEED_STATUSES = [
+  ...RESERVING_BOOKING_STATUSES,
+  'cancelled',
+] as const;
+
+/**
+ * Build iCalendar events for a property's bookings.
+ *
+ * Date semantics: stays are half-open [check_in, check_out) on UTC calendar
+ * days, so DTSTART is the check-in day and DTEND is the check-out day
+ * (exclusive), matching the all-day event convention used by `ics.ts`.
+ *
+ * Privacy: exported events intentionally omit tenant name, email, phone and
+ * the property's full street address. Only a generic summary and the stable
+ * booking UID are exposed.
+ */
+export async function getCalendarFeedEvents(
+  propertyId: string,
+): Promise<ServiceResponse<IcsEventInput[]>> {
+  const { data: bookings, error } = await supabase
+    .from('bookings')
+    .select('id, check_in, check_out, status, updated_at')
+    .eq('property_id', propertyId)
+    .in('status', [...CALENDAR_FEED_STATUSES])
+    .order('check_in', { ascending: true });
+
+  if (error) {
+    return { success: false, error: 'Failed to load calendar events' };
+  }
+
+  const events: IcsEventInput[] = (bookings ?? []).map((booking) => {
+    const isCancelled = booking.status === 'cancelled';
+    const startDay = toDay(new Date(booking.check_in));
+    const endDay = toDay(new Date(booking.check_out));
+
+    return {
+      // Stable, unguessable-per-booking identifier so updates replace the
+      // existing occurrence instead of duplicating it.
+      uid: `booking-${booking.id}@stayhub`,
+      startDate: startDay,
+      endDate: endDay,
+      summary: isCancelled ? 'Booking cancelled' : 'Reserved',
+      status: isCancelled ? 'CANCELLED' : 'CONFIRMED',
+      lastModified: booking.updated_at ? new Date(booking.updated_at) : undefined,
+    };
+  });
+
+  return { success: true, data: events };
 }
 
 /**

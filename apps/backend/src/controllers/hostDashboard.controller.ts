@@ -43,6 +43,8 @@ export async function listHostProperties(req: AuthRequest, res: Response): Promi
 
   const page = req.query.page ? Number(req.query.page) : 1;
   const limit = req.query.limit ? Number(req.query.limit) : 20;
+  const status = typeof req.query.status === 'string' ? req.query.status : '';
+  const search = typeof req.query.q === 'string' ? req.query.q : '';
 
   if (Number.isNaN(page) || page < 1) {
     res.status(422).json({ error: 'page must be a positive integer' });
@@ -53,7 +55,7 @@ export async function listHostProperties(req: AuthRequest, res: Response): Promi
     return;
   }
 
-  const result = await getHostProperties(hostId, page, limit);
+  const result = await getHostProperties(hostId, page, limit, status, search);
   if (!result.success) {
     res.status(400).json({ error: result.error });
     return;

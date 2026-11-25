@@ -41,7 +41,7 @@ import { tracingMiddleware } from './middleware/tracing.middleware.js';
 // ── Core middleware ───────────────────────────────────────────────────────────
 import { rateLimiter } from './middleware/rateLimiter.js';
 import { sessionRevocationGuard } from './middleware/sessionRevocation.middleware.js';
-import { parseTrustProxy } from './utils/trustProxy.js';
+import { resolveTrustProxy } from './utils/trustProxy.js';
 import { timeoutMiddleware } from './middleware/timeout.middleware.js';
 
 // ── Routes & services ─────────────────────────────────────────────────────────
@@ -55,7 +55,7 @@ import { startProbeScheduler, stopProbeScheduler } from './services/probe-schedu
 
 // ── Validate blockchain config early (before the server binds) ────────────────
 const configErrors = validateBlockchainConfig();
-if (configErrors.length > 0) {
+if (process.env.NODE_ENV !== 'test' && configErrors.length > 0) {
   const errorDetails = configErrors
     .map((err) => `  - ${err.field}: ${err.message}`)
     .join('\n');
@@ -70,7 +70,7 @@ if (configErrors.length > 0) {
 
 // ── Validate contract registry (IDs, ABI versions, WASM hashes) ──────────────
 const registryErrors = validateContractRegistry();
-if (registryErrors.length > 0) {
+if (process.env.NODE_ENV !== 'test' && registryErrors.length > 0) {
   const errorDetails = registryErrors
     .map((err) => `  - ${err.contract}.${err.field}: ${err.message}`)
     .join('\n');
@@ -86,8 +86,12 @@ if (registryErrors.length > 0) {
 export const app = express();
 
 // Resolve req.ip from X-Forwarded-For only for the hops in TRUST_PROXY. Without
-// this, every client behind a reverse proxy shares one rate-limit bucket.
-app.set('trust proxy', parseTrustProxy(process.env.TRUST_PROXY));
+// this, every client behind a reverse proxy shares one rate-limit bucket; with
+// an over-permissive value, clients can spoof their IP and evade rate limits.
+// resolveTrustProxy validates the configured hop count against the deployment
+// topology and fails fast on unsafe values. It must run before any middleware
+// that reads req.ip (notably the rate limiter below).
+app.set('trust proxy', resolveTrustProxy(process.env.TRUST_PROXY));
 
 // ── 1. Security headers (must be first — applies to every response) ───────────
 app.use(securityMiddleware);
@@ -115,7 +119,7 @@ app.use(csrfTokenMiddleware);
 // ── 7. CSRF token validation (for state-changing requests) ────────────────────
 app.use(csrfMiddleware);
 
-// ── 8. Rate limiting ──────────────────────────────────────────────────────────
+// ── 8. Rate limiting (mounted after trust proxy so req.ip is trustworthy) ─────
 app.use(rateLimiter);
 
 // ── 8b. Session revocation guard (rejects tokens issued before a password reset / logout-all) ──
@@ -225,13 +229,15 @@ async function startServer(): Promise<void> {
   });
 }
 
-startServer().catch((error) => {
-  structuredLog({
-    level: 'error',
-    message: 'Fatal startup error',
-    timestamp: new Date().toISOString(),
-    error: error instanceof Error ? error.message : String(error),
-    stack: error instanceof Error ? error.stack : undefined,
+if (process.env.NODE_ENV !== 'test') {
+  startServer().catch((error) => {
+    structuredLog({
+      level: 'error',
+      message: 'Fatal startup error',
+      timestamp: new Date().toISOString(),
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+    process.exit(1);
   });
-  process.exit(1);
-});
+}

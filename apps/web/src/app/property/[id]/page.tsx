@@ -14,9 +14,21 @@
  */
 
 import type { Metadata } from 'next';
-import { redirect } from 'next/navigation';
+import { notFound, redirect } from 'next/navigation';
 import PropertyDetail from '@/components/features/properties/PropertyDetail';
 import type { Property } from '@/types/property';
+
+/**
+ * Responsive contract for the property detail page (see docs/design-system/responsive.md):
+ *   narrow  < 640px   — single column; gallery → calendar → summary stacked; booking CTA
+ *                       sticky at the bottom of the viewport; secondary summaries
+ *                       (booking summary, map, filters) collapsed into disclosures.
+ *   medium  640–1024px — two columns; gallery full width, calendar + summary side by side.
+ *   wide    > 1024px  — three columns; gallery, calendar and sticky summary rail.
+ *
+ * The page shell below enforces `overflow-x-hidden` and `min-w-0` so no child can
+ * introduce horizontal scrolling at narrow widths.
+ */
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
 
@@ -109,8 +121,13 @@ export async function generateMetadata({
   const property = await resolveProperty(params.id);
   const siteUrl  = getSiteUrl();
 
+  // Draft or deleted properties must not be indexed at all.
+  if (!property || property.status === 'draft' || property.status === 'deleted') {
+    return { title: 'Property — Rentars' };
+  }
+
   // Canonical URL always uses the slug when available
-  const canonicalSlug = property?.slug ?? params.id;
+  const canonicalSlug = property.slug ?? params.id;
   const canonicalUrl  = `${siteUrl}/property/${canonicalSlug}`;
 
   const title = property
@@ -157,8 +174,8 @@ export default async function PropertyPage({
 }) {
   const property = await resolveProperty(params.id);
 
-  if (!property) {
-    return <div className="p-8 text-center">Property not found</div>;
+  if (!property || property.status === 'draft' || property.status === 'deleted') {
+    notFound();
   }
 
   const siteUrl = getSiteUrl();
@@ -181,6 +198,16 @@ export default async function PropertyPage({
 
   const reviewCount = property.review_count ?? property.reviews?.length ?? 0;
 
+  // Private listings must not expose street address to crawlers.
+  const addressBlock = property.status === 'private'
+    ? {}
+    : {
+        '@type':          'PostalAddress',
+        streetAddress:    property.address,
+        addressLocality:  property.city || property.location,
+        addressCountry:   property.country,
+      };
+
   const ldJsonLd: Record<string, unknown> = {
     '@context': 'https://schema.org',
     '@type':    'LodgingBusiness',
@@ -190,16 +217,20 @@ export default async function PropertyPage({
     url:         canonicalUrl,
     address: {
       '@type':          'PostalAddress',
-      streetAddress:    property.address,
+      // Street-level addresses are private: metadata is public HTML and is
+      // cached by crawlers, so only city/country may be published.
       addressLocality:  property.city || property.location,
       addressCountry:   property.country,
     },
-    ...(typeof property.latitude === 'number' && typeof property.longitude === 'number'
+    // #936: never publish exact coordinates in HTML metadata. Only the
+    // approved approximation from the public API may be emitted.
+    ...(typeof (property as Record<string, unknown>).approximate_latitude === 'number' &&
+    typeof (property as Record<string, unknown>).approximate_longitude === 'number'
       ? {
           geo: {
             '@type':    'GeoCoordinates',
-            latitude:   property.latitude,
-            longitude:  property.longitude,
+            latitude:   (property as Record<string, unknown>).approximate_latitude,
+            longitude:  (property as Record<string, unknown>).approximate_longitude,
           },
         }
       : {}),
@@ -230,13 +261,21 @@ export default async function PropertyPage({
   };
 
   return (
-    <>
+    <div className="w-full min-w-0 overflow-x-hidden">
       <script
         type="application/ld+json"
         // eslint-disable-next-line react/no-danger
         dangerouslySetInnerHTML={{ __html: JSON.stringify(ldJsonLd) }}
       />
+      {/*
+        PropertyDetail owns the responsive layout:
+          - narrow:  stacked gallery/calendar/summary, sticky booking CTA,
+                     secondary summaries inside ResponsiveDisclosure.
+          - medium:  two-column grid.
+          - wide:    three-column grid with a sticky summary rail.
+        It must never exceed the viewport width (no horizontal scrolling).
+      */}
       <PropertyDetail property={property} />
-    </>
+    </div>
   );
 }

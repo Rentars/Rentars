@@ -4,12 +4,6 @@ import { useId, useState } from 'react';
 import { ChevronDown } from 'lucide-react';
 import type { PriceHistogramResult } from '@/types/search';
 
-interface FilterSidebarProps {
-  onFilterChange: (filters: FilterState) => void;
-  /** Histogram data returned by the search API for the current context. */
-  histogram?: PriceHistogramResult | null;
-}
-
 export interface FilterState {
   priceMin: number;
   priceMax: number;
@@ -28,6 +22,8 @@ export interface FilterState {
 interface FilterSidebarProps {
   filters?: Partial<FilterState>;
   onFilterChange: (filters: FilterState) => void;
+  /** Histogram data returned by the search API for the current context. */
+  histogram?: PriceHistogramResult | null;
 }
 
 const AMENITIES = [
@@ -89,19 +85,24 @@ function PriceHistogramBars({
 
 // ─── Main component ───────────────────────────────────────────────────────────
 
-export default function FilterSidebar({ onFilterChange, histogram }: FilterSidebarProps) {
+const DEFAULT_FILTERS: FilterState = {
+  priceMin: 0,
+  priceMax: 1000,
+  amenities: [],
+  guests: 1,
+  propertyType: '',
+  bedrooms: undefined,
+  minBathrooms: undefined,
+  sortBy: 'newest',
+};
+
+export default function FilterSidebar({ onFilterChange, histogram, filters: filtersProp }: FilterSidebarProps) {
   const id = useId();
 
-  const [filters, setFilters] = useState<FilterState>({
-    priceMin: 0,
-    priceMax: 1000,
-    amenities: [],
-    guests: 1,
-    propertyType: '',
-    bedrooms: undefined,
-    minBathrooms: undefined,
-    sortBy: 'newest',
-  });
+  const [filters, setFilters] = useState<FilterState>(() => ({
+    ...DEFAULT_FILTERS,
+    ...filtersProp,
+  }));
 
   const [expandedSections, setExpandedSections] = useState({
     sort: true,
@@ -146,8 +147,25 @@ export default function FilterSidebar({ onFilterChange, histogram }: FilterSideb
     );
   }
 
+  const reset = () => {
+    setFilters(DEFAULT_FILTERS);
+    onFilterChange(DEFAULT_FILTERS);
+  };
+
   return (
     <div className="bg-white dark:bg-gray-900 rounded-lg border border-gray-200 dark:border-gray-700 p-5 space-y-5 h-fit sticky top-8">
+
+      {/* Reset ---------------------------------------------------------------- */}
+      <div className="flex justify-end">
+        <button
+          type="button"
+          onClick={reset}
+          className="text-xs text-blue-600 dark:text-blue-400 hover:underline
+            focus:outline-none focus-visible:ring-2 focus-visible:ring-ring rounded"
+        >
+          Reset all filters
+        </button>
+      </div>
 
       {/* Sort ---------------------------------------------------------------- */}
       <section>

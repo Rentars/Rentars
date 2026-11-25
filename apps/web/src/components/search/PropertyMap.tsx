@@ -54,7 +54,6 @@ export default function PropertyMap({
 }: PropertyMapProps) {
   const [center, setCenter] = useState<[number, number]>([40.7128, -74.006]);
   const [mapKey, setMapKey] = useState(0);
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Focus request forwarded to the results list when a keyboard user
   // activates a pin (nonce changes → the list item receives DOM focus).
@@ -114,9 +113,9 @@ export default function PropertyMap({
   }, [validProperties]);
 
   const handleBoundsChanged = (bounds: LatLngBounds) => {
-    if (!onBoundsChanged) return;
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => onBoundsChanged(bounds), 350);
+    // One debounce (BoundsListener) keeps map markers and list results tied
+    // to the same, latest query — no second timer with stale bounds.
+    onBoundsChanged?.(bounds);
   };
 
   return (

@@ -20,6 +20,7 @@
 import { describe, it, expect, beforeEach, beforeAll, mock } from 'bun:test';
 import request from 'supertest';
 import jwt from 'jsonwebtoken';
+import { Clock } from '@/utils/clock.js';
 
 // ── Environment (must be set before any local imports) ────────────────────────
 beforeAll(() => {
@@ -34,7 +35,7 @@ beforeAll(() => {
 
 // ── Test data (isolated per test run context) ─────────────────────────────────
 
-const TEST_RUN_ID = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+const TEST_RUN_ID = Clock.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
 const OWNER_ID    = 'e2e-owner-' + TEST_RUN_ID;
 const TENANT_ID   = 'e2e-tenant-' + TEST_RUN_ID;
@@ -144,10 +145,10 @@ function setupSupabaseMock() {
             guest_count: row.guest_count ?? 1,
             status: 'Pending',
             escrow_id: ESCROW_ID,
-            rules_acknowledged_at: row.rules_acknowledged_at ?? new Date().toISOString(),
+            rules_acknowledged_at: row.rules_acknowledged_at ?? Clock.date().toISOString(),
             on_chain_id: null,
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
+            created_at: Clock.date().toISOString(),
+            updated_at: Clock.date().toISOString(),
           };
           bookingDB.set(BOOKING_ID, newRow);
           return {

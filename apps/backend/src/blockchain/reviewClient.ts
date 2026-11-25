@@ -9,6 +9,7 @@
 
 import {
   Contract,
+  Keypair,
   Networks,
   rpc,
   TransactionBuilder,
@@ -16,7 +17,14 @@ import {
   scValToNative,
   xdr,
 } from '@stellar/stellar-sdk';
-import type { Review, SubmitReviewParams } from './types.js';
+import type {
+  Review,
+  ReviewCommitment,
+  SubmitReviewCommitmentParams,
+  SubmitReviewCommitmentResult,
+  SubmitReviewParams,
+  TransactionConfirmation,
+} from './types.js';
 
 // ─── ABI metadata (sourced from review_abi.json) ─────────────────────────────
 const ABI_VERSION = '0.1.0';
@@ -91,6 +99,29 @@ export class ReviewClient {
     return BigInt(scValToNative(result) as number | string);
   }
 
+  /**
+   * Look up an on-chain review reference by its commitment hash.
+   *
+   * ABI: get_review_by_commitment(commitment: BytesN<32>) -> Option<ReviewCommitment>
+   *
+   * Returns `null` when no review has been anchored for the given commitment.
+   * Only the commitment and non-sensitive identifiers are ever stored on-chain;
+   * the raw review content is never published.
+   */
+  async getReviewByCommitment(commitment: string): Promise<ReviewCommitment | null> {
+    const commitmentBytes = this.parseCommitment(commitment);
+    const result = await this.simulateReadOnly('get_review_by_commitment', [
+      nativeToScVal(commitmentBytes, { type: 'bytes' }),
+    ]);
+
+    const native = scValToNative(result);
+    if (native === null || native === undefined) {
+      return null;
+    }
+
+    return native as ReviewCommitment;
+  }
+
   // ── State-changing operations ─────────────────────────────────────────────
 
   /**
@@ -121,7 +152,132 @@ export class ReviewClient {
     );
   }
 
+  /**
+   * Build the XDR operation for submit_review_commitment.
+   *
+   * ABI: submit_review_commitment(
+   *   reviewer: Address,
+   *   commitment: BytesN<32>,
+   *   booking_id: String,
+   *   property_id: String,
+   *   nonce: BytesN<32>,
+   * ) -> u64
+   *
+   * Only the privacy-safe commitment and non-sensitive identifiers are passed
+   * to the contract. Raw review text, ratings and personal data must never be
+   * included here.
+   */
+  buildSubmitReviewCommitment(
+    params: SubmitReviewCommitmentParams,
+  ): xdr.Operation {
+    return this.contract.call(
+      'submit_review_commitment',
+      nativeToScVal(params.reviewer, { type: 'address' }),
+      nativeToScVal(this.parseCommitment(params.commitment), { type: 'bytes' }),
+      nativeToScVal(params.bookingId, { type: 'string' }),
+      nativeToScVal(params.propertyId, { type: 'string' }),
+      nativeToScVal(this.parseCommitment(params.nonce), { type: 'bytes' }),
+    );
+  }
+
+  /**
+   * Submit a review commitment on-chain and wait for confirmation.
+   *
+   * The caller supplies a signed transaction envelope (built from
+   * `buildSubmitReviewCommitment`) so that signing stays with the reviewer's
+   * keypair. Returns the transaction hash, ledger and confirmation status.
+   *
+   * A failed or pending transaction is reported as such; it never implies the
+   * off-chain review is verified.
+   */
+  async submitReviewCommitment(
+    params: SubmitReviewCommitmentParams,
+    signedEnvelopeXdr: string,
+  ): Promise<SubmitReviewCommitmentResult> {
+    const envelope = TransactionBuilder.fromXDR(
+      signedEnvelopeXdr,
+      this.networkPassphrase,
+    );
+
+    const sendResponse = await this.server.sendTransaction(envelope);
+    const txHash = sendResponse.hash;
+
+    if (sendResponse.status === 'ERROR') {
+      return {
+        txHash,
+        ledger: null,
+        status: 'failed',
+        commitment: params.commitment,
+      };
+    }
+
+    const confirmation = await this.waitForConfirmation(txHash);
+
+    return {
+      txHash,
+      ledger: confirmation.ledger,
+      status: confirmation.status,
+      commitment: params.commitment,
+    };
+  }
+
+  /**
+   * Poll the RPC until the transaction is confirmed (SUCCESS), fails
+   * (FAILED) or the polling budget is exhausted (NOT_FOUND).
+   *
+   * Pending transactions are never treated as confirmed.
+   */
+  async waitForConfirmation(
+    txHash: string,
+    options: { attempts?: number; intervalMs?: number } = {},
+  ): Promise<TransactionConfirmation> {
+    const attempts = options.attempts ?? 20;
+    const intervalMs = options.intervalMs ?? 1_500;
+
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      const response = await this.server.getTransaction(txHash);
+
+      if (response.status === rpc.Api.GetTransactionStatus.SUCCESS) {
+        return {
+          txHash,
+          ledger: response.ledger,
+          status: 'confirmed',
+        };
+      }
+
+      if (response.status === rpc.Api.GetTransactionStatus.FAILED) {
+        return {
+          txHash,
+          ledger: response.ledger ?? null,
+          status: 'failed',
+        };
+      }
+
+      if (attempt < attempts - 1) {
+        await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      }
+    }
+
+    return { txHash, ledger: null, status: 'pending' };
+  }
+
   // ── Internal helpers ──────────────────────────────────────────────────────
+
+  /**
+   * Normalise a hex commitment/nonce string into raw bytes.
+   *
+   * Accepts an optional `0x` prefix and requires exactly 32 bytes so that the
+   * value maps to the contract's BytesN<32> type.
+   */
+  private parseCommitment(value: string): Buffer {
+    const hex = value.startsWith('0x') ? value.slice(2) : value;
+    if (!/^[0-9a-fA-F]{64}$/.test(hex)) {
+      throw new RangeError(
+        'Commitment and nonce must be 32-byte hex strings (64 hex characters)',
+      );
+    }
+    return Buffer.from(hex, 'hex');
+  }
 
   /**
    * Simulate a read-only contract call and return the result ScVal.

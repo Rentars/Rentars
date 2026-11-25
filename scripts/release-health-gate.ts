@@ -26,6 +26,18 @@
  * recovery rule must be at or below its recovery threshold for its recovery
  * windows, and no gate may be breached. The snapshot does not record which gate
  * paused the rollout, so the check applies to all of them.
+ *
+ * Deployment smoke checks (#125):
+ *   bun run scripts/release-health-gate.ts --smoke <smoke.json>
+ *     [--metrics <snapshot.json>] [--policy <file>] [--mode evaluate|resume]
+ *
+ * Smoke checks verify API readiness, frontend availability, database
+ * compatibility and payment configuration. They are environment-safe: they only
+ * perform read-only requests and never create bookings or move funds. A failed
+ * required smoke check blocks promotion (exit 10) or, when the check is marked
+ * as a rollback trigger, requests rollback (exit 20). The combined report links
+ * the release version, migration state and health results for the deployment
+ * record.
  */
 
 import { createHash } from 'node:crypto';
@@ -35,6 +47,34 @@ import { resolve } from 'node:path';
 export type GateAction = 'pause' | 'rollback';
 export type Decision = 'proceed' | 'pause' | 'rollback';
 export type Mode = 'evaluate' | 'resume';
+
+export type SmokeCheckName =
+  | 'api_readiness'
+  | 'frontend_availability'
+  | 'database_compatibility'
+  | 'payment_configuration';
+
+export type SmokeStatus = 'ok' | 'failed' | 'skipped';
+
+export interface SmokeCheck {
+  name: SmokeCheckName;
+  status: SmokeStatus;
+  required: boolean;
+  action: GateAction;
+  detail: string;
+}
+
+export interface SmokeReport {
+  environment: string;
+  version: string;
+  migration_state: string;
+  checks: SmokeCheck[];
+}
+
+export interface SmokeEvaluation {
+  decision: Decision;
+  checks: SmokeCheck[];
+}
 
 export interface Recovery {
   threshold: number;
@@ -213,40 +253,157 @@ export function evaluateMode(policy: Policy, snapshot: Snapshot, mode: Mode): Ev
   return mode === 'resume' ? evaluateResume(policy, snapshot) : evaluate(policy, snapshot);
 }
 
-function parseArgs(argv: string[]): { metrics: string; policy: string; mode: Mode } {
+const SMOKE_CHECK_NAMES: readonly SmokeCheckName[] = [
+  'api_readiness',
+  'frontend_availability',
+  'database_compatibility',
+  'payment_configuration',
+];
+
+/**
+ * Parses a smoke-check report. Every documented check must be present exactly
+ * once so a missing check cannot silently pass the gate.
+ */
+export function parseSmokeReport(raw: unknown): SmokeReport {
+  if (!isRecord(raw)) fail('smoke report must be a JSON object');
+  const { environment, version, migration_state, checks } = raw;
+  if (typeof environment !== 'string' || environment === '')
+    fail('smoke report environment must be a non-empty string');
+  if (typeof version !== 'string' || version === '')
+    fail('smoke report version must be a non-empty string');
+  if (typeof migration_state !== 'string' || migration_state === '')
+    fail('smoke report migration_state must be a non-empty string');
+  if (!Array.isArray(checks)) fail('smoke report checks must be an array');
+
+  const parsed = checks.map((entry, index): SmokeCheck => {
+    if (!isRecord(entry)) fail(`checks[${index}] must be an object`);
+    const { name, status, required, action, detail } = entry;
+    if (!SMOKE_CHECK_NAMES.includes(name as SmokeCheckName)) {
+      fail(`checks[${index}].name must be one of ${SMOKE_CHECK_NAMES.join(', ')}`);
+    }
+    if (status !== 'ok' && status !== 'failed' && status !== 'skipped') {
+      fail(`check ${String(name)} status must be "ok", "failed" or "skipped"`);
+    }
+    if (typeof required !== 'boolean') fail(`check ${String(name)} required must be a boolean`);
+    if (action !== 'pause' && action !== 'rollback') {
+      fail(`check ${String(name)} action must be "pause" or "rollback"`);
+    }
+    if (typeof detail !== 'string') fail(`check ${String(name)} detail must be a string`);
+    return {
+      name: name as SmokeCheckName,
+      status,
+      required,
+      action,
+      detail,
+    };
+  });
+
+  const seen = new Set<SmokeCheckName>();
+  for (const check of parsed) {
+    if (seen.has(check.name)) fail(`smoke report contains duplicate check ${check.name}`);
+    seen.add(check.name);
+  }
+  for (const name of SMOKE_CHECK_NAMES) {
+    if (!seen.has(name)) fail(`smoke report is missing required check ${name}`);
+  }
+
+  return { environment, version, migration_state, checks: parsed };
+}
+
+/**
+ * Evaluates smoke checks. A failed required check blocks promotion; a failed
+ * required check whose action is "rollback" requests rollback. Skipped required
+ * checks fail closed to pause. Optional checks never block.
+ */
+export function evaluateSmoke(report: SmokeReport): SmokeEvaluation {
+  const blocking = report.checks.filter(
+    (check) => check.required && (check.status === 'failed' || check.status === 'skipped')
+  );
+
+  let decision: Decision = 'proceed';
+  if (blocking.some((check) => check.status === 'failed' && check.action === 'rollback')) {
+    decision = 'rollback';
+  } else if (blocking.length > 0) {
+    decision = 'pause';
+  }
+
+  return { decision, checks: report.checks };
+}
+
+/**
+ * Combines the metrics evaluation with the smoke evaluation. The most severe
+ * decision wins (rollback > pause > proceed).
+ */
+export function combineDecisions(...decisions: Decision[]): Decision {
+  if (decisions.includes('rollback')) return 'rollback';
+  if (decisions.includes('pause')) return 'pause';
+  return 'proceed';
+}
+
+function parseArgs(argv: string[]): {
+  metrics: string | undefined;
+  smoke: string | undefined;
+  policy: string;
+  mode: Mode;
+} {
   const value = (flag: string): string | undefined => {
     const index = argv.indexOf(flag);
     return index >= 0 ? argv[index + 1] : undefined;
   };
 
   const metrics = value('--metrics');
-  if (!metrics) fail('--metrics <snapshot.json> is required');
+  const smoke = value('--smoke');
+  if (!metrics && !smoke) fail('--metrics <snapshot.json> or --smoke <smoke.json> is required');
 
   const mode = value('--mode') ?? 'evaluate';
   if (mode !== 'evaluate' && mode !== 'resume') fail('--mode must be "evaluate" or "resume"');
 
   const defaultPolicy = resolve(import.meta.dir, '../docs/releases/health-gates.json');
-  return { metrics, policy: value('--policy') ?? defaultPolicy, mode };
+  return { metrics, smoke, policy: value('--policy') ?? defaultPolicy, mode };
 }
 
 function main(): number {
-  const { metrics, policy: policyPath, mode } = parseArgs(process.argv.slice(2));
+  const { metrics, smoke, policy: policyPath, mode } = parseArgs(process.argv.slice(2));
 
   const policyText = readFileSync(policyPath, 'utf-8');
   const policy = parsePolicy(JSON.parse(policyText));
-  const snapshot = parseSnapshot(JSON.parse(readFileSync(metrics, 'utf-8')));
-  const result = evaluateMode(policy, snapshot, mode);
+
+  const decisions: Decision[] = [];
+  let metricsResult: Evaluation | undefined;
+  if (metrics) {
+    const snapshot = parseSnapshot(JSON.parse(readFileSync(metrics, 'utf-8')));
+    metricsResult = evaluateMode(policy, snapshot, mode);
+    decisions.push(metricsResult.decision);
+  }
+
+  let smokeReport: SmokeReport | undefined;
+  let smokeResult: SmokeEvaluation | undefined;
+  if (smoke) {
+    smokeReport = parseSmokeReport(JSON.parse(readFileSync(smoke, 'utf-8')));
+    smokeResult = evaluateSmoke(smokeReport);
+    decisions.push(smokeResult.decision);
+  }
+
+  const decision = combineDecisions(...decisions);
 
   const report = {
     mode,
-    decision: result.decision,
+    decision,
     policy_version: policy.policy_version,
     policy_sha256: createHash('sha256').update(policyText).digest('hex'),
     evaluated_at: new Date().toISOString(),
-    gates: result.gates,
+    release: smokeReport
+      ? {
+          environment: smokeReport.environment,
+          version: smokeReport.version,
+          migration_state: smokeReport.migration_state,
+        }
+      : null,
+    gates: metricsResult?.gates ?? [],
+    smoke_checks: smokeResult?.checks ?? [],
   };
   console.log(JSON.stringify(report, null, 2));
-  return EXIT_CODES[result.decision];
+  return EXIT_CODES[decision];
 }
 
 if (import.meta.main) {

@@ -109,6 +109,74 @@ jobs:
         # Per-finding suppression configured in .cargo/audit.toml
         run: cargo audit --config .cargo/audit.toml
 
+  # ─── Log-output credential scan ─────────────────────────────────────────────
+  # Runs the backend unit tests, captures stdout, and greps for credential-
+  # shaped patterns.  A match means redaction is not working at the emission
+  # point — the step fails and blocks the PR.
+  #
+  # Patterns checked (matches docs/LOG_RETENTION_POLICY.md §5.2):
+  #   - JWTs (three base64url segments)
+  #   - Bearer tokens
+  #   - Stellar secret keys (S + 55 uppercase alphanumeric chars)
+  #   - 64-char hex strings (high-entropy secrets / API keys)
+  #
+  # False-positive suppression: the Supabase demo JWTs used in test env vars
+  # are excluded via the grep -v pipeline so they do not trigger a false alarm.
+  log-credential-scan:
+    name: Log Output Credential Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.1.38'
+
+      - name: Install backend dependencies (frozen)
+        working-directory: apps/backend
+        run: bun install --frozen-lockfile
+
+      - name: Run unit tests and capture output
+        working-directory: apps/backend
+        env:
+          NODE_ENV: test
+          SUPABASE_URL: http://localhost:54321
+          SUPABASE_SERVICE_ROLE_KEY: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0.EGIM96RAZx35lJzdJsyH-qQwv8Hdp7fsn3W0YpN81IU
+          JWT_SECRET: test_jwt_secret_min_32_chars_long
+          PREF_TOKEN_SECRET: test_pref_token_secret_min_32_chars
+          FRONTEND_URL: https://rentars.app
+          CORS_ORIGIN: http://localhost:3001
+          STELLAR_NETWORK: testnet
+        # Tee output to file so both the terminal and the scan step see it
+        run: bun run test:unit 2>&1 | tee /tmp/unit-test-output.txt; exit "${PIPESTATUS[0]}"
+
+      - name: Scan test output for accidental credential logging
+        # Exclude the known Supabase demo JWTs injected as test env vars above.
+        # Any other JWT, Bearer token, Stellar secret, or 64-char hex in the
+        # test output indicates a redaction gap.
+        run: |
+          DEMO_SRK="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0"
+          DEMO_ANON="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9"
+
+          if grep -E \
+            'eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|Bearer [A-Za-z0-9\-._~+/]+=*|S[A-Z2-7]{55}' \
+            /tmp/unit-test-output.txt \
+            | grep -v "$DEMO_SRK" \
+            | grep -v "$DEMO_ANON" \
+            | grep -qv 'JWT_REDACTED\|TOKEN_REDACTED\|STELLAR_SECRET_REDACTED\|HEX_SECRET_REDACTED'; then
+            echo "::error::Potential credential found in test log output. A log call is bypassing redaction — review src/utils/redact.ts and the failing test."
+            grep -E \
+              'eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|Bearer [A-Za-z0-9\-._~+/]+=*|S[A-Z2-7]{55}' \
+              /tmp/unit-test-output.txt \
+              | grep -v "$DEMO_SRK" \
+              | grep -v "$DEMO_ANON" \
+              | grep -v 'JWT_REDACTED\|TOKEN_REDACTED\|STELLAR_SECRET_REDACTED\|HEX_SECRET_REDACTED' \
+              | head -10
+            exit 1
+          fi
+          echo "Log credential scan passed — no unredacted credentials detected in test output."
+
   # ─── Container image scan ────────────────────────────────────────────────────
   container-scan:
     name: Container Image Scan (trivy)

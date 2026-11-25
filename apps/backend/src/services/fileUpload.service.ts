@@ -1,5 +1,6 @@
 import sharp from 'sharp';
 import { structuredLog } from '@/middleware/logging.middleware.js';
+import { IMAGE_LIMITS } from './imageValidation.js';
 
 export interface FileValidationOptions {
   maxSizeBytes: number;
@@ -109,8 +110,10 @@ export async function validateImage(
 }
 
 export async function normalizeImage(buffer: Buffer, format: 'jpeg' | 'png' | 'webp' = 'webp'): Promise<Buffer> {
-  return sharp(buffer)
-    .withMetadata() // Preserve orientation
+  // Re-encode without withMetadata(): EXIF/GPS/XMP (and any injected payload)
+  // must never survive normalisation. rotate() preserves visual orientation.
+  return sharp(buffer, { limitInputPixels: IMAGE_LIMITS.maxPixels })
+    .rotate()
     .toFormat(format, { quality: 85, progressive: true })
     .toBuffer();
 }
@@ -122,7 +125,7 @@ export async function generateImageDerivatives(
   small: Buffer;
   medium: Buffer;
 }> {
-  const base = sharp(buffer).withMetadata();
+  const base = sharp(buffer, { limitInputPixels: IMAGE_LIMITS.maxPixels }).rotate();
 
   const [thumbnail, small, medium] = await Promise.all([
     base

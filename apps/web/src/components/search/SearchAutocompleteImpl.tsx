@@ -18,6 +18,9 @@ export default function SearchAutocomplete({
     suggestions,
     isOpen,
     activeIndex,
+    isLoading,
+    error,
+    lastResultQuery,
     listId,
     inputRef,
     listRef,
@@ -27,6 +30,21 @@ export default function SearchAutocomplete({
     openSuggestions,
     closeSuggestions,
   } = useSearchAutocomplete({ onSearch });
+
+  const hasNoResults =
+    !isLoading &&
+    !error &&
+    input.trim().length >= 2 &&
+    lastResultQuery === input.trim() &&
+    suggestions.length === 0;
+
+  const statusMessage = isLoading
+    ? 'Loading suggestions'
+    : error
+      ? error
+      : hasNoResults
+        ? 'No suggestions found'
+        : '';
 
   return (
     <div className="relative w-full">
@@ -47,6 +65,7 @@ export default function SearchAutocomplete({
           ref={inputRef}
           type="text"
           role="combobox"
+          aria-label={placeholder}
           aria-autocomplete="list"
           aria-expanded={isOpen}
           aria-controls={isOpen ? listId : undefined}
@@ -66,6 +85,15 @@ export default function SearchAutocomplete({
         />
       </form>
 
+      <div role="status" aria-live="polite" aria-atomic="true" className="sr-only">
+        {statusMessage}
+      </div>
+      {error && (
+        <p role="alert" className="mt-1 text-sm text-destructive">
+          {error} Try a different search.
+        </p>
+      )}
+
       {isOpen && (
         <ul
           id={listId}
@@ -84,6 +112,7 @@ export default function SearchAutocomplete({
             >
               <button
                 type="button"
+                onMouseDown={(e) => e.preventDefault()}
                 onClick={() => handleSelectSuggestion(suggestion)}
                 className={[
                   'w-full text-left px-4 py-2 text-sm flex items-center gap-2 transition-colors',

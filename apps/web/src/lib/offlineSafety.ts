@@ -132,3 +132,110 @@ export function getCacheAge(metadata: OfflineCacheMetadata): number {
 export function isCacheStale(metadata: OfflineCacheMetadata, ttlMs: number): boolean {
   return getCacheAge(metadata) > ttlMs;
 }
+
+// ─── Booking draft persistence ────────────────────────────────────────────────
+
+/**
+ * Fields that may be preserved as a local draft while the user is offline or
+ * between sessions.  Payment data is intentionally excluded — card numbers,
+ * wallet private keys, and XDR transactions must never be stored in localStorage.
+ */
+export interface BookingDraft {
+  /** Storage key that also acts as an idempotency key once the user submits. */
+  idempotencyKey: string;
+  propertyId: string;
+  checkIn: string;   // ISO date string YYYY-MM-DD
+  checkOut: string;  // ISO date string YYYY-MM-DD
+  guestCount: number;
+  /** Unix ms when this draft was last saved. Used to detect staleness. */
+  savedAt: number;
+}
+
+/** localStorage key prefix. The property ID is appended to scope drafts per listing. */
+const DRAFT_KEY_PREFIX = 'rntr_booking_draft_';
+
+/** Drafts older than 24 hours are considered stale and are discarded on load. */
+const DRAFT_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Persist a booking draft to localStorage.
+ * Never call this with any payment or wallet data.
+ */
+export function saveDraft(draft: BookingDraft): void {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    localStorage.setItem(`${DRAFT_KEY_PREFIX}${draft.propertyId}`, JSON.stringify(draft));
+  } catch {
+    // localStorage quota exceeded — silently ignore; the draft is advisory only.
+  }
+}
+
+/**
+ * Load the most recent draft for a given property.
+ * Returns null if no draft exists or if it has exceeded DRAFT_TTL_MS.
+ * Automatically removes an expired draft so it does not accumulate.
+ */
+export function loadDraft(propertyId: string): BookingDraft | null {
+  if (typeof localStorage === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem(`${DRAFT_KEY_PREFIX}${propertyId}`);
+    if (!raw) return null;
+    const draft = JSON.parse(raw) as BookingDraft;
+    if (Date.now() - draft.savedAt > DRAFT_TTL_MS) {
+      localStorage.removeItem(`${DRAFT_KEY_PREFIX}${propertyId}`);
+      return null;
+    }
+    return draft;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Remove the draft for a property — call this after a successful submission
+ * or when the user explicitly clears the form.
+ */
+export function clearDraft(propertyId: string): void {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    localStorage.removeItem(`${DRAFT_KEY_PREFIX}${propertyId}`);
+  } catch {
+    // ignore
+  }
+}
+
+// ─── Stale-data marker ────────────────────────────────────────────────────────
+
+/**
+ * Mark cached availability / pricing data as stale so components that render
+ * it can show an appropriate warning.  Uses sessionStorage so it clears on tab
+ * close but persists across a disconnect/reconnect within the same session.
+ */
+const STALE_MARKER_KEY = 'rntr_data_stale';
+
+export function markCachedDataStale(): void {
+  if (typeof sessionStorage === 'undefined') return;
+  try {
+    sessionStorage.setItem(STALE_MARKER_KEY, String(Date.now()));
+  } catch {
+    // ignore
+  }
+}
+
+export function clearStaleMarker(): void {
+  if (typeof sessionStorage === 'undefined') return;
+  try {
+    sessionStorage.removeItem(STALE_MARKER_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+export function isCachedDataStale(): boolean {
+  if (typeof sessionStorage === 'undefined') return false;
+  try {
+    return sessionStorage.getItem(STALE_MARKER_KEY) !== null;
+  } catch {
+    return false;
+  }
+}

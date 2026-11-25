@@ -1,0 +1,58 @@
+{
+  "$schema": "https://raw.githubusercontent.com/your-org/your-repo/main/apps/contracts/resource-budgets.schema.json",
+  "description": "Soroban resource and cost regression budgets for critical contract operations. See README section 'Resource Budgets' below for the procedure to intentionally raise a threshold.",
+  "version": 1,
+  "tolerancePercent": 10,
+  "toolchain": {
+    "sorobanCli": "21.0.0",
+    "rust": "1.77.0",
+    "note": "Budgets are measured with the pinned Soroban CLI and Rust toolchain above. Changing the toolchain may require re-baselining budgets."
+  },
+  "operations": {
+    "create_booking": {
+      "description": "Create a new booking for a property (representative maximum collection size).",
+      "cpuInstructions": 2500000,
+      "memoryBytes": 524288,
+      "ledgerReadBytes": 4096,
+      "ledgerWriteBytes": 2048
+    },
+    "overlap_rejection": {
+      "description": "Reject a booking that overlaps an existing booking (representative maximum collection size).",
+      "cpuInstructions": 1800000,
+      "memoryBytes": 393216,
+      "ledgerReadBytes": 4096,
+      "ledgerWriteBytes": 0
+    },
+    "listing_update": {
+      "description": "Update a property listing (representative maximum collection size).",
+      "cpuInstructions": 2000000,
+      "memoryBytes": 458752,
+      "ledgerReadBytes": 4096,
+      "ledgerWriteBytes": 2048
+    },
+    "review_submit": {
+      "description": "Submit a review for a completed booking (representative maximum collection size).",
+      "cpuInstructions": 1500000,
+      "memoryBytes": 327680,
+      "ledgerReadBytes": 2048,
+      "ledgerWriteBytes": 1024
+    }
+  },
+  "representativeSizes": {
+    "maxBookingsPerProperty": 500,
+    "maxPropertiesPerOwner": 100,
+    "maxReviewsPerProperty": 1000,
+    "note": "These collection sizes are used when generating fixtures for resource measurement. Update together with the budgets if the supported maximums change."
+  },
+  "readme": {
+    "title": "Resource Budgets",
+    "procedure": [
+      "1. Install the pinned toolchain listed in the 'toolchain' section above.",
+      "2. Run `pnpm --filter contracts measure-resources` to capture current resource usage for each operation.",
+      "3. Compare the measured values against the thresholds in this file. CI fails when any measurement exceeds its threshold by more than 'tolerancePercent'.",
+      "4. To intentionally raise a threshold (e.g. after an approved feature that legitimately increases resource use), update the corresponding value in this file and add an entry to CHANGELOG.md describing the reason and the new value.",
+      "5. The measurement procedure is fully reproducible and requires no production credentials; it uses local Soroban test fixtures only."
+    ],
+    "raisingThresholds": "Any change to a threshold in this file MUST be accompanied by a CHANGELOG.md entry explaining why the budget was raised. Reviewers should reject threshold changes without a corresponding changelog note."
+  }
+}

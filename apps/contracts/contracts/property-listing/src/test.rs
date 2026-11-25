@@ -1037,4 +1037,128 @@ mod tests {
             );
         }
     }
+
+    // ─── Resource / Cost Regression Measurements (Issue 119) ─────────────────
+    //
+    // These tests measure Soroban CPU instruction and memory consumption for
+    // representative property-listing operations and emit one
+    // `RESOURCE_METRIC {json}` line per measurement. The CI comparison script
+    // (`scripts/check-resource-budget.sh`) parses those lines and fails the
+    // build when a metric exceeds the configured budget.
+    //
+    // The measurements are fully reproducible: they use the in-memory Soroban
+    // test host with a pinned toolchain and require no production credentials.
+    //
+    // To intentionally change a budget, update
+    // `scripts/resource-budgets.json` and document the reason in
+    // `docs/resource-budgets.md`.
+
+    /// Maximum title length exercised by the resource tests (bytes).
+    const MAX_TITLE_LEN: u32 = 128;
+    /// Maximum description length exercised by the resource tests (bytes).
+    const MAX_DESC_LEN: u32 = 512;
+
+    /// Build a string of `len` ASCII bytes (all 'a') for max-size scenarios.
+    fn max_len_string(env: &Env, len: u32) -> String {
+        let mut buf = [b'a'; 512];
+        let slice = &mut buf[..len as usize];
+        String::from_bytes(env, slice)
+    }
+
+    /// Emit a single machine-readable resource metric line.
+    fn emit_metric(operation: &str, cpu: u64, mem: u64) {
+        // Keep the format stable and easy to parse from shell/CI.
+        std::println!(
+            "RESOURCE_METRIC {{\"contract\":\"property-listing\",\"operation\":\"{}\",\"cpu_instructions\":{},\"memory_bytes\":{}}}",
+            operation, cpu, mem
+        );
+    }
+
+    /// Measure a closure's resource usage and emit the metric.
+    fn measure<F: FnOnce()>(env: &Env, operation: &str, f: F) {
+        env.budget().reset_unlimited();
+        f();
+        let cpu = env.budget().cpu_instruction_cost();
+        let mem = env.budget().memory_bytes_cost();
+        emit_metric(operation, cpu, mem);
+    }
+
+    /// Resource measurement: create a listing with typical-size fields.
+    #[test]
+    fn test_resource_create_listing() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        measure(&env, "create_listing", || {
+            client.create_listing(
+                &owner,
+                &String::from_str(&env, "Mountain Cabin"),
+                &String::from_str(&env, "Peaceful retreat in the Alps"),
+                &50_0000000_i128,
+            );
+        });
+    }
+
+    /// Resource measurement: create a listing with maximum-size title/description.
+    #[test]
+    fn test_resource_create_listing_max_size() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        let title = max_len_string(&env, MAX_TITLE_LEN);
+        let desc = max_len_string(&env, MAX_DESC_LEN);
+
+        measure(&env, "create_listing_max_size", || {
+            client.create_listing(&owner, &title, &desc, &50_0000000_i128);
+        });
+    }
+
+    /// Resource measurement: update a listing with typical-size fields.
+    #[test]
+    fn test_resource_update_listing() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        let id = client.create_listing(
+            &owner,
+            &String::from_str(&env, "Cozy Beach House"),
+            &String::from_str(&env, "A lovely place by the sea"),
+            &100_0000000_i128,
+        );
+
+        measure(&env, "update_listing", || {
+            client.update_listing(
+                &owner,
+                &id,
+                &String::from_str(&env, "Updated Beach House"),
+                &String::from_str(&env, "Renovated with ocean view"),
+                &150_0000000_i128,
+            );
+        });
+    }
+
+    /// Resource measurement: update a listing with maximum-size title/description.
+    #[test]
+    fn test_resource_update_listing_max_size() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        let id = client.create_listing(
+            &owner,
+            &String::from_str(&env, "Cozy Beach House"),
+            &String::from_str(&env, "A lovely place by the sea"),
+            &100_0000000_i128,
+        );
+
+        let title = max_len_string(&env, MAX_TITLE_LEN);
+        let desc = max_len_string(&env, MAX_DESC_LEN);
+
+        measure(&env, "update_listing_max_size", || {
+            client.update_listing(&owner, &id, &title, &desc, &150_0000000_i128);
+        });
+    }
 }

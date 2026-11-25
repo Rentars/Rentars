@@ -66,6 +66,7 @@ docker logs rentars-api --tail 100
 ### Symptoms
 - `http_errors_total{status_class="5xx"}` rising sharply on the `/metrics` dashboard.
 - Alerts firing on `error_rate > 1%` threshold.
+- Workflow-level failure counters rising (see [Workflow metrics](#workflow-metrics) for the full vocabulary).
 
 ### Verify
 ```bash
@@ -103,6 +104,8 @@ journalctl -u rentars-api --since "15 min ago" \
 
 ### Symptoms
 - `escrow_failures_total` or `payment_failures_total` counters rising.
+- `payment_workflow_total{outcome="failure"}` or `escrow_workflow_total{outcome="failure"}` rising (see [Workflow metrics](#workflow-metrics)).
+- `payment_workflow_duration_seconds` p95 above threshold — escrows are slow but not yet failing.
 - Users reporting "payment failed" or bookings stuck in `pending` state.
 - Alerts on `escrow_failures_total > N` in a rolling window.
 
@@ -405,6 +408,131 @@ curl -s -H "Authorization: Bearer $METRICS_TOKEN" http://localhost:3000/metrics 
 
 ---
 
+## Workflow metrics
+
+Business-critical workflows emit a bounded, privacy-safe metric vocabulary.  These
+metrics are defined in `src/metrics/workflowMetrics.ts` and exposed on `/metrics`
+alongside the HTTP metrics.
+
+### Label policy (read this before adding a metric)
+
+- **Allowed dimensions:** `operation`, `outcome`, `provider_class`, `channel`, `status_class`.
+- **Never** use user IDs, booking IDs, transaction IDs, escrow IDs, email addresses,
+  IP addresses, or any other unbounded value as a label.  Doing so creates a
+  cardinality explosion and leaks personal data into the metrics store.
+- Every label value must come from a fixed enum.  Unknown values are coerced to
+  `other` by the metric helper, so a typo cannot create a new time series.
+- Each logical event increments its counter **exactly once** at the service
+  boundary (not inside retry loops).  Retries are recorded on the dedicated
+  `*_retries_total` counters.
+
+### Metric catalogue
+
+| Metric | Type | Labels (allowed values) | Meaning |
+|---|---|---|---|
+| `booking_workflow_total` | counter | `operation` = `create` \| `confirm` \| `cancel` \| `complete`; `outcome` = `success` \| `failure` \| `rejected` | One increment per booking workflow attempt.  `rejected` = validation/availability refusal (not an error). |
+| `booking_workflow_duration_seconds` | histogram | `operation` (as above) | End-to-end duration of the booking workflow, from request acceptance to terminal state. |
+| `payment_workflow_total` | counter | `operation` = `initiate` \| `confirm` \| `refund`; `outcome` = `success` \| `failure` \| `timeout`; `provider_class` = `trustless_work` \| `stellar` \| `internal` | One increment per payment workflow attempt. |
+| `payment_workflow_duration_seconds` | histogram | `operation`, `provider_class` | Duration of the payment workflow including provider round-trips.  Used for escrow delay. |
+| `payment_retries_total` | counter | `operation`, `provider_class` | Retry attempts after a failed payment/escrow call.  A retry does **not** re-increment `payment_workflow_total`. |
+| `escrow_workflow_total` | counter | `operation` = `create` \| `fund` \| `release` \| `refund`; `outcome` = `success` \| `failure` \| `timeout` | Escrow lifecycle outcomes. |
+| `notification_workflow_total` | counter | `channel` = `email` \| `in_app` \| `push`; `outcome` = `success` \| `failure` \| `dropped` | Notification delivery outcomes.  `dropped` = intentionally suppressed (preferences, dedupe). |
+| `notification_backlog_size` | gauge | `channel` | Number of notifications currently queued but not yet delivered, sampled by the dispatcher. |
+| `sync_workflow_total` | counter | `operation` = `property_sync` \| `booking_sync` \| `escrow_reconcile`; `outcome` = `success` \| `failure` \| `quarantined` | Blockchain sync / reconciliation outcomes.  `quarantined` = record skipped after repeated failures and parked for manual review. |
+| `sync_workflow_duration_seconds` | histogram | `operation` | Duration of a sync or reconciliation pass. |
+| `sync_retries_total` | counter | `operation` | Retry attempts inside the sync/reconciliation loop. |
+
+### Dashboard queries
+
+All examples assume Prometheus (or a compatible PromQL endpoint) scraping `/metrics`.
+
+**Booking conversion rate** (successful bookings ÷ all booking attempts, 15 min window):
+
+```promql
+sum(rate(booking_workflow_total{operation="create",outcome="success"}[15m]))
+/
+sum(rate(booking_workflow_total{operation="create"}[15m]))
+```
+
+**Booking failure rate** (excludes intentional rejections):
+
+```promql
+sum(rate(booking_workflow_total{outcome="failure"}[5m]))
+/
+sum(rate(booking_workflow_total[5m]))
+```
+
+**Escrow / payment delay p95** (per provider class):
+
+```promql
+histogram_quantile(
+  0.95,
+  sum by (le, provider_class) (rate(payment_workflow_duration_seconds_bucket[5m]))
+)
+```
+
+**Payment retry pressure** (retries per successful payment):
+
+```promql
+sum(rate(payment_retries_total[15m]))
+/
+clamp_min(sum(rate(payment_workflow_total{outcome="success"}[15m])), 0.001)
+```
+
+**Notification backlog** (per channel):
+
+```promql
+max by (channel) (notification_backlog_size)
+```
+
+**Notification failure rate**:
+
+```promql
+sum by (channel) (rate(notification_workflow_total{outcome="failure"}[5m]))
+/
+clamp_min(sum by (channel) (rate(notification_workflow_total[5m])), 0.001)
+```
+
+**Sync / reconciliation failure rate**:
+
+```promql
+sum by (operation) (rate(sync_workflow_total{outcome="failure"}[15m]))
+/
+clamp_min(sum by (operation) (rate(sync_workflow_total[15m])), 0.001)
+```
+
+**Quarantined records** (records parked for manual review):
+
+```promql
+sum by (operation) (increase(sync_workflow_total{outcome="quarantined"}[1h]))
+```
+
+### Alert thresholds
+
+| Alert | Condition | Severity | Response |
+|---|---|---|---|
+| Booking failure rate | `booking_workflow_total{outcome="failure"}` rate > 5% of all booking attempts over 10 min | Critical | Follow [High Error Rate](#2-high-error-rate-5xx-spike); check availability service and DB. |
+| Booking conversion drop | conversion rate < 50% of the trailing 7-day baseline for 30 min | Warning | Check `booking_workflow_total{outcome="rejected"}` — a spike usually means an availability or validation regression. |
+| Payment delay | `payment_workflow_duration_seconds` p95 > 120 s over 10 min | Warning | Follow [Payment / Escrow Failure](#3-payment--escrow-failure); check Trustless Work and Stellar latency. |
+| Payment failure | `payment_workflow_total{outcome="failure"}` rate > 3 in 5 min | Critical | Follow [Payment / Escrow Failure](#3-payment--escrow-failure). |
+| Payment timeouts | `payment_workflow_total{outcome="timeout"}` > 2 in 10 min | Warning | Check provider status pages; timeouts often precede hard failures. |
+| Notification backlog | `notification_backlog_size` > 500 for 10 min on any channel | Warning | Check SMTP / push provider health; backlog drains automatically once the provider recovers. |
+| Notification failures | `notification_workflow_total{outcome="failure"}` rate > 10% over 10 min | Warning | Check provider credentials and rate limits; see [DR-8](#dr-8--full-stack-recovery-sequence) step 19–20. |
+| Sync failures | `sync_workflow_total{outcome="failure"}` rate > 10% over 15 min | Warning | Check Stellar RPC (see [Blockchain runbook](#4-blockchain--stellar-rpc-connection-issues)). |
+| Quarantined records | `sync_workflow_total{outcome="quarantined"}` > 0 in 1 h | Warning | Inspect the quarantine table; records need manual reconciliation. |
+| Sync duration | `sync_workflow_duration_seconds` p95 > 300 s over 15 min | Warning | Check DB query latency and RPC latency; a growing sync pass can indicate a backlog. |
+
+### Validation
+
+- `src/metrics/workflowMetrics.test.ts` asserts that every label value is drawn
+  from the allowed enum and that unknown values are coerced to `other`.
+- A scrape-level test (`src/metrics/workflowMetrics.scrape.test.ts`) renders the
+  registry and fails if any workflow metric exposes a label name outside the
+  allow-list (`operation`, `outcome`, `provider_class`, `channel`, `status_class`).
+- When adding a metric, update this table and the allow-list in the same PR.
+
+---
+
 ## Alerting Thresholds Reference
 
 | Metric | Alert condition | Severity |
@@ -419,6 +547,12 @@ curl -s -H "Authorization: Bearer $METRICS_TOKEN" http://localhost:3000/metrics 
 | `wallet_approvals_total{outcome="error"}` | > 5 in 5 min | Warning |
 | `auth_events_total{outcome="failure"}` | > 50 in 5 min | Warning |
 | `client_errors_total` | > 20 in 5 min | Warning |
+| `booking_workflow_total{outcome="failure"}` | rate > 5% of booking attempts over 10 min | Critical |
+| `payment_workflow_duration_seconds` p95 | > 120 s over 10 min | Warning |
+| `payment_workflow_total{outcome="failure"}` | > 3 in 5 min | Critical |
+| `notification_backlog_size` | > 500 for 10 min on any channel | Warning |
+| `sync_workflow_total{outcome="failure"}` | rate > 10% over 15 min | Warning |
+| `sync_workflow_total{outcome="quarantined"}` | > 0 in 1 h | Warning |
 | `process_heap_used_bytes / process_heap_bytes` | > 0.85 for 5 min | Warning |
 | `/health` non-200 | any occurrence | Critical |
 

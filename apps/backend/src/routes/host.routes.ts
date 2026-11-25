@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { authenticate } from '@/middleware/auth.middleware.js';
 import { requireAdmin } from '@/middleware/admin.middleware.js';
-import { getHostEarnings, getLedgerEntries, getLedgerBalance, getReconciliationReport, postLedgerAdjustment } from '@/controllers/earnings.controller.js';
+import { getHostEarnings, getLedgerEntries, getLedgerBalance, getReconciliationReport, postLedgerAdjustment, getEarningsExport } from '@/controllers/earnings.controller.js';
 import {
   getHostDashboard,
   listHostProperties,
@@ -12,6 +12,11 @@ const router = Router();
 
 // GET /api/v1/host/earnings?from=YYYY-MM-DD&to=YYYY-MM-DD
 router.get('/earnings', authenticate, getHostEarnings);
+
+// GET /api/v1/host/earnings/export?from=&to=&currency=USDC
+// Returns summary + ledger entries using the same definitions as /earnings so
+// exported totals reconcile with the dashboard and earnings view (Feature 4).
+router.get('/earnings/export', authenticate, getEarningsExport);
 
 // ── Ledger endpoints (#770) ────────────────────────────────────────────────────
 // All append-only ledger queries are scoped to the authenticated host.

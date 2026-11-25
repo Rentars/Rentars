@@ -104,6 +104,46 @@ for (const abi of abiFiles) {
   }
 }
 
+// ── Migration checksum / validation results ──────────────────────────────────
+// These are produced by the migration tooling and written to a well-known
+// results file (or supplied via env) so the manifest can link version,
+// migration state and health results for each deployment.
+function readJsonIfExists(rel: string): Record<string, unknown> | null {
+  if (!existsSync(resolve(ROOT, rel))) return null;
+  try {
+    return json(rel);
+  } catch {
+    return null;
+  }
+}
+
+const migrationChecksums =
+  readJsonIfExists('docs/releases/migration-checksums.json') ??
+  (process.env.MIGRATION_CHECKSUMS_JSON
+    ? (JSON.parse(process.env.MIGRATION_CHECKSUMS_JSON) as Record<string, unknown>)
+    : null);
+
+const migrationValidation =
+  readJsonIfExists('docs/releases/migration-validation.json') ??
+  (process.env.MIGRATION_VALIDATION_JSON
+    ? (JSON.parse(process.env.MIGRATION_VALIDATION_JSON) as Record<string, unknown>)
+    : null);
+
+// ── Health gate results ──────────────────────────────────────────────────────
+// Smoke-test results are written by the deployment health gate runner. The
+// manifest records the decision (pass/fail) and the per-check outcomes so a
+// deployment record can be audited against the gate policy.
+const healthResults =
+  readJsonIfExists('docs/releases/health-results.json') ??
+  (process.env.HEALTH_RESULTS_JSON
+    ? (JSON.parse(process.env.HEALTH_RESULTS_JSON) as Record<string, unknown>)
+    : null);
+
+const healthDecision: 'pass' | 'fail' | 'not_run' =
+  healthResults && typeof healthResults.decision === 'string'
+    ? (healthResults.decision as 'pass' | 'fail')
+    : 'not_run';
+
 // ── Git metadata ──────────────────────────────────────────────────────────────
 const commit = git('rev-parse HEAD');
 const tag = git('describe --tags --exact-match 2>/dev/null') || `v${version}`;
@@ -126,6 +166,20 @@ const manifest = {
   database: {
     latest_migration: latestMigration,
     migration_count: migrationCount,
+    checksums: migrationChecksums
+      ? {
+          status: migrationChecksums.status ?? 'unknown',
+          checked_at: migrationChecksums.checked_at ?? null,
+          mismatches: migrationChecksums.mismatches ?? [],
+        }
+      : null,
+    validation: migrationValidation
+      ? {
+          status: migrationValidation.status ?? 'unknown',
+          checked_at: migrationValidation.checked_at ?? null,
+          errors: migrationValidation.errors ?? [],
+        }
+      : null,
   },
   dependencies: {
     stellar_network: process.env.STELLAR_NETWORK ?? null,
@@ -137,6 +191,18 @@ const manifest = {
   },
   contracts: {
     abi_sha256: abiHashes,
+    upgradeability: contractUpgradeability,
+    compatibility_check: compatibilityCheck,
+  },
+  health: {
+    decision: healthDecision,
+    results: healthResults
+      ? {
+          generated_at: healthResults.generated_at ?? null,
+          environment: healthResults.environment ?? null,
+          checks: healthResults.checks ?? [],
+        }
+      : null,
   },
   rollback: {
     docs: 'docs/releases/rollback.md',

@@ -1,13 +1,14 @@
 /**
- * Automated accessibility tests for critical routes
- * Uses axe-core to detect accessibility violations
+ * Automated accessibility tests for critical routes.
+ * Uses axe-core (via jest-axe) to detect accessibility violations.
+ *
+ * jest-axe is configured globally in src/tests/setup.ts via
+ * expect.extend(toHaveNoViolations) — no per-file setup needed.
  */
 
 import { describe, it, expect } from 'vitest';
 import { render } from '@testing-library/react';
-import { axe, toHaveNoViolations } from 'jest-axe';
-
-expect.extend(toHaveNoViolations);
+import { axe } from 'jest-axe';
 
 // Mock components for testing
 import SearchPage from '@/app/search/page';

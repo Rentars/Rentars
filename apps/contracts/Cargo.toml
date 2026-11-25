@@ -7,6 +7,28 @@ members = [
 ]
 resolver = "2"
 
+# ---------------------------------------------------------------------------
+# CI toolchain expectations (see issue 121)
+#
+# The CI WASM build gate pins a supported Rust toolchain and the
+# `wasm32-unknown-unknown` target so that contract builds are reproducible.
+# Keep this note in sync with the CI workflow and `rust-toolchain.toml`.
+#
+#   Rust toolchain : stable (pinned via rust-toolchain.toml / CI matrix)
+#   Build target   : wasm32-unknown-unknown
+#
+# The gate runs, from this directory:
+#   cargo fmt --all --check
+#   cargo clippy --workspace --all-targets -- -D warnings
+#   cargo test --workspace
+#   cargo build --workspace --release --target wasm32-unknown-unknown
+#
+# All workspace members listed above must produce a release WASM artifact
+# under `target/wasm32-unknown-unknown/release/`; the CI job verifies the
+# expected artifact names and hashes and uploads them as build artifacts.
+# No deployment credentials or network deployment are used.
+# ---------------------------------------------------------------------------
+
 # Shared release profile applied to all workspace members
 [profile.release]
 opt-level = "z"

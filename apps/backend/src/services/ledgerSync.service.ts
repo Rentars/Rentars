@@ -26,7 +26,10 @@
  *     attempts        INT NOT NULL DEFAULT 0,
  *     last_error      TEXT,
  *     status          TEXT NOT NULL DEFAULT 'received'
- *                     CHECK (status IN ('received','projected','dead_letter'))
+ *                     CHECK (status IN ('received','projected','dead_letter')),
+ *     correlation_id  TEXT,               -- originating request correlation ID
+ *     booking_id      TEXT,               -- originating booking (if any)
+ *     operation_id    TEXT                -- originating operation (if any)
  *   );
  *
  *   ledger_sync_cursors (
@@ -38,6 +41,7 @@
 
 import { supabase } from '@/config/supabase.js';
 import type { ServiceResponse } from './index.js';
+import { metrics } from '@/observability/metrics.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -51,6 +55,82 @@ export interface InboxRecord {
     attempts: number;
     last_error: string | null;
     status: InboxStatus;
+    correlation_id: string | null;
+    booking_id: string | null;
+    operation_id: string | null;
+}
+
+/**
+ * Correlation identifiers carried through asynchronous work.
+ *
+ * Persisted on the inbox record so a worker that restarts (or a retry that
+ * runs in a different process) can restore the originating operation context.
+ * All values are nonsecret identifiers — never tokens or payment credentials.
+ */
+export interface CorrelationContext {
+    correlationId?: string | null;
+    bookingId?: string | null;
+    operationId?: string | null;
+}
+
+const CORRELATION_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+
+/**
+ * Normalise a user-supplied identifier before it is persisted or logged.
+ *
+ * Returns null when the value is missing or does not look like an opaque ID,
+ * so arbitrary user input can never leak into logs or the inbox table.
+ */
+export function sanitizeCorrelationId(value: string | null | undefined): string | null {
+    if (!value) return null;
+    const trimmed = value.trim();
+    if (!CORRELATION_ID_PATTERN.test(trimmed)) return null;
+    return trimmed;
+}
+
+/**
+ * Build a log-safe correlation suffix, e.g. ` correlation_id=abc booking_id=42`.
+ * Missing identifiers are omitted; values are sanitised first.
+ */
+export function formatCorrelationContext(context: CorrelationContext): string {
+    const parts: string[] = [];
+    const correlationId = sanitizeCorrelationId(context.correlationId);
+    const bookingId = sanitizeCorrelationId(context.bookingId);
+    const operationId = sanitizeCorrelationId(context.operationId);
+    if (correlationId) parts.push(`correlation_id=${correlationId}`);
+    if (bookingId) parts.push(`booking_id=${bookingId}`);
+    if (operationId) parts.push(`operation_id=${operationId}`);
+    return parts.length > 0 ? ` ${parts.join(' ')}` : '';
+}
+
+const REDACTED = '[REDACTED]';
+const SENSITIVE_KEY_PATTERN =
+    /(authorization|auth|token|secret|password|passwd|private[_-]?key|mnemonic|seed|wallet|signature|api[_-]?key|credential|card|cvv|pan|iban|payment[_-]?payload)/i;
+
+/**
+ * Recursively redact secrets from a value before it is logged.
+ *
+ * Removes auth headers, wallet secrets, and full payment payloads while
+ * preserving the shape of the object for debugging.
+ */
+export function redactForLog(value: unknown, depth = 0): unknown {
+    if (depth > 6) return REDACTED;
+    if (value === null || value === undefined) return value;
+    if (typeof value === 'string') {
+        return value.length > 512 ? `${value.slice(0, 512)}…` : value;
+    }
+    if (typeof value === 'number' || typeof value === 'boolean') return value;
+    if (Array.isArray(value)) {
+        return value.slice(0, 50).map((item) => redactForLog(item, depth + 1));
+    }
+    if (typeof value === 'object') {
+        const out: Record<string, unknown> = {};
+        for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+            out[key] = SENSITIVE_KEY_PATTERN.test(key) ? REDACTED : redactForLog(entry, depth + 1);
+        }
+        return out;
+    }
+    return REDACTED;
 }
 
 export interface CursorRecord {
@@ -81,6 +161,7 @@ export interface LagReport {
 export async function recordEventInbox(
     eventKey: string,
     workerId: string,
+    context: CorrelationContext = {},
 ): Promise<ServiceResponse<{ isNew: boolean }>> {
     const { data, error } = await supabase
         .from('ledger_event_inbox')
@@ -91,6 +172,9 @@ export async function recordEventInbox(
                 received_at: new Date().toISOString(),
                 status: 'received',
                 attempts: 0,
+                correlation_id: sanitizeCorrelationId(context.correlationId),
+                booking_id: sanitizeCorrelationId(context.bookingId),
+                operation_id: sanitizeCorrelationId(context.operationId),
             },
             { onConflict: 'event_key', ignoreDuplicates: true },
         )
@@ -125,6 +209,36 @@ export async function isEventProjected(
 
     const alreadyProjected = (data as InboxRecord | null)?.status === 'projected';
     return { success: true, data: alreadyProjected };
+}
+
+/**
+ * Restore the persisted correlation context for an event.
+ *
+ * Workers call this after a restart (or when picking up a deferred retry) so
+ * downstream logs and provider calls retain the originating operation context.
+ */
+export async function loadEventCorrelation(
+    eventKey: string,
+): Promise<ServiceResponse<CorrelationContext>> {
+    const { data, error } = await supabase
+        .from('ledger_event_inbox')
+        .select('correlation_id, booking_id, operation_id')
+        .eq('event_key', eventKey)
+        .maybeSingle();
+
+    if (error) {
+        return { success: false, error: `Failed to load event correlation: ${error.message}` };
+    }
+
+    const record = data as InboxRecord | null;
+    return {
+        success: true,
+        data: {
+            correlationId: record?.correlation_id ?? null,
+            bookingId: record?.booking_id ?? null,
+            operationId: record?.operation_id ?? null,
+        },
+    };
 }
 
 /**
@@ -192,6 +306,7 @@ export async function recordEventAttemptFailure(
 export async function quarantineEvent(
     eventKey: string,
     reason: string,
+    context: CorrelationContext = {},
 ): Promise<ServiceResponse<void>> {
     const { error } = await supabase
         .from('ledger_event_inbox')
@@ -205,7 +320,9 @@ export async function quarantineEvent(
         return { success: false, error: `Failed to quarantine event: ${error.message}` };
     }
 
-    console.error(`[LedgerSync] DEAD_LETTER event_key=${eventKey} reason="${reason}"`);
+    console.error(
+        `[LedgerSync] DEAD_LETTER event_key=${eventKey}${formatCorrelationContext(context)} reason="${reason}"`,
+    );
     return { success: true };
 }
 
@@ -273,7 +390,23 @@ export async function loadCursor(
  */
 export function measureLag(cursorKey: string, cursorValue: bigint, latestOnChain: bigint): LagReport {
     const lag = latestOnChain > cursorValue ? latestOnChain - cursorValue : 0n;
+    // Expose lag as a gauge.  `cursorKey` is a bounded worker identifier
+    // (e.g. "booking_sync"), never a user/booking/transaction ID.
+    metrics.ledgerSyncLagSeconds.set({ worker: cursorKey }, Number(lag));
     return { cursor_key: cursorKey, cursor_value: cursorValue, latest_on_chain: latestOnChain, lag };
+}
+
+/**
+ * Emit a structured lag log line including the worker's correlation context.
+ *
+ * Used by sync workers so operators can tie a stalled cursor back to the
+ * originating request/booking/operation without exposing secrets.
+ */
+export function logLagReport(report: LagReport, context: CorrelationContext = {}): void {
+    console.info(
+        `[LedgerSync] LAG cursor_key=${report.cursor_key} cursor_value=${report.cursor_value} ` +
+            `latest_on_chain=${report.latest_on_chain} lag=${report.lag}${formatCorrelationContext(context)}`,
+    );
 }
 
 // ─── Dead-Letter Inspection ───────────────────────────────────────────────────
@@ -360,48 +493,280 @@ export async function processEventOnce(
     {
         eventKey,
         workerId,
-    }: { eventKey: string; workerId: string },
-    project: () => Promise<void>,
+        correlationId,
+        bookingId,
+        operationId,
+    }: { eventKey: string; workerId: string } & CorrelationContext,
+    project: (context: CorrelationContext) => Promise<void>,
     { maxAttempts = 5 }: { maxAttempts?: number } = {},
 ): Promise<ServiceResponse<{ outcome: 'projected' | 'skipped' | 'dead_letter' }>> {
-    // 1. Record in inbox — idempotent; duplicate delivery → isNew = false
-    const inboxResult = await recordEventInbox(eventKey, workerId);
+    // 1. Record in inbox — idempotent; duplicate delivery → isNew = false.
+    //    Correlation IDs are persisted so a restart can restore the context.
+    const inboxResult = await recordEventInbox(eventKey, workerId, {
+        correlationId,
+        bookingId,
+        operationId,
+    });
     if (!inboxResult.success) {
+        finish('failed');
         return { success: false, error: inboxResult.error };
     }
 
     // 2. Check if already projected (covers restarts that skip the inbox insert)
     const projectedResult = await isEventProjected(eventKey);
     if (!projectedResult.success) {
+        finish('failed');
         return { success: false, error: projectedResult.error };
     }
     if (projectedResult.data) {
+        finish('duplicate');
         return { success: true, data: { outcome: 'skipped' } };
     }
 
-    // 3. Attempt projection
+    // 3. Restore correlation context from the inbox record.  On a fresh
+    //    delivery this matches the caller's values; after a restart it is the
+    //    only source of truth, so prefer the persisted record when present.
+    const storedResult = await loadEventCorrelation(eventKey);
+    const context: CorrelationContext = storedResult.success
+        ? {
+              correlationId: storedResult.data.correlationId ?? sanitizeCorrelationId(correlationId),
+              bookingId: storedResult.data.bookingId ?? sanitizeCorrelationId(bookingId),
+              operationId: storedResult.data.operationId ?? sanitizeCorrelationId(operationId),
+          }
+        : {
+              correlationId: sanitizeCorrelationId(correlationId),
+              bookingId: sanitizeCorrelationId(bookingId),
+              operationId: sanitizeCorrelationId(operationId),
+          };
+
+    // 4. Attempt projection
     try {
-        await project();
+        await project(context);
 
         const markResult = await markEventProjected(eventKey);
         if (!markResult.success) {
-            console.error(`[LedgerSync] Failed to mark ${eventKey} projected: ${markResult.error}`);
+            console.error(
+                `[LedgerSync] Failed to mark ${eventKey} projected${formatCorrelationContext(context)}: ${markResult.error}`,
+            );
         }
 
+        finish('projected');
         return { success: true, data: { outcome: 'projected' } };
     } catch (err) {
         const message = (err as Error).message;
         const failureResult = await recordEventAttemptFailure(eventKey, message);
 
         if (!failureResult.success) {
+            finish('failed');
             return { success: false, error: failureResult.error };
         }
 
         if (failureResult.data.attempts >= maxAttempts) {
-            await quarantineEvent(eventKey, message);
+            await quarantineEvent(eventKey, message, context);
             return { success: true, data: { outcome: 'dead_letter' } };
         }
 
-        return { success: false, error: `Projection failed (attempt ${failureResult.data.attempts}): ${message}` };
+        console.warn(
+            `[LedgerSync] Projection failed event_key=${eventKey} attempt=${failureResult.data.attempts}` +
+                `${formatCorrelationContext(context)} error=${JSON.stringify(redactForLog(message))}`,
+        );
+
+        return {
+            success: false,
+            error: `Projection failed (attempt ${failureResult.data.attempts})${formatCorrelationContext(context)}: ${message}`,
+        };
     }
+}
+
+// ─── Payment Reconciliation ───────────────────────────────────────────────────
+
+/**
+ * A single immutable payment event as stored in the payment ledger.
+ *
+ * Events are append-only: each attempt or state transition produces a new
+ * record rather than mutating a prior one.  The current payment status is
+ * *derived* from the ordered set of events, never stored as mutable state.
+ */
+export interface PaymentLedgerEvent {
+    /** Globally unique event id (idempotency key for the ledger append). */
+    event_id: string;
+    /** Booking this event belongs to. */
+    booking_id: string;
+    /** Quote the payment was created against, when known. */
+    quote_id: string | null;
+    /** Payment provider (e.g. `stripe`, `circle`). */
+    provider: string;
+    /** Network for on-chain payments (e.g. `ethereum`, `stellar`); null for fiat. */
+    network: string | null;
+    /** Amount in minor units as a decimal string — exact currency precision. */
+    amount: string;
+    /** ISO-4217 currency code (e.g. `USD`, `USDC`). */
+    currency: string;
+    /** Provider-side reference (charge id, tx hash, etc.). */
+    external_reference: string | null;
+    /** Correlation id propagated across every external call. */
+    correlation_id: string | null;
+    /** Event kind: attempt, authorization, capture, failure, refund, etc. */
+    event_type: PaymentEventType;
+    /** Monotonically increasing provider sequence, when available. */
+    provider_sequence: string | null;
+    /** When the provider reported the event (may arrive out of order). */
+    occurred_at: string;
+}
+
+export type PaymentEventType =
+    | 'attempt'
+    | 'authorized'
+    | 'captured'
+    | 'failed'
+    | 'refunded'
+    | 'cancelled';
+
+export type DerivedPaymentStatus =
+    | 'pending'
+    | 'authorized'
+    | 'captured'
+    | 'failed'
+    | 'refunded'
+    | 'cancelled';
+
+/** Terminal event types that must not be overridden by later, stale events. */
+const TERMINAL_EVENT_TYPES: ReadonlySet<PaymentEventType> = new Set([
+    'captured',
+    'failed',
+    'refunded',
+    'cancelled',
+]);
+
+/**
+ * Derive the current payment status from the stored event history.
+ *
+ * The derivation is deterministic and order-independent: events are sorted by
+ * `provider_sequence` (falling back to `occurred_at`, then `event_id`) so that
+ * out-of-order delivery yields the same result as in-order delivery.  Once a
+ * terminal event is reached, later non-terminal events cannot regress it.
+ *
+ * This is a pure function — the same event set always produces the same status,
+ * which is what makes the derived status reproducible from stored events.
+ */
+export function derivePaymentStatus(events: readonly PaymentLedgerEvent[]): DerivedPaymentStatus {
+    if (events.length === 0) return 'pending';
+
+    const ordered = [...events].sort(comparePaymentEvents);
+
+    let status: DerivedPaymentStatus = 'pending';
+    for (const event of ordered) {
+        switch (event.event_type) {
+            case 'attempt':
+                if (status === 'pending') status = 'pending';
+                break;
+            case 'authorized':
+                if (status === 'pending') status = 'authorized';
+                break;
+            case 'captured':
+                status = 'captured';
+                break;
+            case 'failed':
+                if (status !== 'captured' && status !== 'refunded') status = 'failed';
+                break;
+            case 'refunded':
+                if (status === 'captured') status = 'refunded';
+                break;
+            case 'cancelled':
+                if (status === 'pending' || status === 'authorized') status = 'cancelled';
+                break;
+        }
+    }
+
+    return status;
+}
+
+/**
+ * Total captured amount (minor units) derived from the event history.
+ *
+ * Duplicate `captured` events sharing the same `event_id` are collapsed so a
+ * redelivered callback cannot double-count the financial effect.
+ */
+export function deriveCapturedAmount(events: readonly PaymentLedgerEvent[]): bigint {
+    const seen = new Set<string>();
+    let total = 0n;
+    for (const event of events) {
+        if (event.event_type !== 'captured') continue;
+        if (seen.has(event.event_id)) continue;
+        seen.add(event.event_id);
+        total += BigInt(event.amount);
+    }
+    return total;
+}
+
+function comparePaymentEvents(a: PaymentLedgerEvent, b: PaymentLedgerEvent): number {
+    if (a.provider_sequence !== null && b.provider_sequence !== null) {
+        const sa = BigInt(a.provider_sequence);
+        const sb = BigInt(b.provider_sequence);
+        if (sa !== sb) return sa < sb ? -1 : 1;
+    }
+    if (a.occurred_at !== b.occurred_at) {
+        return a.occurred_at < b.occurred_at ? -1 : 1;
+    }
+    return a.event_id < b.event_id ? -1 : a.event_id > b.event_id ? 1 : 0;
+}
+
+export interface ReconciliationReport {
+    booking_id: string;
+    derived_status: DerivedPaymentStatus;
+    captured_amount: string;
+    /** Event ids that were received more than once (duplicates collapsed). */
+    duplicate_event_ids: string[];
+    /** True when the derived status is terminal and no further action is needed. */
+    settled: boolean;
+    /** True when no provider callback has been observed for this booking. */
+    missing_provider_callback: boolean;
+}
+
+/**
+ * Reconcile a booking's stored payment events into a reproducible report.
+ *
+ * Handles the three failure modes support cares about:
+ *  - **duplicate** callbacks: collapsed by `event_id`, no double financial effect;
+ *  - **out-of-order** callbacks: ordering is normalized before derivation;
+ *  - **missing** provider callbacks: surfaced via `missing_provider_callback`.
+ */
+export function reconcilePaymentEvents(
+    bookingId: string,
+    events: readonly PaymentLedgerEvent[],
+): ReconciliationReport {
+    const counts = new Map<string, number>();
+    for (const event of events) {
+        counts.set(event.event_id, (counts.get(event.event_id) ?? 0) + 1);
+    }
+    const duplicate_event_ids = [...counts.entries()]
+        .filter(([, count]) => count > 1)
+        .map(([id]) => id)
+        .sort();
+
+    const derived_status = derivePaymentStatus(events);
+    const captured_amount = deriveCapturedAmount(events).toString();
+
+    const hasProviderCallback = events.some(
+        (e) => e.external_reference !== null && e.event_type !== 'attempt',
+    );
+
+    return {
+        booking_id: bookingId,
+        derived_status,
+        captured_amount,
+        duplicate_event_ids,
+        settled: TERMINAL_EVENT_TYPES.has(
+            derived_status === 'captured'
+                ? 'captured'
+                : derived_status === 'failed'
+                    ? 'failed'
+                    : derived_status === 'refunded'
+                        ? 'refunded'
+                        : derived_status === 'cancelled'
+                            ? 'cancelled'
+                            : 'attempt',
+        ),
+        missing_provider_callback: !hasProviderCallback,
+    };
 }

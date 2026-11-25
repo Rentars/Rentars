@@ -9,6 +9,20 @@ const router = Router();
 export type HealthStatus = 'ok' | 'error' | 'not_configured';
 
 /**
+ * Service version reported by health probes so deployment records can link
+ * a release to the health results observed during promotion.
+ * Falls back to 'unknown' when no version metadata is provided at build time.
+ */
+export function getServiceVersion(): string {
+  return (
+    process.env.SERVICE_VERSION ??
+    process.env.APP_VERSION ??
+    process.env.npm_package_version ??
+    'unknown'
+  );
+}
+
+/**
  * Probe database connectivity. Never throws — resolves to false on failure.
  */
 export async function pingDatabase(): Promise<boolean> {
@@ -45,6 +59,7 @@ router.get('/health', (_req: Request, res: Response) => {
   res.status(200).json({
     status: 'ok',
     service: 'Rentars API 🚀',
+    version: getServiceVersion(),
     timestamp: new Date().toISOString(),
   });
 });
@@ -106,6 +121,7 @@ router.get('/health/ready', async (_req: Request, res: Response) => {
   res.status(notReady ? 503 : 200).json({
     status: notReady ? 'not_ready' : 'ready',
     service: 'Rentars API 🚀',
+    version: getServiceVersion(),
     timestamp: new Date().toISOString(),
     checks: {
       ...checks,

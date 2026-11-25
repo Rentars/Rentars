@@ -203,6 +203,10 @@ describe('Booking flow integration', () => {
         (init as RequestInit | undefined)?.method === 'POST'
     );
     expect(bookingPost).toBeDefined();
+    const headers = (bookingPost?.[1] as RequestInit | undefined)?.headers as Record<string, string> | undefined;
+    expect(headers?.['Idempotency-Key']).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+    );
 
     rerender(<BookingConfirmationPage bookingId="booking-123" />);
 

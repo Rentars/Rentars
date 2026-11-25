@@ -2,7 +2,114 @@ import { supabase } from '@/config/supabase.js';
 import * as cache from './cache.service.js';
 import type { ServiceResponse } from './index.js';
 
+/**
+ * Documented geospatial search policy.
+ *
+ * - Coordinates are WGS-84 degrees.
+ * - Latitude must be within [-90, 90]; longitude within [-180, 180].
+ * - Coordinates are rounded to 4 decimal places (~11 m) before use so that
+ *   near-identical inputs share cache entries and query plans.
+ * - Radius is expressed in kilometres, must be strictly positive and may not
+ *   exceed {@link MAX_SEARCH_RADIUS_KM}.
+ */
+export const MAX_SEARCH_RADIUS_KM = 500;
+export const MIN_SEARCH_RADIUS_KM = 0.001;
+export const COORDINATE_PRECISION_DP = 4;
+
+/** Field-level validation errors keyed by input field name. */
+export type GeoFieldErrors = Record<string, string>;
+
+export interface ValidatedGeoQuery {
+  lat: number;
+  lng: number;
+  radiusKm: number;
+}
+
+export type GeoValidationResult =
+  | { ok: true; value: ValidatedGeoQuery }
+  | { ok: false; fields: GeoFieldErrors };
+
+/** Round a coordinate to the documented precision. */
+export function roundCoordinate(value: number): number {
+  const factor = 10 ** COORDINATE_PRECISION_DP;
+  return Math.round(value * factor) / factor;
+}
+
+/**
+ * Validate a latitude/longitude pair and radius as a single unit.
+ *
+ * Latitude and longitude must be supplied together: providing only one is a
+ * field-level error on the missing field. Non-finite values (NaN, Infinity)
+ * and out-of-range values are rejected. The radius is validated against the
+ * documented policy bounds.
+ */
+export function validateGeoQuery(input: {
+  lat?: number | string | null;
+  lng?: number | string | null;
+  radiusKm?: number | string | null;
+}): GeoValidationResult {
+  const fields: GeoFieldErrors = {};
+
+  const hasLat = input.lat !== undefined && input.lat !== null && input.lat !== '';
+  const hasLng = input.lng !== undefined && input.lng !== null && input.lng !== '';
+
+  const lat = hasLat ? Number(input.lat) : NaN;
+  const lng = hasLng ? Number(input.lng) : NaN;
+
+  if (!hasLat && !hasLng) {
+    fields.lat = 'Latitude is required when longitude is provided';
+    fields.lng = 'Longitude is required when latitude is provided';
+  } else if (hasLat && !hasLng) {
+    fields.lng = 'Longitude is required when latitude is provided';
+  } else if (!hasLat && hasLng) {
+    fields.lat = 'Latitude is required when longitude is provided';
+  }
+
+  if (hasLat) {
+    if (!Number.isFinite(lat)) {
+      fields.lat = 'Latitude must be a finite number';
+    } else if (lat < -90 || lat > 90) {
+      fields.lat = 'Latitude must be between -90 and 90';
+    }
+  }
+
+  if (hasLng) {
+    if (!Number.isFinite(lng)) {
+      fields.lng = 'Longitude must be a finite number';
+    } else if (lng < -180 || lng > 180) {
+      fields.lng = 'Longitude must be between -180 and 180';
+    }
+  }
+
+  const hasRadius = input.radiusKm !== undefined && input.radiusKm !== null && input.radiusKm !== '';
+  const radiusKm = hasRadius ? Number(input.radiusKm) : NaN;
+
+  if (!hasRadius) {
+    fields.radiusKm = 'Radius is required';
+  } else if (!Number.isFinite(radiusKm)) {
+    fields.radiusKm = 'Radius must be a finite number';
+  } else if (radiusKm < MIN_SEARCH_RADIUS_KM) {
+    fields.radiusKm = `Radius must be at least ${MIN_SEARCH_RADIUS_KM} km`;
+  } else if (radiusKm > MAX_SEARCH_RADIUS_KM) {
+    fields.radiusKm = `Radius must not exceed ${MAX_SEARCH_RADIUS_KM} km`;
+  }
+
+  if (Object.keys(fields).length > 0) {
+    return { ok: false, fields };
+  }
+
+  return {
+    ok: true,
+    value: {
+      lat: roundCoordinate(lat),
+      lng: roundCoordinate(lng),
+      radiusKm,
+    },
+  };
+}
+
 export interface GeocodeResult {
+=======
   latitude: number;
   longitude: number;
   address: string;
@@ -35,6 +142,38 @@ export interface PriceComparison {
   price_rank: number;
   avg_area_price: number;
   price_diff_pct: number;
+}
+
+/**
+ * Map a thrown geocoder error to an actionable, code-stable ServiceResponse.
+ *
+ * The Nominatim fetch uses `AbortSignal.timeout`, so a slow provider surfaces
+ * as an `AbortError`/`TimeoutError` rather than a generic failure. Distinguishing
+ * the timeout lets the UI offer a "try again" fallback instead of reporting an
+ * opaque internal error.
+ */
+function classifyGeocodeError(error: unknown, label: string): ServiceResponse<never> {
+  const name = error instanceof Error ? error.name : '';
+  const isTimeout =
+    name === 'AbortError' ||
+    name === 'TimeoutError' ||
+    (error instanceof Error && /timed? ?out/i.test(error.message));
+  if (isTimeout) {
+    return {
+      success: false,
+      error: `${label} timed out. The location provider did not respond in time — try again or enter a city manually.`,
+      statusCode: 504,
+      code: 'GEOCODE_TIMEOUT',
+    };
+  }
+  const message = error instanceof Error ? error.message : `${label} failed`;
+  return {
+    success: false,
+    error: `${label} failed. You can still search by typing a city or address.`,
+    statusCode: 502,
+    code: 'GEOCODE_PROVIDER_UNAVAILABLE',
+    details: process.env.NODE_ENV === 'test' ? message : undefined,
+  };
 }
 
 export class LocationService {
@@ -73,10 +212,20 @@ export class LocationService {
       });
 
       if (response.status === 429) {
-        return { success: false, error: 'Reverse geocoding rate limit exceeded', statusCode: 429 };
+        return {
+          success: false,
+          error: 'Reverse geocoding rate limit exceeded. Try again in a moment.',
+          statusCode: 429,
+          code: 'GEOCODE_RATE_LIMITED',
+        };
       }
       if (!response.ok) {
-        return { success: false, error: 'Reverse geocoding service unavailable', statusCode: 502 };
+        return {
+          success: false,
+          error: 'Reverse geocoding service is temporarily unavailable.',
+          statusCode: 502,
+          code: 'GEOCODE_PROVIDER_UNAVAILABLE',
+        };
       }
 
       const data = (await response.json()) as {
@@ -93,7 +242,12 @@ export class LocationService {
       };
 
       if (data.error || !data.display_name) {
-        return { success: false, error: 'Location not found', statusCode: 404 };
+        return {
+          success: false,
+          error: 'Location not found. Enter a city or address manually.',
+          statusCode: 404,
+          code: 'GEOCODE_NOT_FOUND',
+        };
       }
 
       // Build a concise label: "City, State, Country" falling back to display_name.
@@ -106,14 +260,18 @@ export class LocationService {
       await cache.set(cacheKey, result, REVERSE_GEOCODE_TTL);
       return { success: true, data: result };
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Reverse geocoding failed';
-      return { success: false, error: message, statusCode: 500 };
+      return classifyGeocodeError(error, 'Reverse geocoding');
     }
   }
 
   async geocode(address: string): Promise<ServiceResponse<GeocodeResult>> {
     if (!address || address.trim() === '') {
-      return { success: false, error: 'Address is required', statusCode: 400 };
+      return {
+        success: false,
+        error: 'Address is required',
+        statusCode: 400,
+        code: 'GEOCODE_INVALID_INPUT',
+      };
     }
 
     const cacheKey = `geocode:${address.trim().toLowerCase()}`;
@@ -128,10 +286,20 @@ export class LocationService {
       });
 
       if (response.status === 429) {
-        return { success: false, error: 'Geocoding rate limit exceeded', statusCode: 429 };
+        return {
+          success: false,
+          error: 'Geocoding rate limit exceeded. Try again in a moment.',
+          statusCode: 429,
+          code: 'GEOCODE_RATE_LIMITED',
+        };
       }
       if (!response.ok) {
-        return { success: false, error: 'Geocoding service unavailable', statusCode: 502 };
+        return {
+          success: false,
+          error: 'Geocoding service is temporarily unavailable. Enter a city manually instead.',
+          statusCode: 502,
+          code: 'GEOCODE_PROVIDER_UNAVAILABLE',
+        };
       }
 
       const results = (await response.json()) as Array<{
@@ -141,7 +309,12 @@ export class LocationService {
       }>;
 
       if (!results.length) {
-        return { success: false, error: 'Address not found', statusCode: 404 };
+        return {
+          success: false,
+          error: 'Address not found. Try a more specific city or address.',
+          statusCode: 404,
+          code: 'GEOCODE_NOT_FOUND',
+        };
       }
 
       const [hit] = results;
@@ -154,8 +327,7 @@ export class LocationService {
       await cache.set(cacheKey, result, GEOCODE_TTL);
       return { success: true, data: result };
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Geocoding failed';
-      return { success: false, error: message, statusCode: 500 };
+      return classifyGeocodeError(error, 'Geocoding');
     }
   }
 
@@ -164,37 +336,41 @@ export class LocationService {
     lng: number,
     radius: number,
   ): Promise<ServiceResponse<PropertyWithDistance[]>> {
-    if (!isFinite(lat) || !isFinite(lng) || isNaN(radius)) {
-      return { success: false, error: 'Invalid latitude, longitude, or radius', statusCode: 400 };
-    }
-    if (lat < -90 || lat > 90) {
-      return { success: false, error: 'Latitude must be between -90 and 90', statusCode: 400 };
-    }
-    if (lng < -180 || lng > 180) {
-      return { success: false, error: 'Longitude must be between -180 and 180', statusCode: 400 };
+    const validation = validateGeoQuery({ lat, lng, radiusKm: radius });
+    if (!validation.ok) {
+      return {
+        success: false,
+        error: 'Invalid geospatial search parameters',
+        statusCode: 422,
+        fields: validation.fields,
+      };
     }
 
-    if (radius <= 0) {
-      return { success: false, error: 'Radius must be positive', statusCode: 400 };
-    }
+    const { lat: safeLat, lng: safeLng, radiusKm } = validation.value;
 
     try {
       const { data, error } = await supabase.rpc('search_nearby_properties', {
-        lat,
-        lng,
-        radius_km: radius,
+        lat: safeLat,
+        lng: safeLng,
+        radius_km: radiusKm,
       });
 
       if (error) {
         // Fallback: filter in JS when PostGIS RPC is not available
-        const fallback = await this.nearbyFallback(lat, lng, radius);
-        return fallback;
+        return await this.nearbyFallback(safeLat, safeLng, radiusKm);
       }
 
       return { success: true, data: data || [] };
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Search failed';
-      return { success: false, error: message, statusCode: 500 };
+      // A thrown error (e.g. missing PostGIS schema) should not fail the
+      // search outright; degrade to the JS-side haversine fallback.
+      try {
+        return await this.nearbyFallback(safeLat, safeLng, radiusKm);
+      } catch (fallbackError) {
+        const message =
+          fallbackError instanceof Error ? fallbackError.message : 'Search failed';
+        return { success: false, error: message, statusCode: 500 };
+      }
     }
   }
 
@@ -242,6 +418,15 @@ export class LocationService {
 
     const R = 6371;
     const nearby = (data as PropertyWithDistance[])
+      .filter(
+        (p) =>
+          Number.isFinite(p.latitude) &&
+          Number.isFinite(p.longitude) &&
+          p.latitude >= -90 &&
+          p.latitude <= 90 &&
+          p.longitude >= -180 &&
+          p.longitude <= 180,
+      )
       .map((p) => {
         const dLat = ((p.latitude - lat) * Math.PI) / 180;
         const dLng = ((p.longitude - lng) * Math.PI) / 180;

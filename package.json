@@ -23,7 +23,12 @@
     "engines:check": "bash scripts/check-engines.sh",
     "versions": "bash scripts/check-engines.sh",
     "release:validate": "bun run scripts/validate-changelog.ts",
-    "release:manifest": "bun run scripts/generate-release-manifest.ts"
+    "release:manifest": "bun run scripts/generate-release-manifest.ts",
+    "audit": "yarn workspace rentars-backend audit --audit-level=high && yarn workspace web audit --audit-level=high",
+    "audit:backend": "yarn workspace rentars-backend audit --audit-level=high",
+    "audit:web": "yarn workspace web audit --audit-level=high",
+    "audit:contracts": "cd apps/contracts && cargo audit",
+    "audit:all": "yarn audit:backend && yarn audit:web && yarn audit:contracts"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
