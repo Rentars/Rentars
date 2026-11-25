@@ -47,6 +47,64 @@ describe('usePropertySearch', () => {
     expect(typeof result.current.getTrending).toBe('function');
   });
 
+  describe('viewport queries (#938)', () => {
+    const bounds = {
+      getNorth: () => 40.123456,
+      getSouth: () => 40.023456,
+      getEast: () => -73.923456,
+      getWest: () => -74.023456,
+    } as unknown as import('leaflet').LatLngBounds;
+
+    it('keeps active filters and quantises bounds in the request', async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ data: [beachHouse], count: 1 }));
+      const { result } = renderHook(() => usePropertySearch({ debounceMs: 0 }));
+
+      await act(async () => {
+        result.current.searchByBounds(bounds, {
+          priceMin: 100,
+          priceMax: 500,
+          amenities: ['wifi'],
+          propertyType: 'House',
+        });
+        await new Promise((r) => setTimeout(r, 5));
+      });
+
+      const url = new URL(mockFetch.mock.calls[0][0] as string, 'http://localhost');
+      expect(url.pathname).toBe('/api/v1/properties/search/bounds');
+      expect(url.searchParams.get('north')).toBe('40.1235');
+      expect(url.searchParams.get('west')).toBe('-74.0235');
+      expect(url.searchParams.get('min_price')).toBe('100');
+      expect(url.searchParams.get('max_price')).toBe('500');
+      expect(url.searchParams.get('property_types')).toBe('House');
+      expect(url.searchParams.getAll('amenities')).toEqual(['wifi']);
+    });
+
+    it('only the latest viewport response updates markers/results', async () => {
+      const first = deferred<unknown>();
+      mockFetch.mockReturnValueOnce(first.promise);
+      mockFetch.mockResolvedValueOnce(jsonResponse({ data: [beachHouse], count: 1 }));
+      const { result } = renderHook(() => usePropertySearch({ debounceMs: 0 }));
+
+      act(() => {
+        result.current.searchByBounds(bounds);
+      });
+      await new Promise((r) => setTimeout(r, 5));
+
+      // A new pan supersedes the in-flight request.
+      await act(async () => {
+        result.current.searchByBounds(bounds);
+        await new Promise((r) => setTimeout(r, 5));
+      });
+
+      first.resolve(jsonResponse({ data: [staleCabin], count: 1 }));
+      await act(async () => {
+        await first.promise;
+      });
+
+      expect(result.current.results).toEqual([beachHouse]);
+    });
+  });
+
   describe('error vs empty', () => {
     it('reports an empty result as success, not an error', async () => {
       mockFetch.mockResolvedValueOnce(

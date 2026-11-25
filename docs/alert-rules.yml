@@ -1,0 +1,918 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Rentars — Prometheus Alert Rules
+#
+# Every rule in this file is derived from the objectives and thresholds in
+# docs/SLO.md. The structure is:
+#
+#   Journey J1  — Availability (platform uptime)
+#   Journey J2  — Property search
+#   Journey J3  — Booking creation
+#   Journey J4  — Payment reconciliation (escrow)
+#   Journey J5  — Notification delivery
+#   Journey J6  — Blockchain sync lag
+#   Platform    — Resource exhaustion, auth abuse, general ops
+#
+# BEFORE GOING LIVE (checklist from docs/SLO.md §9.1):
+#   [ ] Unit-test each PromQL expression against staging metrics
+#   [ ] Verify silence test: single spike below threshold does not fire
+#   [ ] Verify recovery test: alert resolves after condition clears
+#   [ ] Confirm runbook URL is reachable and links to the correct section
+#   [ ] Wire routing matrix to real PagerDuty service IDs (see §9.2)
+#   [ ] Record test date in annotations.tested_on for each rule
+#
+# OPEN RISKS (docs/SLO.md §10.4):
+#   Risk #1: notifications_sent_total not yet emitted → J5 uses proxy metric
+#   Risk #2: booking_sync_last_success_timestamp gauge not yet emitted → J6
+#            BookingSyncStaleness rule is listed but will not fire until the
+#            gauge is added to sync.service.ts
+#   Risk #3: notification_created_total not yet emitted → J5 in-app SLI uses
+#            DB query, not Prometheus; no alert rule possible yet
+#   Risk #5: PagerDuty policy names below are placeholders — replace with real
+#            service IDs before production
+# ─────────────────────────────────────────────────────────────────────────────
+
+groups:
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # J1 — Availability (platform uptime)
+  #
+  # SLO: 99.5% over a 28-day rolling window
+  # Error budget: 0.5% ≈ 3 h 21 min of downtime per 28-day window
+  # SLI source: probe_runs_total{suite="api_health"} from probe.service.ts
+  # Primary responder: On-Call SRE  (PagerDuty: rentars-platform)
+  # Runbook: apps/backend/RUNBOOKS.md §1
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: J1_Availability
+    rules:
+
+      # Fast burn: 14× over 1 h — exhausts 100% of budget in ≈ 2 h.
+      # Requires immediate page.
+      - alert: J1_AvailabilityFastBurn
+        expr: |
+          (
+            1 -
+            rate(probe_runs_total{suite="api_health",outcome="success"}[1h])
+            /
+            rate(probe_runs_total{suite="api_health"}[1h])
+          )
+          > (14 * (1 - 0.995))
+        for: 2m
+        labels:
+          severity: critical
+          journey: J1_availability
+          owner: sre_oncall
+          pagerduty_policy: rentars-platform
+        annotations:
+          summary: "J1 Availability: fast burn rate ≥ 14× (SLO 99.5%)"
+          description: >
+            The API health probe success rate is consuming error budget at ≥ 14×
+            the allowed pace over the last 1 h. At this rate the full 28-day budget
+            is exhausted in approximately 2 h. Investigate immediately.
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#1-api-outage--service-down"
+          slo_doc: "https://github.com/Mansa147/Rentars/blob/main/docs/SLO.md#2-journey-j1--availability-platform-uptime"
+          tested_on: ""   # fill in after staging test
+
+      # Medium burn: 6× over 6 h — exhausts 100% in ≈ 4.5 h.
+      # Also requires a page.
+      - alert: J1_AvailabilityMediumBurn
+        expr: |
+          (
+            1 -
+            rate(probe_runs_total{suite="api_health",outcome="success"}[6h])
+            /
+            rate(probe_runs_total{suite="api_health"}[6h])
+          )
+          > (6 * (1 - 0.995))
+        for: 10m
+        labels:
+          severity: critical
+          journey: J1_availability
+          owner: sre_oncall
+          pagerduty_policy: rentars-platform
+        annotations:
+          summary: "J1 Availability: medium burn rate ≥ 6× over 6 h"
+          description: >
+            Availability is consuming error budget at ≥ 6× the allowed pace over
+            6 h. Full budget exhaustion in ≈ 4.5 h if rate continues. Page and
+            investigate.
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#1-api-outage--service-down"
+          slo_doc: "https://github.com/Mansa147/Rentars/blob/main/docs/SLO.md#2-journey-j1--availability-platform-uptime"
+          tested_on: ""
+
+      # Slow burn: 1× over 3 d — on pace to exhaust budget by end of window.
+      # Ticket only; no page.
+      - alert: J1_AvailabilitySlowBurn
+        expr: |
+          (
+            1 -
+            rate(probe_runs_total{suite="api_health",outcome="success"}[3d])
+            /
+            rate(probe_runs_total{suite="api_health"}[3d])
+          )
+          > (1 * (1 - 0.995))
+        for: 1h
+        labels:
+          severity: warning
+          journey: J1_availability
+          owner: sre_oncall
+          pagerduty_policy: ""
+          slack_channel: "#ops-alerts"
+        annotations:
+          summary: "J1 Availability: slow burn — budget pacing toward exhaustion"
+          description: >
+            Availability is consuming error budget at ≥ 1× the allowed rate over 3 d.
+            No immediate action required but a ticket should be created before the
+            budget drops below 50%. Review recent deploys and dependency health.
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#1-api-outage--service-down"
+          slo_doc: "https://github.com/Mansa147/Rentars/blob/main/docs/SLO.md#2-journey-j1--availability-platform-uptime"
+          tested_on: ""
+
+      # Health check deep failure — database or Redis returning not-ok.
+      - alert: J1_HealthCheckDatabaseFailing
+        expr: |
+          probe_runs_total{suite="api_health",outcome="success"} == 0
+          and
+          probe_runs_total{suite="api_health"}[2m] > 0
+        for: 1m
+        labels:
+          severity: critical
+          journey: J1_availability
+          owner: sre_oncall
+          pagerduty_policy: rentars-platform
+        annotations:
+          summary: "J1 Availability: GET /health returning non-200 for 1+ minute"
+          description: >
+            All health probes are failing. API is unreachable or the database/Redis
+            dependency check is reporting an error. This is a P1 or P0 event.
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#1-api-outage--service-down"
+          tested_on: ""
+
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # J2 — Property search
+  #
+  # SLO (availability): 99.5% — search routes must return non-5xx
+  # SLO (latency):      95% of requests complete within 500 ms
+  # Primary responder: Backend On-Call  (PagerDuty: rentars-backend)
+  # Runbook: apps/backend/RUNBOOKS.md §8
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: J2_Search
+    rules:
+
+      # Availability fast burn: 14× over 1 h.
+      - alert: J2_SearchAvailabilityFastBurn
+        expr: |
+          (
+            1 -
+            rate(http_requests_total{route=~"/api/v1/properties.*",status!~"5.."}[1h])
+            /
+            rate(http_requests_total{route=~"/api/v1/properties.*"}[1h])
+          )
+          > (14 * (1 - 0.995))
+        for: 2m
+        labels:
+          severity: critical
+          journey: J2_search
+          owner: backend_oncall
+          pagerduty_policy: rentars-backend
+        annotations:
+          summary: "J2 Search: availability fast burn ≥ 14×"
+          description: >
+            Search routes are returning 5xx at a rate that consumes the full
+            28-day error budget in ≈ 2 h. Page Backend On-Call immediately.
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#8-high-latency--slow-requests"
+          slo_doc: "https://github.com/Mansa147/Rentars/blob/main/docs/SLO.md#3-journey-j2--property-search"
+          tested_on: ""
+
+      # Availability slow burn: 1× over 3 d → ticket.
+      - alert: J2_SearchAvailabilitySlowBurn
+        expr: |
+          (
+            1 -
+            rate(http_requests_total{route=~"/api/v1/properties.*",status!~"5.."}[3d])
+            /
+            rate(http_requests_total{route=~"/api/v1/properties.*"}[3d])
+          )
+          > (1 * (1 - 0.995))
+        for: 1h
+        labels:
+          severity: warning
+          journey: J2_search
+          owner: backend_oncall
+          pagerduty_policy: ""
+          slack_channel: "#ops-alerts"
+        annotations:
+          summary: "J2 Search: availability slow burn — create ticket"
+          description: >
+            Search availability is consuming error budget at ≥ 1× the allowed
+            rate over 3 d. Investigate before budget drops to Yellow state.
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#8-high-latency--slow-requests"
+          tested_on: ""
+
+      # Latency critical: p99 > 2 s sustained for 5 min.
+      - alert: J2_SearchLatencyCritical
+        expr: |
+          histogram_quantile(0.99,
+            rate(http_request_duration_seconds_bucket{
+              route=~"/api/v1/properties.*",
+              method="GET"
+            }[5m])
+          ) > 2.0
+        for: 5m
+        labels:
+          severity: critical
+          journey: J2_search
+          owner: backend_oncall
+          pagerduty_policy: rentars-backend
+        annotations:
+          summary: "J2 Search: p99 latency > 2 s for 5 min"
+          description: >
+            Property search p99 response time has exceeded 2 s for 5 consecutive
+            minutes. SLO target is p99 ≤ 500 ms for 95% of requests. At 2 s the
+            user experience is unacceptable. Check DB query plans, Redis cache
+            hit rate, and concurrent connection pool usage.
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#8-high-latency--slow-requests"
+          tested_on: ""
+
+      # Latency warning: p99 > 500 ms sustained for 30 min → ticket.
+      - alert: J2_SearchLatencyTicket
+        expr: |
+          histogram_quantile(0.99,
+            rate(http_request_duration_seconds_bucket{
+              route=~"/api/v1/properties.*",
+              method="GET"
+            }[5m])
+          ) > 0.5
+        for: 30m
+        labels:
+          severity: warning
+          journey: J2_search
+          owner: backend_oncall
+          pagerduty_policy: ""
+          slack_channel: "#ops-alerts"
+        annotations:
+          summary: "J2 Search: p99 latency > 500 ms for 30 min — create ticket"
+          description: >
+            Search p99 has exceeded the 500 ms SLO threshold for 30 min. No
+            immediate page but a ticket is required. Common causes: missing
+            index, cold cache, or increased data volume.
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#8-high-latency--slow-requests"
+          tested_on: ""
+
+      # Cache health: hit rate below 50% for 15 min → info.
+      - alert: J2_SearchCacheHitRateLow
+        expr: |
+          rate(probe_runs_total{suite="search_cached",outcome="success"}[15m])
+          /
+          rate(probe_runs_total{suite="search_cached"}[15m])
+          < 0.50
+        for: 15m
+        labels:
+          severity: info
+          journey: J2_search
+          owner: backend_oncall
+          pagerduty_policy: ""
+          slack_channel: "#ops-alerts"
+        annotations:
+          summary: "J2 Search: Redis cache hit rate below 50%"
+          description: >
+            Fewer than 50% of search probe requests are hitting the cache over
+            the last 15 min. This can precede a latency degradation. Check Redis
+            memory usage and eviction policy. No page required; investigate during
+            business hours.
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#8-high-latency--slow-requests"
+          tested_on: ""
+
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # J3 — Booking creation
+  #
+  # SLO (availability): 99.0% (excludes 409 conflicts and 429 rate limits)
+  # SLO (latency):      95% of requests complete within 3 000 ms
+  # SLO (exclusivity):  100% — zero tolerance for double-bookings
+  # SLO (escrow):       99.0% creation success
+  # Primary responder: Backend On-Call  (PagerDuty: rentars-backend)
+  # Finance escrow alerts: Finance Owner  (PagerDuty: rentars-finance)
+  # Runbook: apps/backend/RUNBOOKS.md §3
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: J3_Booking
+    rules:
+
+      # Availability fast burn: 14× over 1 h.
+      - alert: J3_BookingAvailabilityFastBurn
+        expr: |
+          (
+            1 -
+            rate(http_requests_total{route="/api/v1/bookings",method="POST",status!~"5.."}[1h])
+            /
+            rate(http_requests_total{route="/api/v1/bookings",method="POST",status!~"(409|429)"}[1h])
+          )
+          > (14 * (1 - 0.99))
+        for: 2m
+        labels:
+          severity: critical
+          journey: J3_booking
+          owner: backend_oncall
+          pagerduty_policy: rentars-backend
+        annotations:
+          summary: "J3 Booking: availability fast burn ≥ 14×"
+          description: >
+            Booking creation is returning 5xx at a rate that exhausts the full
+            28-day error budget in ≈ 2 h. Page Backend On-Call and concurrently
+            notify Finance Owner. 409 (conflict) and 429 (rate-limit) are
+            excluded from this calculation.
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#3-payment--escrow-failure"
+          slo_doc: "https://github.com/Mansa147/Rentars/blob/main/docs/SLO.md#4-journey-j3--booking-creation"
+          tested_on: ""
+
+      # Availability slow burn: 1× over 3 d → ticket.
+      - alert: J3_BookingAvailabilitySlowBurn
+        expr: |
+          (
+            1 -
+            rate(http_requests_total{route="/api/v1/bookings",method="POST",status!~"5.."}[3d])
+            /
+            rate(http_requests_total{route="/api/v1/bookings",method="POST",status!~"(409|429)"}[3d])
+          )
+          > (1 * (1 - 0.99))
+        for: 1h
+        labels:
+          severity: warning
+          journey: J3_booking
+          owner: backend_oncall
+          pagerduty_policy: ""
+          slack_channel: "#ops-alerts"
+        annotations:
+          summary: "J3 Booking: availability slow burn — create ticket"
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#3-payment--escrow-failure"
+          tested_on: ""
+
+      # Latency critical: p99 > 5 s sustained for 5 min.
+      - alert: J3_BookingLatencyCritical
+        expr: |
+          histogram_quantile(0.99,
+            rate(http_request_duration_seconds_bucket{
+              route="/api/v1/bookings",
+              method="POST"
+            }[5m])
+          ) > 5.0
+        for: 5m
+        labels:
+          severity: critical
+          journey: J3_booking
+          owner: backend_oncall
+          pagerduty_policy: rentars-backend
+        annotations:
+          summary: "J3 Booking: p99 latency > 5 s for 5 min"
+          description: >
+            Booking creation p99 response time has exceeded 5 s for 5 min.
+            SLO target is ≤ 3 000 ms for 95% of requests. At 5 s the escrow
+            call is likely timing out. Check Stellar RPC and Trustless Work API
+            response times.
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#3-payment--escrow-failure"
+          tested_on: ""
+
+      # Latency warning: p99 > 3 s sustained for 30 min → ticket.
+      - alert: J3_BookingLatencyTicket
+        expr: |
+          histogram_quantile(0.99,
+            rate(http_request_duration_seconds_bucket{
+              route="/api/v1/bookings",
+              method="POST"
+            }[5m])
+          ) > 3.0
+        for: 30m
+        labels:
+          severity: warning
+          journey: J3_booking
+          owner: backend_oncall
+          pagerduty_policy: ""
+          slack_channel: "#ops-alerts"
+        annotations:
+          summary: "J3 Booking: p99 latency > 3 s for 30 min — create ticket"
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#4-blockchain--stellar-rpc-connection-issues"
+          tested_on: ""
+
+      # Escrow creation failure spike — fires immediately (for: 0m).
+      # Pages Backend On-Call AND Finance Owner concurrently.
+      - alert: J3_EscrowCreationFailureSpike
+        expr: rate(escrow_failures_total{operation="create"}[5m]) > 5
+        for: 0m
+        labels:
+          severity: critical
+          journey: J3_booking
+          owner: finance_oncall
+          pagerduty_policy: rentars-finance
+          also_page: rentars-backend
+        annotations:
+          summary: "J3 Booking: escrow creation failures > 5 in 5 min"
+          description: >
+            More than 5 escrow creation failures occurred in the last 5 minutes.
+            Bookings are being created without escrows, leaving them in an
+            indeterminate payment state. Page Finance Owner AND Backend On-Call.
+            Check Trustless Work API status and Stellar account XLM balance.
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#3-payment--escrow-failure"
+          tested_on: ""
+
+      # Double-booking detection (P0 — pages Incident Commander).
+      # This fires based on the escrow_failures_total QUARANTINE signal.
+      # The definitive check is a DB query; this Prometheus rule provides a
+      # real-time early-warning signal from the QUARANTINE payment log.
+      # Note: a dedicated double_booking_detected_total counter should be added
+      # to the booking service to make this SLI directly observable.
+      - alert: J3_ExclusivityViolationSuspected
+        expr: |
+          rate(payment_failures_total{reason="QUARANTINE"}[1m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          journey: J3_booking
+          owner: incident_commander
+          pagerduty_policy: rentars-incident-command
+          p0: "true"
+        annotations:
+          summary: "J3 Booking: P0 — QUARANTINE payment state detected (possible double-booking)"
+          description: >
+            A payment entered QUARANTINE state, which indicates an unexpected
+            state machine transition. This may be a symptom of a double-booking
+            or data-integrity violation. Page Incident Commander immediately.
+            Verify by querying bookings for overlapping confirmed date ranges.
+            All new booking creation should be paused until confirmed safe.
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#3-payment--escrow-failure"
+          slo_doc: "https://github.com/Mansa147/Rentars/blob/main/docs/SLO.md#4-journey-j3--booking-creation"
+          tested_on: ""
+
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # J4 — Payment reconciliation (escrow)
+  #
+  # SLO (reconciliation): 99.5% — release/refund/cancel operations succeed
+  # SLO (orphan escrows): 100% zero tolerance
+  # SLO (latency):        99.0% of bookings settle within 15 min
+  # Primary responder: Finance Owner  (PagerDuty: rentars-finance)
+  # Technical support: Backend On-Call
+  # Runbook: apps/backend/RUNBOOKS.md §3
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: J4_Reconciliation
+    rules:
+
+      # Escrow release/refund/cancel failures — fires immediately.
+      - alert: J4_EscrowReleaseFailure
+        expr: rate(escrow_failures_total{operation=~"release|refund|cancel"}[5m]) > 3
+        for: 0m
+        labels:
+          severity: critical
+          journey: J4_reconciliation
+          owner: finance_oncall
+          pagerduty_policy: rentars-finance
+        annotations:
+          summary: "J4 Reconciliation: escrow release/refund/cancel failures > 3 in 5 min"
+          description: >
+            More than 3 escrow release, refund, or cancellation operations failed
+            in the last 5 minutes. Financial records may be in an inconsistent
+            state. Page Finance Owner and check Trustless Work API and Stellar
+            network status. Run the reconciliation job manually after the incident.
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#3-payment--escrow-failure"
+          slo_doc: "https://github.com/Mansa147/Rentars/blob/main/docs/SLO.md#5-journey-j4--payment-reconciliation-escrow"
+          tested_on: ""
+
+      # Payment failure spike.
+      - alert: J4_PaymentFailureSpike
+        expr: rate(payment_failures_total[5m]) > 3
+        for: 0m
+        labels:
+          severity: critical
+          journey: J4_reconciliation
+          owner: finance_oncall
+          pagerduty_policy: rentars-finance
+        annotations:
+          summary: "J4 Reconciliation: payment failures > 3 in 5 min"
+          description: >
+            General payment failure rate has exceeded 3 per 5 minutes. This
+            covers all payment state machine transitions. Page Finance Owner.
+            Check the payment.service.ts state machine logs and Supabase for
+            bookings in unexpected states.
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#3-payment--escrow-failure"
+          tested_on: ""
+
+      # Reconciliation fast burn: 14× over 1 h.
+      - alert: J4_ReconciliationFastBurn
+        expr: |
+          (
+            1 -
+            rate(escrow_operations_total{operation=~"release|refund|cancel"}[1h])
+            -
+            rate(escrow_failures_total{operation=~"release|refund|cancel"}[1h])
+            /
+            rate(escrow_operations_total{operation=~"release|refund|cancel"}[1h])
+          )
+          < (1 - (14 * (1 - 0.995)))
+        for: 2m
+        labels:
+          severity: critical
+          journey: J4_reconciliation
+          owner: finance_oncall
+          pagerduty_policy: rentars-finance
+        annotations:
+          summary: "J4 Reconciliation: fast burn ≥ 14× (SLO 99.5%)"
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#3-payment--escrow-failure"
+          tested_on: ""
+
+      # Reconciliation slow burn: 1× over 3 d → ticket.
+      - alert: J4_ReconciliationSlowBurn
+        expr: |
+          rate(escrow_failures_total{operation=~"release|refund|cancel"}[3d])
+          /
+          rate(escrow_operations_total{operation=~"release|refund|cancel"}[3d])
+          > (1 * (1 - 0.995))
+        for: 1h
+        labels:
+          severity: warning
+          journey: J4_reconciliation
+          owner: finance_oncall
+          pagerduty_policy: ""
+          slack_channel: "#ops-alerts"
+        annotations:
+          summary: "J4 Reconciliation: slow burn — create ticket"
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#3-payment--escrow-failure"
+          tested_on: ""
+
+      # Orphaned escrow (P0) — this requires a DB-side check.
+      # The rule below fires if a booking_escrow_reconcile_failed_total counter
+      # ever increments. Add this counter to payment.service.ts when a booking
+      # transitions to escrow_reconcile_failed status.
+      # Until that counter exists this rule is a placeholder; track as Risk #6.
+      - alert: J4_OrphanedEscrowDetected
+        expr: increase(booking_escrow_reconcile_failed_total[1h]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          journey: J4_reconciliation
+          owner: finance_oncall
+          pagerduty_policy: rentars-incident-command
+          p0: "true"
+        annotations:
+          summary: "J4 Reconciliation: P0 — orphaned escrow detected"
+          description: >
+            A booking has entered the escrow_reconcile_failed state. This means
+            an escrow operation (release, refund, or cancel) has failed and left
+            a booking in an unrecoverable state without manual intervention.
+            Page Finance Owner AND Incident Commander. Follow runbook §3
+            reconciliation recovery steps immediately.
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#3-payment--escrow-failure"
+          slo_doc: "https://github.com/Mansa147/Rentars/blob/main/docs/SLO.md#5-journey-j4--payment-reconciliation-escrow"
+          implementation_risk: "Risk #6 in SLO.md §10.4 — counter not yet emitted"
+          tested_on: ""
+
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # J5 — Notification delivery
+  #
+  # SLO (email):    98.0% — email delivery must not produce SMTP errors
+  # SLO (in-app):  99.0% — notifications created within 60 s of event
+  #
+  # NOTE: The dedicated notifications_sent_total counter is not yet emitted
+  # (docs/SLO.md §10.4 risk #1 and #3). Rules below use proxy metrics.
+  # Replace with direct counter rules once the metrics are added.
+  #
+  # Primary responder: Email/Comms Owner  (Slack: #ops-alerts)
+  # Runbook: apps/backend/RUNBOOKS.md §2
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: J5_Notifications
+    rules:
+
+      # Email failure spike: > 10 failures in 5 min → SMTP likely down.
+      # NOTE: This uses a proxy (5xx on notification route). Replace with
+      # rate(notifications_sent_total{channel="email",outcome="failure"}[5m]) > 10
+      # once the counter is added to notification.service.ts.
+      - alert: J5_NotificationEmailFailureSpike
+        expr: |
+          rate(http_errors_total{route="/api/v1/notifications",status_class="5xx"}[5m]) > 2
+        for: 5m
+        labels:
+          severity: warning
+          journey: J5_notifications
+          owner: comms_owner
+          pagerduty_policy: ""
+          slack_channel: "#ops-alerts"
+        annotations:
+          summary: "J5 Notifications: notification endpoint 5xx spike — possible SMTP failure"
+          description: >
+            The notification API endpoint is returning 5xx errors at > 2/s over
+            5 min. This is likely an SMTP provider failure. Email delivery SLO
+            is 98%. Notify Email/Comms Owner and check SMTP provider status.
+            Note: this is a proxy metric — add notifications_sent_total counter
+            to notification.service.ts to get a direct signal (SLO.md §10.4 risk #1).
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#2-high-error-rate-5xx-spike"
+          slo_doc: "https://github.com/Mansa147/Rentars/blob/main/docs/SLO.md#6-journey-j5--notification-delivery"
+          implementation_risk: "Proxy metric — see SLO.md §10.4 risk #1"
+          tested_on: ""
+
+      # Email delivery slow burn: 6× over 6 h → ticket.
+      - alert: J5_NotificationEmailSlowBurn
+        expr: |
+          rate(http_errors_total{route="/api/v1/notifications",status_class="5xx"}[6h])
+          /
+          rate(http_requests_total{route="/api/v1/notifications"}[6h])
+          > (6 * (1 - 0.98))
+        for: 30m
+        labels:
+          severity: warning
+          journey: J5_notifications
+          owner: comms_owner
+          pagerduty_policy: ""
+          slack_channel: "#ops-alerts"
+        annotations:
+          summary: "J5 Notifications: email delivery slow burn ≥ 6× — create ticket"
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#2-high-error-rate-5xx-spike"
+          implementation_risk: "Proxy metric — see SLO.md §10.4 risk #1"
+          tested_on: ""
+
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # J6 — Blockchain sync lag
+  #
+  # SLO (booking sync):   99.0% of time sync lag ≤ 120 s
+  # SLO (property sync):  99.5% of time sync lag ≤ 300 s
+  # SLO (RPC):            99.0% of calls succeed
+  # Primary responder: Backend On-Call  (PagerDuty: rentars-backend)
+  # RPC failures: Contracts Lead paged concurrently  (PagerDuty: rentars-blockchain)
+  # Runbook: apps/backend/RUNBOOKS.md §4
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: J6_BlockchainSync
+    rules:
+
+      # RPC failure spike — fires immediately.
+      - alert: J6_BlockchainRpcFailureSpike
+        expr: rate(blockchain_rpc_calls_total{outcome="failure"}[1m]) > 3
+        for: 0m
+        labels:
+          severity: critical
+          journey: J6_sync
+          owner: backend_oncall
+          pagerduty_policy: rentars-backend
+          also_page: rentars-blockchain
+        annotations:
+          summary: "J6 Sync: Stellar RPC failures > 3 in 1 min"
+          description: >
+            More than 3 Stellar RPC call failures occurred in the last minute.
+            Escrow operations and sync will be failing. Page Backend On-Call AND
+            Contracts Lead. Check Stellar network status at https://status.stellar.org
+            and the configured STELLAR_RPC_URL reachability.
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#4-blockchain--stellar-rpc-connection-issues"
+          slo_doc: "https://github.com/Mansa147/Rentars/blob/main/docs/SLO.md#7-journey-j6--blockchain-sync-lag"
+          tested_on: ""
+
+      # RPC fast burn: 14× over 1 h.
+      - alert: J6_BlockchainRpcFastBurn
+        expr: |
+          (
+            1 -
+            rate(blockchain_rpc_calls_total{outcome="success"}[1h])
+            /
+            rate(blockchain_rpc_calls_total[1h])
+          )
+          > (14 * (1 - 0.99))
+        for: 2m
+        labels:
+          severity: critical
+          journey: J6_sync
+          owner: backend_oncall
+          pagerduty_policy: rentars-backend
+          also_page: rentars-blockchain
+        annotations:
+          summary: "J6 Sync: RPC reliability fast burn ≥ 14×"
+          description: >
+            Stellar RPC call reliability is consuming the error budget at ≥ 14×
+            the allowed rate over 1 h. The full 28-day budget is exhausted in
+            ≈ 2 h. Page Backend On-Call and Contracts Lead.
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#4-blockchain--stellar-rpc-connection-issues"
+          tested_on: ""
+
+      # RPC slow burn: 1× over 3 d → ticket.
+      - alert: J6_BlockchainRpcSlowBurn
+        expr: |
+          (
+            1 -
+            rate(blockchain_rpc_calls_total{outcome="success"}[3d])
+            /
+            rate(blockchain_rpc_calls_total[3d])
+          )
+          > (1 * (1 - 0.99))
+        for: 1h
+        labels:
+          severity: warning
+          journey: J6_sync
+          owner: backend_oncall
+          pagerduty_policy: ""
+          slack_channel: "#ops-alerts"
+        annotations:
+          summary: "J6 Sync: RPC reliability slow burn — create ticket"
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#4-blockchain--stellar-rpc-connection-issues"
+          tested_on: ""
+
+      # Booking sync staleness: no successful sync for > 10 min (600 s).
+      # REQUIRES: booking_sync_last_success_timestamp gauge emitted by sync.service.ts
+      # (docs/SLO.md §10.4 risk #2). Rule is correct but will not fire until the
+      # gauge is added with:
+      #   observeGauge('booking_sync_last_success_timestamp', {}, Date.now() / 1000)
+      # after each successful writeSyncLog for entity_type='booking'.
+      - alert: J6_BookingSyncStale
+        expr: (time() - booking_sync_last_success_timestamp) > 600
+        for: 0m
+        labels:
+          severity: critical
+          journey: J6_sync
+          owner: backend_oncall
+          pagerduty_policy: rentars-backend
+        annotations:
+          summary: "J6 Sync: booking sync has not succeeded for > 10 min"
+          description: >
+            The booking_sync_last_success_timestamp gauge shows no successful
+            booking sync for more than 10 minutes. Booking status may be stale
+            on-chain. Page Backend On-Call. Check sync.service.ts logs and
+            Stellar RPC connectivity.
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#4-blockchain--stellar-rpc-connection-issues"
+          implementation_risk: "Requires gauge emission in sync.service.ts — see SLO.md §10.4 risk #2"
+          tested_on: ""
+
+      # Booking sync warning: lag > 2 min for 15 min → ticket.
+      # Same gauge dependency as above.
+      - alert: J6_BookingSyncLagTicket
+        expr: (time() - booking_sync_last_success_timestamp) > 120
+        for: 15m
+        labels:
+          severity: warning
+          journey: J6_sync
+          owner: backend_oncall
+          pagerduty_policy: ""
+          slack_channel: "#ops-alerts"
+        annotations:
+          summary: "J6 Sync: booking sync lag > 2 min for 15 min — create ticket"
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#4-blockchain--stellar-rpc-connection-issues"
+          implementation_risk: "Requires gauge emission in sync.service.ts — see SLO.md §10.4 risk #2"
+          tested_on: ""
+
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Platform — Resource exhaustion, auth abuse, general ops
+  #
+  # These are NOT SLO journeys. They are operational hygiene alerts that back
+  # the runbooks in RUNBOOKS.md. Each has a clear owner and response procedure.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: Platform_Operations
+    rules:
+
+      # Memory exhaustion: heap > 85% for 5 min.
+      # Runbook: RUNBOOKS.md §10
+      - alert: Platform_MemoryExhaustion
+        expr: |
+          process_heap_used_bytes / process_heap_bytes > 0.85
+        for: 5m
+        labels:
+          severity: warning
+          journey: platform
+          owner: sre_oncall
+          pagerduty_policy: ""
+          slack_channel: "#ops-alerts"
+        annotations:
+          summary: "Platform: heap memory > 85% for 5 min"
+          description: >
+            The API process heap is above 85% capacity. OOM kill risk is elevated.
+            Investigate for memory leaks, large in-memory operations, or
+            insufficient container memory limit. Consider an emergency restart if
+            heap reaches 95% before the root cause is identified.
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#10-memory-or-cpu-exhaustion"
+          tested_on: ""
+
+      # 5xx error rate > 1% of total requests over 5 min.
+      # Runbook: RUNBOOKS.md §2
+      - alert: Platform_HighErrorRate
+        expr: |
+          rate(http_errors_total{status_class="5xx"}[5m])
+          /
+          rate(http_requests_total[5m])
+          > 0.01
+        for: 5m
+        labels:
+          severity: critical
+          journey: platform
+          owner: backend_oncall
+          pagerduty_policy: rentars-backend
+        annotations:
+          summary: "Platform: 5xx error rate > 1% of total requests for 5 min"
+          description: >
+            More than 1% of all API requests are returning 5xx over the last
+            5 minutes. This is the general error-rate alarm; check journey-specific
+            alerts for more context. Identify the failing route(s) using the
+            http_errors_total route label.
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#2-high-error-rate-5xx-spike"
+          tested_on: ""
+
+      # 4xx error rate > 10% of total requests over 5 min (possible attack).
+      - alert: Platform_High4xxRate
+        expr: |
+          rate(http_errors_total{status_class="4xx"}[5m])
+          /
+          rate(http_requests_total[5m])
+          > 0.10
+        for: 5m
+        labels:
+          severity: warning
+          journey: platform
+          owner: backend_oncall
+          pagerduty_policy: ""
+          slack_channel: "#ops-alerts"
+        annotations:
+          summary: "Platform: 4xx error rate > 10% of total requests for 5 min"
+          description: >
+            More than 10% of requests are returning 4xx. This may indicate a
+            rate-limit flood, credential stuffing, or a misconfigured client.
+            Check the route label to identify the affected endpoint.
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#7-rate-limit-flood-429-spike"
+          tested_on: ""
+
+      # Auth failure spike: > 50 failures in 5 min — possible credential stuffing.
+      # Runbook: RUNBOOKS.md §5
+      - alert: Platform_AuthFailureSpike
+        expr: rate(auth_events_total{outcome="failure"}[5m]) > 50
+        for: 0m
+        labels:
+          severity: warning
+          journey: platform
+          owner: backend_oncall
+          pagerduty_policy: ""
+          slack_channel: "#ops-alerts"
+        annotations:
+          summary: "Platform: auth failures > 50 in 5 min — possible credential stuffing"
+          description: >
+            More than 50 authentication failures per 5-minute window. Common
+            causes: credential stuffing attack, JWT secret rotation without
+            rolling deploy, or Supabase auth outage. Check whether failures are
+            concentrated on a single IP or spread across many.
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#5-authentication-failures-401403-spike"
+          tested_on: ""
+
+      # Overall p99 latency > 2 s for 5 min.
+      # Runbook: RUNBOOKS.md §8
+      - alert: Platform_HighLatencyGlobal
+        expr: |
+          histogram_quantile(0.99,
+            rate(http_request_duration_seconds_bucket[5m])
+          ) > 2.0
+        for: 5m
+        labels:
+          severity: warning
+          journey: platform
+          owner: backend_oncall
+          pagerduty_policy: ""
+          slack_channel: "#ops-alerts"
+        annotations:
+          summary: "Platform: global p99 request latency > 2 s for 5 min"
+          description: >
+            API-wide p99 response time has exceeded 2 s. This is a global
+            indicator; check journey-specific latency alerts for the affected
+            routes. Common causes: DB query regression, Redis miss, or Stellar
+            RPC latency.
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#8-high-latency--slow-requests"
+          tested_on: ""
+
+      # Client error boundary flood: > 20 client errors in 5 min.
+      # Runbook: RUNBOOKS.md §9
+      - alert: Platform_ClientErrorBoundaryFlood
+        expr: rate(client_errors_total[5m]) > 20
+        for: 0m
+        labels:
+          severity: warning
+          journey: platform
+          owner: backend_oncall
+          pagerduty_policy: ""
+          slack_channel: "#ops-alerts"
+        annotations:
+          summary: "Platform: client error boundary flood > 20 errors in 5 min"
+          description: >
+            The frontend is reporting more than 20 client-side errors per 5 min
+            to POST /api/v1/client-errors. A common cause is a bad API response
+            shape after a backend deploy. Check the 'context' field in client
+            error reports to identify the failing UI component.
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#9-frontend-error-boundary-flood"
+          tested_on: ""
+
+      # Wallet approval errors > 5 in 5 min.
+      - alert: Platform_WalletApprovalErrors
+        expr: rate(wallet_approvals_total{outcome="error"}[5m]) > 5
+        for: 0m
+        labels:
+          severity: warning
+          journey: platform
+          owner: backend_oncall
+          pagerduty_policy: ""
+          slack_channel: "#ops-alerts"
+        annotations:
+          summary: "Platform: wallet approval errors > 5 in 5 min"
+          description: >
+            More than 5 wallet approval errors per 5 min. This affects
+            Stellar wallet auth and escrow signing. Check Stellar RPC
+            connectivity and Freighter extension compatibility.
+          runbook: "https://github.com/Mansa147/Rentars/blob/main/apps/backend/RUNBOOKS.md#4-blockchain--stellar-rpc-connection-issues"
+          tested_on: ""

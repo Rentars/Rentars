@@ -280,7 +280,116 @@ export async function emitEscrowFailed(
   return emitFunnelEvent({ event: 'payment.escrow_failed', session_id, user_id, properties: { ...props } });
 }
 
-// ─── Aggregate queries (used by the analytics dashboard endpoint) ─────────────
+// ─── Admin analytics: privacy-safe aggregate layer ────────────────────────────
+//
+// Standard admin reporting must only ever see aggregates.  Individual-level
+// behavioural data (raw events, IPs, exact coordinates, full query strings)
+// is never returned here; it is only reachable through the documented
+// elevated raw-data process (see docs/ANALYTICS_TAXONOMY.md), which is
+// role-gated and audited.
+
+/** Scope required to read standard (aggregate) admin analytics. */
+export const ANALYTICS_READ_SCOPE = 'admin:analytics:read';
+
+/** Scope required for the documented elevated raw-data access path. */
+export const ANALYTICS_RAW_SCOPE = 'admin:analytics:raw';
+
+/** Hard upper bound on any admin analytics time window, in days. */
+export const MAX_ANALYTICS_WINDOW_DAYS = 90;
+
+/** Default time window when the caller does not specify one. */
+export const DEFAULT_ANALYTICS_WINDOW_DAYS = 30;
+
+/**
+ * Minimum number of underlying events a group must contain before it is
+ * reported.  Groups below this threshold are suppressed to prevent
+ * re-identification of small cohorts.  Configurable via
+ * ADMIN_ANALYTICS_MIN_COHORT (default 10).
+ */
+export function getMinCohortSize(): number {
+  const raw = process.env.ADMIN_ANALYTICS_MIN_COHORT;
+  const parsed = raw === undefined ? NaN : Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 1) return 10;
+  return parsed;
+}
+
+/**
+ * Allowlisted filter fields for admin analytics queries.  Anything not in
+ * this list is rejected — arbitrary filtering is not permitted.
+ */
+export const ALLOWED_ANALYTICS_FILTERS = ['event', 'property_id'] as const;
+export type AnalyticsFilterField = (typeof ALLOWED_ANALYTICS_FILTERS)[number];
+
+export type AnalyticsFilters = Partial<Record<AnalyticsFilterField, string>>;
+
+/** Caller identity/authorization context for admin analytics requests. */
+export interface AnalyticsActor {
+  userId: string;
+  scopes: readonly string[];
+}
+
+export class AnalyticsAuthorizationError extends Error {
+  constructor(message = 'Not authorized to access analytics') {
+    super(message);
+    this.name = 'AnalyticsAuthorizationError';
+  }
+}
+
+export class AnalyticsValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AnalyticsValidationError';
+  }
+}
+
+function assertScope(actor: AnalyticsActor, scope: string): void {
+  if (!actor || !Array.isArray(actor.scopes) || !actor.scopes.includes(scope)) {
+    structuredLog({
+      level: 'warn',
+      message: 'Analytics access denied: missing scope',
+      timestamp: new Date().toISOString(),
+      user_id: actor?.userId ?? null,
+      required_scope: scope,
+    });
+    throw new AnalyticsAuthorizationError();
+  }
+}
+
+/**
+ * Clamp and validate a requested time window.  Rejects non-positive or
+ * non-finite windows and caps at MAX_ANALYTICS_WINDOW_DAYS.
+ */
+export function resolveWindowDays(requested?: number): number {
+  if (requested === undefined) return DEFAULT_ANALYTICS_WINDOW_DAYS;
+  if (!Number.isFinite(requested) || requested <= 0) {
+    throw new AnalyticsValidationError('Time window must be a positive number of days');
+  }
+  return Math.min(Math.floor(requested), MAX_ANALYTICS_WINDOW_DAYS);
+}
+
+function validateFilters(filters?: AnalyticsFilters): AnalyticsFilters {
+  if (!filters) return {};
+  const clean: AnalyticsFilters = {};
+  for (const [key, value] of Object.entries(filters)) {
+    if (!(ALLOWED_ANALYTICS_FILTERS as readonly string[]).includes(key)) {
+      throw new AnalyticsValidationError(`Filter field not allowed: ${key}`);
+    }
+    if (typeof value !== 'string' || value.length === 0 || value.length > 128) {
+      throw new AnalyticsValidationError(`Invalid filter value for: ${key}`);
+    }
+    clean[key as AnalyticsFilterField] = value;
+  }
+  return clean;
+}
+
+/**
+ * Normalize a free-text search query for aggregation.  Full query strings
+ * are never returned; only a short, lowercased, whitespace-collapsed token
+ * capped at 40 characters.
+ */
+export function normalizeQueryForAggregation(query: string): string {
+  return query.trim().toLowerCase().replace(/\s+/g, ' ').slice(0, 40);
+}
 
 export interface FunnelSummary {
   searches: number;
@@ -323,4 +432,163 @@ export async function getFunnelSummary(days = 30): Promise<FunnelSummary> {
     escrow_refunded:       count('payment.escrow_refunded'),
     escrow_failed:         count('payment.escrow_failed'),
   };
+}
+
+/** A single aggregated group.  `suppressed` groups carry no count. */
+export interface AggregateGroup {
+  key: string;
+  count: number | null;
+  suppressed: boolean;
+}
+
+export interface AdminFunnelReport {
+  window_days: number;
+  min_cohort: number;
+  total_events: number;
+  total_suppressed: boolean;
+  by_event: AggregateGroup[];
+}
+
+/**
+ * Privacy-safe aggregate funnel report for admin dashboards.
+ *
+ * - Requires the `admin:analytics:read` scope.
+ * - Only allowlisted filters are accepted.
+ * - Time window is bounded to MAX_ANALYTICS_WINDOW_DAYS.
+ * - Groups with fewer than the minimum cohort size are suppressed.
+ * - Returns counts only — never user_id, session_id, IPs, coordinates or
+ *   full query strings.
+ */
+export async function getAdminFunnelReport(
+  actor: AnalyticsActor,
+  options: { windowDays?: number; filters?: AnalyticsFilters } = {},
+): Promise<AdminFunnelReport> {
+  assertScope(actor, ANALYTICS_READ_SCOPE);
+
+  const windowDays = resolveWindowDays(options.windowDays);
+  const filters = validateFilters(options.filters);
+  const minCohort = getMinCohortSize();
+  const since = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000).toISOString();
+
+  let query = supabase
+    .from('funnel_events')
+    .select('event')
+    .gte('created_at', since);
+
+  if (filters.event) query = query.eq('event', filters.event);
+  if (filters.property_id) query = query.eq('properties->>property_id', filters.property_id);
+
+  const { data, error } = await query;
+
+  if (error || !data) {
+    structuredLog({
+      level: 'warn',
+      message: 'getAdminFunnelReport query failed',
+      timestamp: new Date().toISOString(),
+      error: error?.message,
+    });
+    return {
+      window_days: windowDays,
+      min_cohort: minCohort,
+      total_events: 0,
+      total_suppressed: true,
+      by_event: [],
+    };
+  }
+
+  const counts = new Map<string, number>();
+  for (const row of data) {
+    counts.set(row.event, (counts.get(row.event) ?? 0) + 1);
+  }
+
+  const by_event: AggregateGroup[] = [...counts.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, count]) =>
+      count < minCohort
+        ? { key, count: null, suppressed: true }
+        : { key, count, suppressed: false },
+    );
+
+  const totalEvents = data.length;
+
+  structuredLog({
+    level: 'info',
+    message: 'Admin analytics aggregate report generated',
+    timestamp: new Date().toISOString(),
+    user_id: actor.userId,
+    scope: ANALYTICS_READ_SCOPE,
+    window_days: windowDays,
+    filters,
+  });
+
+  return {
+    window_days: windowDays,
+    min_cohort: minCohort,
+    total_events: totalEvents < minCohort ? 0 : totalEvents,
+    total_suppressed: totalEvents < minCohort,
+    by_event,
+  };
+}
+
+/**
+ * Documented elevated raw-data access path.
+ *
+ * Raw event rows are only available to holders of `admin:analytics:raw`,
+ * require a documented purpose, are bounded to MAX_ANALYTICS_WINDOW_DAYS,
+ * and every access is audit-logged.  Even here, raw IPs, exact coordinates
+ * and full query strings are stripped from the response.
+ */
+export async function getRawAnalyticsEvents(
+  actor: AnalyticsActor,
+  options: { windowDays?: number; purpose: string; limit?: number },
+): Promise<Array<Record<string, unknown>>> {
+  assertScope(actor, ANALYTICS_RAW_SCOPE);
+
+  if (!options.purpose || options.purpose.trim().length < 10) {
+    throw new AnalyticsValidationError('A documented purpose is required for raw analytics access');
+  }
+
+  const windowDays = resolveWindowDays(options.windowDays);
+  const limit = Math.min(Math.max(options.limit ?? 100, 1), 1000);
+  const since = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000).toISOString();
+
+  structuredLog({
+    level: 'warn',
+    message: 'Elevated raw analytics access',
+    timestamp: new Date().toISOString(),
+    user_id: actor.userId,
+    scope: ANALYTICS_RAW_SCOPE,
+    purpose: options.purpose,
+    window_days: windowDays,
+    limit,
+  });
+
+  const { data, error } = await supabase
+    .from('funnel_events')
+    .select('event, properties, created_at')
+    .gte('created_at', since)
+    .order('created_at', { ascending: false })
+    .limit(limit);
+
+  if (error || !data) {
+    structuredLog({
+      level: 'warn',
+      message: 'getRawAnalyticsEvents query failed',
+      timestamp: new Date().toISOString(),
+      error: error?.message,
+    });
+    return [];
+  }
+
+  const FORBIDDEN_RAW_KEYS = ['ip', 'ip_address', 'latitude', 'longitude', 'lat', 'lng', 'query', 'user_id', 'session_id'];
+
+  return data.map((row) => {
+    const props = (row.properties ?? {}) as Record<string, unknown>;
+    const sanitized: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(props)) {
+      if (FORBIDDEN_RAW_KEYS.includes(key.toLowerCase())) continue;
+      sanitized[key] = value;
+    }
+    return { event: row.event, properties: sanitized, created_at: row.created_at };
+  });
 }

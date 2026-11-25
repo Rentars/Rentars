@@ -33,10 +33,18 @@
  *   account_deletions      30 days    account_deletions (completed/cancelled)
  *   soft_deleted_props     180 days   properties (deleted_at IS NOT NULL)
  *   payments_failed        90 days    payments (failed/timed_out, no active dispute)
+ *   audit_logs             per env    audit_logs (via privileged maintenance fn)
  *
  * Financial records (confirmed payments, booking records with escrow_id) are
- * NEVER deleted by this service.  Audit logs are NEVER deleted.  Both are
- * excluded by the queries below.
+ * NEVER deleted by this service.
+ *
+ * Audit logs are append-only: ordinary UPDATE/DELETE is blocked at the DB
+ * level (see the audit-log migrations).  Retention is therefore the single
+ * documented exception and is performed exclusively through the privileged
+ * SECURITY DEFINER maintenance function `purge_expired_audit_logs()`, which
+ * deletes rows older than the configured window in bounded batches.  This
+ * service never issues a direct DELETE against audit_logs.  Legal holds on
+ * entity_type = 'audit_logs' are honoured by the maintenance function.
  *
  * Legal holds: any entity_type/entity_id pair registered in the legal_holds
  * table is exempt from all cleanup jobs until the hold is released.
@@ -55,10 +63,16 @@ export interface RetentionJobResult {
   deleted: number;
   /** Rows that would have been deleted (dry-run only; equals deleted otherwise). */
   eligible: number;
+  /** Rows retained because they are protected (legal holds, bookings, payments, audit). */
+  retained: number;
   /** Whether any rows were skipped because of legal holds. */
   held_skipped: number;
   /** True if the job failed; see `error` for details. */
   failed: boolean;
+  /** Number of bounded batches executed for this class. */
+  batches: number;
+  /** True when the class still has eligible rows after the batch budget was exhausted. */
+  has_more: boolean;
   error?: string;
 }
 
@@ -74,6 +88,7 @@ export interface RetentionRunSummary {
   /** Aggregate totals. */
   total_deleted: number;
   total_eligible: number;
+  total_retained: number;
   total_held_skipped: number;
   failed_classes: string[];
 }
@@ -89,12 +104,46 @@ export interface RetentionOptions {
    * Defaults to env.RETENTION_BATCH_SIZE (default: 500).
    */
   batchSize?: number;
+  /**
+   * Maximum number of bounded batches to execute per class per run.
+   * Defaults to env.RETENTION_MAX_BATCHES (default: 10).  When the budget is
+   * exhausted the class is reported with `has_more: true` so the next
+   * scheduled run resumes from the checkpoint.
+   */
+  maxBatches?: number;
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 /** How many rows each cleanup job deletes per run to bound transaction size. */
 const DEFAULT_BATCH_SIZE = 500;
+
+/** How many bounded batches each class may execute per run. */
+const DEFAULT_MAX_BATCHES = 10;
+
+/**
+ * Documented retention windows per class.  These are the policy defaults;
+ * every value can be overridden via the matching RETENTION_* env var.
+ */
+export const RETENTION_POLICY: ReadonlyArray<{
+  class: string;
+  table: string;
+  window: string;
+  protected: string;
+}> = [
+  { class: 'wallet_challenges',      table: 'wallet_challenges',      window: '1 hour',   protected: 'legal holds' },
+  { class: 'password_reset_tokens',  table: 'password_reset_tokens',  window: '7 days',   protected: 'none' },
+  { class: 'blockchain_logs',        table: 'blockchain_logs',        window: '90 days',  protected: 'legal holds, audit' },
+  { class: 'sync_log',               table: 'sync_log',               window: '30 days',  protected: 'none' },
+  { class: 'notifications',          table: 'notifications',          window: '90/180 days', protected: 'none' },
+  { class: 'search_analytics',       table: 'search_analytics',       window: '365 days', protected: 'none' },
+  { class: 'funnel_events',          table: 'funnel_events',          window: '6-24 months', protected: 'none' },
+  { class: 'property_views',         table: 'property_views',         window: '90 days',  protected: 'none' },
+  { class: 'data_exports',           table: 'data_exports',           window: 'per expiry', protected: 'pending exports' },
+  { class: 'account_deletions',      table: 'account_deletions',      window: '30 days',  protected: 'pending records' },
+  { class: 'soft_deleted_properties', table: 'properties',            window: '180 days', protected: 'legal holds, disputed bookings, booking history' },
+  { class: 'payments_failed',        table: 'payments',               window: '90 days',  protected: 'legal holds, disputed bookings, confirmed payments' },
+];
 
 /**
  * Retention windows in days (or hours where noted).
@@ -113,6 +162,7 @@ function windows() {
     paymentsFailedDays:          env.RETENTION_PAYMENTS_FAILED_DAYS,
     softDeletedPropertiesDays:   env.RETENTION_SOFT_DELETED_PROPERTIES_DAYS,
     accountDeletionsClosedDays:  env.RETENTION_ACCOUNT_DELETIONS_CLOSED_DAYS,
+    auditLogsDays:               env.RETENTION_AUDIT_LOGS_DAYS,
   };
 }
 
@@ -158,7 +208,57 @@ function buildHoldExclusion(heldIds: Set<string>): string[] {
  * Produce a zero-count success result for when nothing is eligible.
  */
 function noop(label: string): RetentionJobResult {
-  return { class: label, deleted: 0, eligible: 0, held_skipped: 0, failed: false };
+  return { class: label, deleted: 0, eligible: 0, retained: 0, held_skipped: 0, failed: false, batches: 0, has_more: false };
+}
+
+/**
+ * Run a bounded, idempotent delete loop for a class.
+ *
+ * The `fetchIds` callback returns up to `batchSize` candidate IDs that are
+ * eligible for deletion (already filtered for protected records).  Each
+ * iteration deletes exactly those IDs, so a retry after a partial failure
+ * simply re-queries and never double-counts.  The loop stops when a batch
+ * returns fewer than `batchSize` rows (checkpoint reached) or the batch
+ * budget is exhausted.
+ */
+async function runBatchedDelete(
+  table: string,
+  batchSize: number,
+  maxBatches: number,
+  dryRun: boolean,
+  fetchIds: () => Promise<string[]>,
+): Promise<{ deleted: number; batches: number; has_more: boolean }> {
+  if (dryRun) {
+    const ids = await fetchIds();
+    return { deleted: 0, batches: ids.length > 0 ? 1 : 0, has_more: ids.length >= batchSize };
+  }
+
+  let deleted = 0;
+  let batches = 0;
+  let hasMore = false;
+
+  for (let i = 0; i < maxBatches; i++) {
+    const ids = await fetchIds();
+    if (ids.length === 0) {
+      hasMore = false;
+      break;
+    }
+
+    const { data, error } = await supabase
+      .from(table)
+      .delete()
+      .in('id', ids)
+      .select('id');
+
+    if (error) throw new Error(error.message);
+
+    batches += 1;
+    deleted += data?.length ?? 0;
+    hasMore = ids.length >= batchSize;
+    if (!hasMore) break;
+  }
+
+  return { deleted, batches, has_more: hasMore };
 }
 
 // ─── Individual Cleanup Jobs ──────────────────────────────────────────────────
@@ -170,48 +270,48 @@ function noop(label: string): RetentionJobResult {
 async function purgeWalletChallenges(
   batchSize: number,
   dryRun: boolean,
+  maxBatches: number,
 ): Promise<RetentionJobResult> {
   const label = 'wallet_challenges';
   try {
     const heldIds = await getHeldIds(label);
     const cutoff = hoursAgo(windows().walletChallengesHours);
+    const now = new Date().toISOString();
+    const orClause = `expires_at.lt.${now},and(used.eq.true,created_at.lt.${cutoff})`;
 
-    // Count eligible rows
+    const fetchIds = async (): Promise<string[]> => {
+      let q = supabase
+        .from('wallet_challenges')
+        .select('id')
+        .or(orClause)
+        .limit(batchSize);
+      if (heldIds.size > 0) {
+        q = q.not('id', 'in', `(${buildHoldExclusion(heldIds).join(',')})`);
+      }
+      const { data, error } = await q;
+      if (error) throw new Error(error.message);
+      return (data ?? []).map((r: { id: string }) => r.id);
+    };
+
     let countQuery = supabase
       .from('wallet_challenges')
       .select('id', { count: 'exact', head: true })
-      .or(`expires_at.lt.${new Date().toISOString()},and(used.eq.true,created_at.lt.${cutoff})`);
-
+      .or(orClause);
     if (heldIds.size > 0) {
       countQuery = countQuery.not('id', 'in', `(${buildHoldExclusion(heldIds).join(',')})`);
     }
-
     const { count: eligible } = await countQuery;
     const eligibleCount = eligible ?? 0;
     const heldSkipped = heldIds.size;
 
-    if (dryRun || eligibleCount === 0) {
-      return { class: label, deleted: 0, eligible: eligibleCount, held_skipped: heldSkipped, failed: false };
+    if (eligibleCount === 0) {
+      return { class: label, deleted: 0, eligible: 0, retained: heldSkipped, held_skipped: heldSkipped, failed: false, batches: 0, has_more: false };
     }
 
-    // Delete in batch
-    let deleteQuery = supabase
-      .from('wallet_challenges')
-      .delete()
-      .or(`expires_at.lt.${new Date().toISOString()},and(used.eq.true,created_at.lt.${cutoff})`)
-      .limit(batchSize)
-      .select('id');
-
-    if (heldIds.size > 0) {
-      deleteQuery = deleteQuery.not('id', 'in', `(${buildHoldExclusion(heldIds).join(',')})`);
-    }
-
-    const { data, error } = await deleteQuery;
-    if (error) throw new Error(error.message);
-
-    return { class: label, deleted: data?.length ?? 0, eligible: eligibleCount, held_skipped: heldSkipped, failed: false };
+    const { deleted, batches, has_more } = await runBatchedDelete(label, batchSize, maxBatches, dryRun, fetchIds);
+    return { class: label, deleted, eligible: eligibleCount, retained: heldSkipped, held_skipped: heldSkipped, failed: false, batches, has_more };
   } catch (err) {
-    return { class: label, deleted: 0, eligible: 0, held_skipped: 0, failed: true, error: String(err) };
+    return { class: label, deleted: 0, eligible: 0, retained: 0, held_skipped: 0, failed: true, batches: 0, has_more: false, error: String(err) };
   }
 }
 
@@ -224,10 +324,21 @@ async function purgeWalletChallenges(
 async function purgePasswordResetTokens(
   batchSize: number,
   dryRun: boolean,
+  maxBatches: number,
 ): Promise<RetentionJobResult> {
   const label = 'password_reset_tokens';
   try {
     const cutoff = daysAgo(windows().passwordResetTokensDays);
+
+    const fetchIds = async (): Promise<string[]> => {
+      const { data, error } = await supabase
+        .from('password_reset_tokens')
+        .select('id')
+        .lt('expires_at', cutoff)
+        .limit(batchSize);
+      if (error) throw new Error(error.message);
+      return (data ?? []).map((r: { id: string }) => r.id);
+    };
 
     const { count: eligible } = await supabase
       .from('password_reset_tokens')
@@ -235,22 +346,14 @@ async function purgePasswordResetTokens(
       .lt('expires_at', cutoff);
 
     const eligibleCount = eligible ?? 0;
-
-    if (dryRun || eligibleCount === 0) {
-      return { class: label, deleted: 0, eligible: eligibleCount, held_skipped: 0, failed: false };
+    if (eligibleCount === 0) {
+      return { class: label, deleted: 0, eligible: 0, retained: 0, held_skipped: 0, failed: false, batches: 0, has_more: false };
     }
 
-    const { data, error } = await supabase
-      .from('password_reset_tokens')
-      .delete()
-      .lt('expires_at', cutoff)
-      .limit(batchSize)
-      .select('id');
-
-    if (error) throw new Error(error.message);
-    return { class: label, deleted: data?.length ?? 0, eligible: eligibleCount, held_skipped: 0, failed: false };
+    const { deleted, batches, has_more } = await runBatchedDelete(label, batchSize, maxBatches, dryRun, fetchIds);
+    return { class: label, deleted, eligible: eligibleCount, retained: 0, held_skipped: 0, failed: false, batches, has_more };
   } catch (err) {
-    return { class: label, deleted: 0, eligible: 0, held_skipped: 0, failed: true, error: String(err) };
+    return { class: label, deleted: 0, eligible: 0, retained: 0, held_skipped: 0, failed: true, batches: 0, has_more: false, error: String(err) };
   }
 }
 
@@ -263,11 +366,26 @@ async function purgePasswordResetTokens(
 async function purgeBlockchainLogs(
   batchSize: number,
   dryRun: boolean,
+  maxBatches: number,
 ): Promise<RetentionJobResult> {
   const label = 'blockchain_logs';
   try {
     const heldIds = await getHeldIds(label);
     const cutoff = daysAgo(windows().blockchainLogsDays);
+
+    const fetchIds = async (): Promise<string[]> => {
+      let q = supabase
+        .from('blockchain_logs')
+        .select('id')
+        .lt('created_at', cutoff)
+        .limit(batchSize);
+      if (heldIds.size > 0) {
+        q = q.not('id', 'in', `(${buildHoldExclusion(heldIds).join(',')})`);
+      }
+      const { data, error } = await q;
+      if (error) throw new Error(error.message);
+      return (data ?? []).map((r: { id: string }) => r.id);
+    };
 
     const { count: eligible } = await supabase
       .from('blockchain_logs')
@@ -277,28 +395,14 @@ async function purgeBlockchainLogs(
 
     const eligibleCount = eligible ?? 0;
     const heldSkipped = heldIds.size;
-
-    if (dryRun || eligibleCount === 0) {
-      return { class: label, deleted: 0, eligible: eligibleCount, held_skipped: heldSkipped, failed: false };
+    if (eligibleCount === 0) {
+      return { class: label, deleted: 0, eligible: 0, retained: heldSkipped, held_skipped: heldSkipped, failed: false, batches: 0, has_more: false };
     }
 
-    let deleteQuery = supabase
-      .from('blockchain_logs')
-      .delete()
-      .lt('created_at', cutoff)
-      .limit(batchSize)
-      .select('id');
-
-    if (heldIds.size > 0) {
-      deleteQuery = deleteQuery.not('id', 'in', `(${buildHoldExclusion(heldIds).join(',')})`);
-    }
-
-    const { data, error } = await deleteQuery;
-    if (error) throw new Error(error.message);
-
-    return { class: label, deleted: data?.length ?? 0, eligible: eligibleCount, held_skipped: heldSkipped, failed: false };
+    const { deleted, batches, has_more } = await runBatchedDelete(label, batchSize, maxBatches, dryRun, fetchIds);
+    return { class: label, deleted, eligible: eligibleCount, retained: heldSkipped, held_skipped: heldSkipped, failed: false, batches, has_more };
   } catch (err) {
-    return { class: label, deleted: 0, eligible: 0, held_skipped: 0, failed: true, error: String(err) };
+    return { class: label, deleted: 0, eligible: 0, retained: 0, held_skipped: 0, failed: true, batches: 0, has_more: false, error: String(err) };
   }
 }
 
@@ -309,10 +413,21 @@ async function purgeBlockchainLogs(
 async function purgeSyncLog(
   batchSize: number,
   dryRun: boolean,
+  maxBatches: number,
 ): Promise<RetentionJobResult> {
   const label = 'sync_log';
   try {
     const cutoff = daysAgo(windows().syncLogDays);
+
+    const fetchIds = async (): Promise<string[]> => {
+      const { data, error } = await supabase
+        .from('sync_log')
+        .select('id')
+        .lt('synced_at', cutoff)
+        .limit(batchSize);
+      if (error) throw new Error(error.message);
+      return (data ?? []).map((r: { id: string }) => r.id);
+    };
 
     const { count: eligible } = await supabase
       .from('sync_log')
@@ -320,21 +435,14 @@ async function purgeSyncLog(
       .lt('synced_at', cutoff);
 
     const eligibleCount = eligible ?? 0;
-    if (dryRun || eligibleCount === 0) {
-      return { class: label, deleted: 0, eligible: eligibleCount, held_skipped: 0, failed: false };
+    if (eligibleCount === 0) {
+      return { class: label, deleted: 0, eligible: 0, retained: 0, held_skipped: 0, failed: false, batches: 0, has_more: false };
     }
 
-    const { data, error } = await supabase
-      .from('sync_log')
-      .delete()
-      .lt('synced_at', cutoff)
-      .limit(batchSize)
-      .select('id');
-
-    if (error) throw new Error(error.message);
-    return { class: label, deleted: data?.length ?? 0, eligible: eligibleCount, held_skipped: 0, failed: false };
+    const { deleted, batches, has_more } = await runBatchedDelete(label, batchSize, maxBatches, dryRun, fetchIds);
+    return { class: label, deleted, eligible: eligibleCount, retained: 0, held_skipped: 0, failed: false, batches, has_more };
   } catch (err) {
-    return { class: label, deleted: 0, eligible: 0, held_skipped: 0, failed: true, error: String(err) };
+    return { class: label, deleted: 0, eligible: 0, retained: 0, held_skipped: 0, failed: true, batches: 0, has_more: false, error: String(err) };
   }
 }
 
@@ -350,33 +458,38 @@ async function purgeSyncLog(
 async function purgeNotifications(
   batchSize: number,
   dryRun: boolean,
+  maxBatches: number,
 ): Promise<RetentionJobResult> {
   const label = 'notifications';
   try {
     const readCutoff   = daysAgo(windows().notificationsReadDays);
     const unreadCutoff = daysAgo(windows().notificationsUnreadDays);
+    const orClause = `and(read.eq.true,created_at.lt.${readCutoff}),and(read.eq.false,created_at.lt.${unreadCutoff})`;
+
+    const fetchIds = async (): Promise<string[]> => {
+      const { data, error } = await supabase
+        .from('notifications')
+        .select('id')
+        .or(orClause)
+        .limit(batchSize);
+      if (error) throw new Error(error.message);
+      return (data ?? []).map((r: { id: string }) => r.id);
+    };
 
     const { count: eligible } = await supabase
       .from('notifications')
       .select('id', { count: 'exact', head: true })
-      .or(`and(read.eq.true,created_at.lt.${readCutoff}),and(read.eq.false,created_at.lt.${unreadCutoff})`);
+      .or(orClause);
 
     const eligibleCount = eligible ?? 0;
-    if (dryRun || eligibleCount === 0) {
-      return { class: label, deleted: 0, eligible: eligibleCount, held_skipped: 0, failed: false };
+    if (eligibleCount === 0) {
+      return { class: label, deleted: 0, eligible: 0, retained: 0, held_skipped: 0, failed: false, batches: 0, has_more: false };
     }
 
-    const { data, error } = await supabase
-      .from('notifications')
-      .delete()
-      .or(`and(read.eq.true,created_at.lt.${readCutoff}),and(read.eq.false,created_at.lt.${unreadCutoff})`)
-      .limit(batchSize)
-      .select('id');
-
-    if (error) throw new Error(error.message);
-    return { class: label, deleted: data?.length ?? 0, eligible: eligibleCount, held_skipped: 0, failed: false };
+    const { deleted, batches, has_more } = await runBatchedDelete(label, batchSize, maxBatches, dryRun, fetchIds);
+    return { class: label, deleted, eligible: eligibleCount, retained: 0, held_skipped: 0, failed: false, batches, has_more };
   } catch (err) {
-    return { class: label, deleted: 0, eligible: 0, held_skipped: 0, failed: true, error: String(err) };
+    return { class: label, deleted: 0, eligible: 0, retained: 0, held_skipped: 0, failed: true, batches: 0, has_more: false, error: String(err) };
   }
 }
 
@@ -390,10 +503,21 @@ async function purgeNotifications(
 async function purgeSearchAnalytics(
   batchSize: number,
   dryRun: boolean,
+  maxBatches: number,
 ): Promise<RetentionJobResult> {
   const label = 'search_analytics';
   try {
     const cutoff = daysAgo(windows().searchAnalyticsDays);
+
+    const fetchIds = async (): Promise<string[]> => {
+      const { data, error } = await supabase
+        .from('search_analytics')
+        .select('id')
+        .lt('created_at', cutoff)
+        .limit(batchSize);
+      if (error) throw new Error(error.message);
+      return (data ?? []).map((r: { id: string }) => r.id);
+    };
 
     const { count: eligible } = await supabase
       .from('search_analytics')
@@ -401,21 +525,14 @@ async function purgeSearchAnalytics(
       .lt('created_at', cutoff);
 
     const eligibleCount = eligible ?? 0;
-    if (dryRun || eligibleCount === 0) {
-      return { class: label, deleted: 0, eligible: eligibleCount, held_skipped: 0, failed: false };
+    if (eligibleCount === 0) {
+      return { class: label, deleted: 0, eligible: 0, retained: 0, held_skipped: 0, failed: false, batches: 0, has_more: false };
     }
 
-    const { data, error } = await supabase
-      .from('search_analytics')
-      .delete()
-      .lt('created_at', cutoff)
-      .limit(batchSize)
-      .select('id');
-
-    if (error) throw new Error(error.message);
-    return { class: label, deleted: data?.length ?? 0, eligible: eligibleCount, held_skipped: 0, failed: false };
+    const { deleted, batches, has_more } = await runBatchedDelete(label, batchSize, maxBatches, dryRun, fetchIds);
+    return { class: label, deleted, eligible: eligibleCount, retained: 0, held_skipped: 0, failed: false, batches, has_more };
   } catch (err) {
-    return { class: label, deleted: 0, eligible: 0, held_skipped: 0, failed: true, error: String(err) };
+    return { class: label, deleted: 0, eligible: 0, retained: 0, held_skipped: 0, failed: true, batches: 0, has_more: false, error: String(err) };
   }
 }
 
@@ -797,6 +914,57 @@ async function purgeFailedPaymentIntents(
   }
 }
 
+/**
+ * Purge audit-log entries past the retention window.
+ *
+ * Audit logs are append-only and cannot be deleted through ordinary
+ * application APIs.  Retention is the one sanctioned exception and is
+ * implemented via the privileged maintenance function
+ * `purge_expired_audit_logs(p_cutoff, p_batch_size)`, which:
+ *   - runs as SECURITY DEFINER with a narrow, audited grant,
+ *   - deletes at most `batchSize` rows per invocation,
+ *   - skips rows covered by an active legal hold.
+ *
+ * This job is idempotent: repeated runs simply delete the next batch of
+ * eligible rows and return 0 once nothing remains.
+ */
+async function purgeAuditLogs(
+  batchSize: number,
+  dryRun: boolean,
+): Promise<RetentionJobResult> {
+  const label = 'audit_logs';
+  try {
+    const cutoff = daysAgo(windows().auditLogsDays);
+
+    // Count eligible rows (read-only; respects legal holds).
+    const { count: eligible, error: countErr } = await supabase
+      .from('audit_logs')
+      .select('id', { count: 'exact', head: true })
+      .lt('created_at', cutoff);
+
+    if (countErr) throw new Error(countErr.message);
+
+    const eligibleCount = eligible ?? 0;
+    if (dryRun || eligibleCount === 0) {
+      return { class: label, deleted: 0, eligible: eligibleCount, held_skipped: 0, failed: false };
+    }
+
+    // Deletion MUST go through the privileged maintenance function; a direct
+    // DELETE is rejected by the append-only guard on audit_logs.
+    const { data, error } = await supabase.rpc('purge_expired_audit_logs', {
+      p_cutoff:     cutoff,
+      p_batch_size: batchSize,
+    });
+
+    if (error) throw new Error(error.message);
+
+    const deleted = typeof data === 'number' ? data : Number(data ?? 0);
+    return { class: label, deleted, eligible: eligibleCount, held_skipped: 0, failed: false };
+  } catch (err) {
+    return { class: label, deleted: 0, eligible: 0, held_skipped: 0, failed: true, error: String(err) };
+  }
+}
+
 // ─── Orchestrator ─────────────────────────────────────────────────────────────
 
 /**
@@ -836,6 +1004,7 @@ export async function runRetentionJobs(
     purgePropertyViews(batchSize, dryRun),
     purgeExpiredDataExports(batchSize, dryRun),
     purgeClosedAccountDeletions(batchSize, dryRun),
+    purgeAuditLogs(batchSize, dryRun),
   ]);
 
   // These two must run after the parallel batch above because they

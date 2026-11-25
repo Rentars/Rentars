@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { supabase } from '@/config/supabase.js';
 import { toDay } from '@/utils/availabilityRange.js';
 import { RESERVING_BOOKING_STATUSES } from '@/utils/bookingStatus.js';
@@ -14,14 +14,31 @@ import {
   ruleForNight,
   toCents,
 } from '@/utils/pricingRules.js';
+import {
+  type CurrencyCode,
+  DEFAULT_CURRENCY,
+  ROUNDING_MODE,
+  currencyPrecision,
+  fromMinorUnits,
+  isSupportedCurrency,
+  mulDivRoundHalfUp,
+  toMinorUnits,
+} from '@/utils/money.js';
 import { signQuoteToken, verifyQuoteToken } from '@/utils/quoteToken.js';
 import type { ServiceResponse } from './index.js';
 
-const PLATFORM_FEE_PCT = 0.05;
+/** Platform fee as an exact fraction (5/100) so the fee is computed in integer minor units. */
+const PLATFORM_FEE_NUMERATOR = 5;
+const PLATFORM_FEE_DENOMINATOR = 100;
+/** Displayed as a percentage; the fee itself is always computed from the fraction above. */
+const PLATFORM_FEE_PCT = PLATFORM_FEE_NUMERATOR / PLATFORM_FEE_DENOMINATOR;
 /** How long a quote (and its token) stays valid before the client must re-quote. */
 export const QUOTE_TTL_MS = 15 * 60 * 1000;
 /** Version of the pricing rules and quote shape. Bump when the arithmetic changes. */
-export const PRICING_VERSION = 'pv1';
+export const PRICING_VERSION = 'pv2';
+/** Largest amount, in minor units, a single quote may total (guards against overflow). */
+export const MAX_QUOTE_MINOR_UNITS = 1_000_000_000_000; // 10^12 minor units
+=======
 
 export interface SeasonalPricing {
   id: string;
@@ -66,10 +83,27 @@ export interface PriceQuote {
   breakdown: DayPricing[];
   timezone?: string;
   currency?: string;
+  /** Decimal places the currency uses; all amounts are exact at this precision. */
+  currency_precision?: number;
+  /** Rounding applied when a computed amount is not an exact multiple of the minor unit. */
+  rounding_mode?: string;
+  /** Total in integer minor units (e.g. cents). This is the amount the contract uses. */
+  total_minor_units?: number;
+  /** Where the currency conversion rate came from, when a conversion was applied. */
+  rate_source?: string | null;
+  /** ISO timestamp of when the conversion rate was captured. */
+  rate_timestamp?: string | null;
+  /** Original amount in the requested (display) currency, before conversion. */
+  original_currency?: string;
+  original_amount?: number;
   version?: string;
   expires_at?: string;
   /** True when every requested night is bookable. */
   available: boolean;
+  /** Stable identifier for this server-generated quote. */
+  quote_id: string;
+  /** Human-readable line items, in the quote currency, covering every charged amount. */
+  line_items: Array<{ id: string; label: string; amount: number; currency: string }>;
   /** Signed binding of this total to its inputs; null when signing is not configured. */
   quote_token: string | null;
   /** Pricing rule version this quote was computed under (see PRICING_VERSION). */
@@ -110,6 +144,14 @@ export async function calculateRangePrice(
   }
 
   const basePrice = (property as { base_price_per_night: number }).base_price_per_night;
+
+  // Reject base prices that cannot be represented exactly at the currency's precision.
+  if (!Number.isFinite(basePrice) || basePrice <= 0) {
+    return { success: false, error: 'Property base price is invalid' };
+  }
+  if (toMinorUnits(basePrice, DEFAULT_CURRENCY) === null) {
+    return { success: false, error: 'Property base price exceeds supported precision' };
+  }
 
   // Rules that can touch this range. Precedence is applied per night by ruleForNight.
   const { data: seasonalRates } = await supabase
@@ -218,14 +260,14 @@ export async function calculateRangePrice(
 
     breakdown.push({
       date: dateStr,
-      price: dayPriceCents / 100,
+      price: fromMinorUnits(dayPriceCents, DEFAULT_CURRENCY),
       is_available: true,
       applied_rules: appliedRules,
       out_of_policy: outOfPolicy,
     });
   }
 
-  const total = totalCents / 100;
+  const total = fromMinorUnits(totalCents, DEFAULT_CURRENCY);
   return { success: true, data: { total, breakdown } };
 }
 
@@ -498,7 +540,20 @@ export async function getPropertyQuote(
   start: string,
   end: string,
   guestCount?: number,
+  currency: string = DEFAULT_CURRENCY,
 ): Promise<ServiceResponse<PriceQuote>> {
+  // Validate the requested currency before doing any work.
+  if (!isSupportedCurrency(currency)) {
+    return {
+      success: false,
+      error: `Unsupported currency: ${currency}`,
+      statusCode: 400,
+      code: 'UNSUPPORTED_CURRENCY',
+    };
+  }
+  const quoteCurrency = currency as CurrencyCode;
+  const precision = currencyPrecision(quoteCurrency);
+
   // Validate dates
   const checkInDate = new Date(start);
   const checkOutDate = new Date(end);
@@ -560,6 +615,25 @@ export async function getPropertyQuote(
   const baseRate = listing.base_price_per_night;
   const propertyUpdatedAt = listing.updated_at;
 
+  // Guard against zero, negative, non-finite, or over-precise base rates.
+  if (!Number.isFinite(baseRate) || baseRate <= 0) {
+    return {
+      success: false,
+      error: 'Property base price is invalid',
+      statusCode: 422,
+      code: 'INVALID_BASE_PRICE',
+    };
+  }
+  const baseRateMinor = toMinorUnits(baseRate, quoteCurrency);
+  if (baseRateMinor === null) {
+    return {
+      success: false,
+      error: `Property base price exceeds the ${precision} decimal places supported for ${quoteCurrency}`,
+      statusCode: 422,
+      code: 'PRICE_PRECISION_EXCEEDED',
+    };
+  }
+
   // Price the stay first. The day-by-day breakdown is the single source of truth
   // for availability: a night is unavailable if it is booked, host-blocked or
   // blocked by a special event. Deriving the quote from it keeps the displayed
@@ -591,18 +665,41 @@ export async function getPropertyQuote(
   const availableNights = breakdown.filter((d) => d.is_available);
   const nights = availableNights.length;
 
-  // Money is summed in whole cents. Each night is already rounded to cents, so the
-  // total is exact and independent of summation order.
-  const dynamicCents = availableNights.reduce((sum, d) => sum + toCents(d.price), 0);
-  const baseCents = toCents(baseRate) * nights;
-  const feeCents = Math.round(dynamicCents * PLATFORM_FEE_PCT);
-  const totalCents = dynamicCents + feeCents;
+  // Money is summed in whole minor units. Each night is already rounded to the
+  // currency's precision, so the total is exact and independent of summation order.
+  let dynamicMinor = 0;
+  for (const d of availableNights) {
+    const nightMinor = toMinorUnits(d.price, quoteCurrency);
+    if (nightMinor === null) {
+      return {
+        success: false,
+        error: `Nightly price for ${d.date} exceeds the precision supported for ${quoteCurrency}`,
+        statusCode: 422,
+        code: 'PRICE_PRECISION_EXCEEDED',
+        details: { date: d.date, price: d.price },
+      };
+    }
+    dynamicMinor += nightMinor;
+  }
+  const baseMinor = baseRateMinor * nights;
+  // Fee is an exact integer computation: round(dynamic * 5 / 100) half-up.
+  const feeMinor = mulDivRoundHalfUp(dynamicMinor, PLATFORM_FEE_NUMERATOR, PLATFORM_FEE_DENOMINATOR);
+  const totalMinor = dynamicMinor + feeMinor;
 
-  const subtotal = baseCents / 100;
-  const dynamicTotal = dynamicCents / 100;
-  const dynamicAdjustments = (dynamicCents - baseCents) / 100;
-  const platformFee = feeCents / 100;
-  const total = totalCents / 100;
+  if (!Number.isSafeInteger(totalMinor) || totalMinor > MAX_QUOTE_MINOR_UNITS) {
+    return {
+      success: false,
+      error: 'The total for this stay exceeds the maximum supported amount',
+      statusCode: 422,
+      code: 'AMOUNT_TOO_LARGE',
+    };
+  }
+
+  const subtotal = fromMinorUnits(baseMinor, quoteCurrency);
+  const dynamicTotal = fromMinorUnits(dynamicMinor, quoteCurrency);
+  const dynamicAdjustments = fromMinorUnits(dynamicMinor - baseMinor, quoteCurrency);
+  const platformFee = fromMinorUnits(feeMinor, quoteCurrency);
+  const total = fromMinorUnits(totalMinor, quoteCurrency);
 
   // Fingerprint of the nights this stay depends on. A rule change that touches these
   // nights changes it, even when the listing's updated_at has not moved.
@@ -624,9 +721,26 @@ export async function getPropertyQuote(
   // Create quote version hash from property state
   const quoteVersion = Buffer.from(`${propertyId}:${propertyUpdatedAt}`).toString('base64');
   const expiresAt = new Date(Date.now() + QUOTE_TTL_MS).toISOString();
+  const quoteId = randomUUID();
+
+  // Every charged component is disclosed as its own line item. The total is still
+  // authoritative from the integer-minor-unit calculation above.
+  const lineItems: PriceQuote['line_items'] = breakdown.map((day) => ({
+    id: `night:${day.date}`,
+    label: `Nightly rate – ${day.date}`,
+    amount: day.price,
+    currency: quoteCurrency,
+  }));
+  lineItems.push({
+    id: 'platform-fee',
+    label: `Platform fee (${(PLATFORM_FEE_PCT * 100).toFixed(0)}%)`,
+    amount: platformFee,
+    currency: quoteCurrency,
+  });
 
   // Bind the total to its exact inputs (including occupancy) so booking can verify nothing drifted.
   const quoteToken = signQuoteToken({
+    qid: quoteId,
     pid: propertyId,
     ci: checkInDate.toISOString(),
     co: checkOutDate.toISOString(),
@@ -649,10 +763,22 @@ export async function getPropertyQuote(
       total,
       breakdown,
       timezone: 'UTC',
-      currency: 'USD',
+      currency: quoteCurrency,
+      currency_precision: precision,
+      rounding_mode: ROUNDING_MODE,
+      total_minor_units: totalMinor,
+      // No conversion is applied here: the quote is denominated directly in the
+      // requested currency. Rate metadata is present so support and the UI can
+      // disclose the (absent) conversion and its age.
+      rate_source: null,
+      rate_timestamp: null,
+      original_currency: quoteCurrency,
+      original_amount: total,
       version: quoteVersion,
       expires_at: expiresAt,
       available: unavailableIntervals.length === 0,
+      quote_id: quoteId,
+      line_items: lineItems,
       quote_token: quoteToken,
       pricing_version: PRICING_VERSION,
       pricing_fingerprint: pricingFingerprint,
@@ -669,8 +795,16 @@ export async function getPropertyQuote(
 export function pricingSnapshotFromQuote(quote: PriceQuote): Record<string, unknown> {
   return {
     version: quote.pricing_version ?? null,
+    quote_id: quote.quote_id ?? null,
     fingerprint: quote.pricing_fingerprint ?? null,
-    currency: quote.currency ?? 'USD',
+    currency: quote.currency ?? DEFAULT_CURRENCY,
+    currency_precision: quote.currency_precision ?? currencyPrecision(DEFAULT_CURRENCY),
+    rounding_mode: quote.rounding_mode ?? ROUNDING_MODE,
+    total_minor_units: quote.total_minor_units ?? null,
+    rate_source: quote.rate_source ?? null,
+    rate_timestamp: quote.rate_timestamp ?? null,
+    original_currency: quote.original_currency ?? quote.currency ?? DEFAULT_CURRENCY,
+    original_amount: quote.original_amount ?? quote.total,
     base_nightly_rate: quote.base_nightly_rate,
     nights: quote.nights,
     subtotal: quote.subtotal,
@@ -696,6 +830,10 @@ export interface QuotedTotalInput {
   now?: number;
   /** Guest count the booking will use; checked against token gc when a token is supplied. */
   guestCount?: number;
+  /** Quote identifier the tenant accepted; must match the token's qid. */
+  quoteId?: string;
+  /** When the tenant explicitly accepted the displayed quote. */
+  quoteAcceptedAt?: string;
 }
 
 /**
@@ -714,7 +852,7 @@ export async function assertQuotedTotal(
   const { propertyId, checkIn, checkOut, clientTotal, quoteToken } = input;
   const now = input.now ?? Date.now();
 
-  const quoted = await getPropertyQuote(propertyId, checkIn, checkOut);
+  const quoted = await getPropertyQuote(propertyId, checkIn, checkOut, input.guestCount);
   if (!quoted.success || !quoted.data) {
     const notFound = quoted.error === 'Property not found';
     return {
@@ -756,6 +894,32 @@ export async function assertQuotedTotal(
         statusCode: 400,
         code: 'QUOTE_MISMATCH',
       };
+    }
+
+    if (input.quoteId && claims.qid && claims.qid !== input.quoteId) {
+      return {
+        success: false,
+        error: 'Quote identifier does not match the accepted quote',
+        statusCode: 400,
+        code: 'QUOTE_MISMATCH',
+      };
+    }
+
+    if (input.quoteAcceptedAt) {
+      const acceptedAt = Date.parse(input.quoteAcceptedAt);
+      if (
+        !Number.isFinite(acceptedAt) ||
+        acceptedAt > now ||
+        acceptedAt > Date.parse(claims.exp)
+      ) {
+        return {
+          success: false,
+          error: 'The accepted quote is no longer valid; request a new quote',
+          conflict: true,
+          code: 'QUOTE_EXPIRED',
+          details: { quote },
+        };
+      }
     }
 
     if (Date.parse(claims.exp) <= now) {
@@ -806,10 +970,22 @@ export async function assertQuotedTotal(
     }
   }
 
-  if (Math.round(clientTotal * 100) !== Math.round(quote.total * 100)) {
+  // Compare in integer minor units so no binary floating-point rounding can slip through.
+  const quoteCurrency = (quote.currency ?? DEFAULT_CURRENCY) as CurrencyCode;
+  const clientMinor = toMinorUnits(clientTotal, quoteCurrency);
+  if (clientMinor === null) {
     return {
       success: false,
-      error: `The price for this stay is now $${quote.total.toFixed(2)}; it does not match the submitted total`,
+      error: `The submitted total is not a valid ${quoteCurrency} amount at supported precision`,
+      statusCode: 400,
+      code: 'INVALID_AMOUNT',
+    };
+  }
+  const quoteMinor = quote.total_minor_units ?? toMinorUnits(quote.total, quoteCurrency);
+  if (quoteMinor === null || clientMinor !== quoteMinor) {
+    return {
+      success: false,
+      error: `The price for this stay is now ${quote.total.toFixed(currencyPrecision(quoteCurrency))} ${quoteCurrency}; it does not match the submitted total`,
       conflict: true,
       code: 'PRICE_CHANGED',
       details: { quote },

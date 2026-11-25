@@ -1,5 +1,55 @@
 import type { NextConfig } from 'next';
 import path from 'path';
+import fs from 'fs';
+
+// Build-time identifier used to version the service worker caches. Each
+// deployment must produce a distinct value so stale assets are replaced.
+const SW_CACHE_VERSION =
+  process.env.VERCEL_GIT_COMMIT_SHA ||
+  process.env.GIT_COMMIT ||
+  process.env.NEXT_PUBLIC_BUILD_ID ||
+  `${Date.now()}`;
+
+// Minimum SW/app version required for compatibility. When set, the service
+// worker may force a reload only if the running version is older than this.
+const SW_REQUIRED_MIN_VERSION = process.env.NEXT_PUBLIC_SW_REQUIRED_MIN_VERSION || '';
+
+const SW_PLACEHOLDER = '__SW_CACHE_VERSION__';
+const SW_MIN_VERSION_PLACEHOLDER = '__SW_REQUIRED_MIN_VERSION__';
+
+/**
+ * Replaces the cache-version placeholders in public/sw.js with the current
+ * build id so every deployment ships a distinct, versioned cache namespace.
+ */
+class ServiceWorkerVersionPlugin {
+  apply(compiler: any) {
+    const { sources, Compilation } = compiler.webpack;
+    compiler.hooks.thisCompilation.tap('ServiceWorkerVersionPlugin', (compilation: any) => {
+      compilation.hooks.processAssets.tap(
+        {
+          name: 'ServiceWorkerVersionPlugin',
+          stage: Compilation.PROCESS_ASSETS_STAGE_ADDITIONAL,
+        },
+        () => {
+          const swPath = path.resolve(__dirname, 'public/sw.js');
+          if (!fs.existsSync(swPath)) {
+            return;
+          }
+          const original = fs.readFileSync(swPath, 'utf8');
+          const versioned = original
+            .split(SW_PLACEHOLDER)
+            .join(SW_CACHE_VERSION)
+            .split(SW_MIN_VERSION_PLACEHOLDER)
+            .join(SW_REQUIRED_MIN_VERSION);
+          compilation.emitAsset(
+            'sw.js',
+            new sources.RawSource(versioned),
+          );
+        },
+      );
+    });
+  }
+}
 
 const nextConfig: NextConfig = {
   output: 'standalone',
@@ -46,7 +96,14 @@ const nextConfig: NextConfig = {
     imageSizes: [16, 32, 48, 64, 96, 128, 256, 384],
   },
   
+  // Expose the required minimum SW version to the client bundle.
+  env: {
+    NEXT_PUBLIC_SW_REQUIRED_MIN_VERSION: SW_REQUIRED_MIN_VERSION,
+  },
+
   webpack(config) {
+    config.plugins = config.plugins || [];
+    config.plugins.push(new ServiceWorkerVersionPlugin());
     config.resolve.alias = {
       ...config.resolve.alias,
       '@': path.resolve(__dirname, 'src'),

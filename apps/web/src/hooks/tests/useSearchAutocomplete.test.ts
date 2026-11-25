@@ -106,4 +106,99 @@ describe('useSearchAutocomplete', () => {
       expect.any(Object),
     );
   });
+
+  it('ignores a stale response when the query changes rapidly', async () => {
+    mockFetch.mockReset();
+    const onSearch = vi.fn();
+    const { result } = renderHook(() => useSearchAutocomplete({ onSearch }));
+
+    let resolveFirst!: (value: unknown) => void;
+    const first = new Promise((resolve) => {
+      resolveFirst = resolve;
+    });
+    mockFetch
+      .mockReturnValueOnce(first)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ address: 'Berlin, Germany' }),
+      });
+
+    act(() => result.current.setInput('Lon'));
+    await act(async () => {
+      vi.advanceTimersByTime(300);
+    });
+    act(() => result.current.setInput('Ber'));
+    await act(async () => {
+      vi.advanceTimersByTime(300);
+    });
+    expect(result.current.suggestions).toEqual(['Berlin, Germany']);
+
+    await act(async () => {
+      resolveFirst({ ok: true, json: () => Promise.resolve({ address: 'London, UK' }) });
+    });
+    expect(result.current.suggestions).toEqual(['Berlin, Germany']);
+    expect(result.current.lastResultQuery).toBe('Ber');
+  });
+
+  it('reports zero results without clearing the query', async () => {
+    mockFetch.mockReset().mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({}),
+    });
+    const { result } = renderHook(() => useSearchAutocomplete({ onSearch: vi.fn() }));
+
+    act(() => result.current.setInput('Nowhereville'));
+    await act(async () => {
+      vi.advanceTimersByTime(300);
+    });
+
+    expect(result.current.suggestions).toEqual([]);
+    expect(result.current.input).toBe('Nowhereville');
+    expect(result.current.isLoading).toBe(false);
+  });
+
+  it('surfaces a recoverable error without erasing the query', async () => {
+    mockFetch.mockReset().mockRejectedValueOnce(new Error('network down'));
+    const { result } = renderHook(() => useSearchAutocomplete({ onSearch: vi.fn() }));
+
+    act(() => result.current.setInput('Paris'));
+    await act(async () => {
+      vi.advanceTimersByTime(300);
+    });
+
+    expect(result.current.error).toMatch(/temporarily unavailable/);
+    expect(result.current.input).toBe('Paris');
+    expect(result.current.isLoading).toBe(false);
+
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ address: 'Paris, France' }),
+    });
+    act(() => result.current.setInput('Paris '));
+    await act(async () => {
+      vi.advanceTimersByTime(300);
+    });
+    expect(result.current.error).toBeNull();
+    expect(result.current.suggestions).toEqual(['Paris, France']);
+  });
+
+  it('selects a suggestion by keyboard and updates canonical search state', async () => {
+    mockFetch.mockReset().mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ address: 'Paris, France' }),
+    });
+    const onSearch = vi.fn();
+    const { result } = renderHook(() => useSearchAutocomplete({ onSearch }));
+
+    act(() => result.current.setInput('Par'));
+    await act(async () => {
+      vi.advanceTimersByTime(300);
+    });
+    act(() => result.current.handleKeyDown('ArrowDown', vi.fn()));
+    act(() => result.current.handleKeyDown('Enter', vi.fn()));
+
+    expect(onSearch).toHaveBeenCalledWith('Paris, France');
+    expect(result.current.input).toBe('Paris, France');
+    expect(result.current.isOpen).toBe(false);
+  });
 });

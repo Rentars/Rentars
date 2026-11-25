@@ -161,14 +161,45 @@ export async function loginUser(
     throw new AuthError(AuthErrorCode.USER_NOT_FOUND, 'Login failed: no user returned');
   }
 
-  // Fetch role from users table (default to 'tenant' if not set)
+  // Fetch role and moderation state from users table (default to 'tenant' if not set)
   const { data: userRow } = await supabase
     .from('users')
-    .select('role')
+    .select('role, status, suspended_at, suspension_reason')
     .eq('id', data.user.id)
     .single();
 
-  const role: string = (userRow as { role?: string } | null)?.role ?? 'tenant';
+  const row = userRow as
+    | {
+        role?: string;
+        status?: string | null;
+        suspended_at?: string | null;
+        suspension_reason?: string | null;
+      }
+    | null;
+
+  // Suspended accounts cannot sign in. The message is deliberately generic so it
+  // does not disclose moderation details to an unauthenticated caller; the
+  // reason and actor are recorded in the audit trail by the admin flow.
+  if (row?.status === 'suspended' || row?.suspended_at) {
+    await securityLogger.logAuthEvent('login_failure', data.user.id, {
+      email: normalizedEmail,
+      reason: 'account_suspended',
+    });
+    await auditLogger.log({
+      actorId: data.user.id,
+      action: 'auth.login_denied_suspended',
+      resourceType: 'auth',
+      resourceId: data.user.id,
+      success: false,
+      meta: { reason: 'account_suspended' },
+    });
+    throw new AuthError(
+      AuthErrorCode.INVALID_CREDENTIALS,
+      'This account is not available. Please contact support.',
+    );
+  }
+
+  const role: string = row?.role ?? 'tenant';
 
   // Short-lived access token (15 minutes)
   const token = jwt.sign(
@@ -337,6 +368,38 @@ export async function verifyWalletChallenge(
     }
 
     userData = newUser as { id: string; email: string | null; created_at: string; role: string | null };
+  }
+
+  // Suspended accounts cannot authenticate via wallet either. Restoration is
+  // only possible through the admin restoration flow, which clears the
+  // suspension fields and records an audit entry.
+  const { data: moderationRow } = await supabase
+    .from('users')
+    .select('status, suspended_at')
+    .eq('id', userData.id)
+    .single();
+
+  const moderation = moderationRow as
+    | { status?: string | null; suspended_at?: string | null }
+    | null;
+
+  if (moderation?.status === 'suspended' || moderation?.suspended_at) {
+    await securityLogger.logAuthEvent('login_failure', userData.id, {
+      reason: 'account_suspended',
+      method: 'wallet',
+    });
+    await auditLogger.log({
+      actorId: userData.id,
+      action: 'auth.login_denied_suspended',
+      resourceType: 'auth',
+      resourceId: userData.id,
+      success: false,
+      meta: { reason: 'account_suspended', method: 'wallet' },
+    });
+    throw new AuthError(
+      AuthErrorCode.INVALID_CREDENTIALS,
+      'This account is not available. Please contact support.',
+    );
   }
 
   const role = userData.role || 'tenant';

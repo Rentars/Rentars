@@ -30,7 +30,7 @@ describe('sitemap', () => {
 
   it('includes public properties with their slug and lastModified', async () => {
     mockProperties([
-      { id: 'p1', slug: 'cozy-loft-paris-a1b2c3', status: 'available', updated_at: '2026-01-01T00:00:00.000Z' },
+      { id: 'p1', slug: 'cozy-loft-paris-a1b2c3', status: 'active', updated_at: '2026-01-01T00:00:00.000Z' },
     ]);
     const entries = await sitemap();
     const propertyEntry = entries.find((e) => e.url.includes('cozy-loft-paris-a1b2c3'));
@@ -41,7 +41,7 @@ describe('sitemap', () => {
 
   it('excludes draft (unpublished) properties', async () => {
     mockProperties([
-      { id: 'p1', slug: 'published-listing', status: 'available' },
+      { id: 'p1', slug: 'published-listing', status: 'active' },
       { id: 'p2', slug: 'unpublished-listing', status: 'draft' },
     ]);
     const entries = await sitemap();
@@ -50,8 +50,30 @@ describe('sitemap', () => {
     expect(urls.some((u) => u.includes('unpublished-listing'))).toBe(false);
   });
 
+  it('excludes deleted properties', async () => {
+    mockProperties([
+      { id: 'p1', slug: 'active-listing', status: 'active' },
+      { id: 'p2', slug: 'deleted-listing', status: 'deleted' },
+    ]);
+    const entries = await sitemap();
+    const urls = entries.map((e) => e.url);
+    expect(urls.some((u) => u.includes('active-listing'))).toBe(true);
+    expect(urls.some((u) => u.includes('deleted-listing'))).toBe(false);
+  });
+
+  it('excludes private listings', async () => {
+    mockProperties([
+      { id: 'p1', slug: 'public-listing', status: 'active' },
+      { id: 'p2', slug: 'private-listing', status: 'private' },
+    ]);
+    const entries = await sitemap();
+    const urls = entries.map((e) => e.url);
+    expect(urls.some((u) => u.includes('public-listing'))).toBe(true);
+    expect(urls.some((u) => u.includes('private-listing'))).toBe(false);
+  });
+
   it('falls back to id when a property has no slug', async () => {
-    mockProperties([{ id: 'legacy-id-123', status: 'available' }]);
+    mockProperties([{ id: 'legacy-id-123', status: 'active' }]);
     const entries = await sitemap();
     expect(entries.some((e) => e.url.endsWith('/property/legacy-id-123'))).toBe(true);
   });

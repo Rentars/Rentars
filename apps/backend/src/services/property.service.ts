@@ -34,6 +34,70 @@ const UNIQUE_VIOLATION = '23505';
 /** Fresh ids to try when a generated slug collides before giving up. */
 const SLUG_INSERT_ATTEMPTS = 3;
 
+// ─── Guest capacity rules ─────────────────────────────────────────────────────
+
+/**
+ * Guest-count bounds shared by listing creation, listing updates, search
+ * filters, quote calculation, and booking creation (#944).
+ *
+ * A listing's `max_guests` must be an integer within [MIN_GUESTS, MAX_GUESTS].
+ * A booking's guest count must be an integer within [MIN_GUESTS, listing.max_guests].
+ * Keeping these in one place guarantees search and booking agree on the maximum
+ * for every listing.
+ */
+export const MIN_GUESTS = 1;
+export const MAX_GUESTS = 50;
+
+/**
+ * Validate a stored/requested listing capacity (`max_guests`).
+ *
+ * @returns An error message for the first violation, or null when valid.
+ */
+export function validateMaxGuests(value: unknown): string | null {
+  if (typeof value !== 'number' || !Number.isInteger(value)) {
+    return 'max_guests must be an integer';
+  }
+  if (value < MIN_GUESTS) {
+    return `max_guests must be at least ${MIN_GUESTS}`;
+  }
+  if (value > MAX_GUESTS) {
+    return `max_guests must be at most ${MAX_GUESTS}`;
+  }
+  return null;
+}
+
+/**
+ * Validate a requested guest count against a listing's current capacity.
+ *
+ * Used by search filters, quote calculation, and booking creation so that all
+ * three agree on the maximum for a given listing. A missing/invalid stored
+ * capacity fails explicitly rather than defaulting to an unsafe value.
+ *
+ * @param guests      - Requested number of guests.
+ * @param maxGuests   - The selected property's current `max_guests`.
+ * @returns An error message for the first violation, or null when valid.
+ */
+export function validateGuestCount(
+  guests: unknown,
+  maxGuests: unknown,
+): string | null {
+  if (typeof guests !== 'number' || !Number.isInteger(guests)) {
+    return 'guests must be an integer';
+  }
+  if (guests < MIN_GUESTS) {
+    return `guests must be at least ${MIN_GUESTS}`;
+  }
+  // A listing with a missing or invalid stored capacity cannot be booked safely.
+  const capacityError = validateMaxGuests(maxGuests);
+  if (capacityError) {
+    return `Listing capacity is invalid: ${capacityError}`;
+  }
+  if (guests > (maxGuests as number)) {
+    return `guests must not exceed the listing capacity of ${maxGuests}`;
+  }
+  return null;
+}
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 /**
@@ -134,11 +198,15 @@ export const FEATURED_CAP = 6;
 
 /**
  * Returns true when a property is currently within its feature window.
- * Works purely from the in-memory object — no DB round-trip needed.
+ *
+ * Delegates to the centralized {@link isFeaturedEligible} predicate so that
+ * expiry, soft-delete, draft, and moderation-hidden rules are applied
+ * consistently across every featured code path.  Accepts a minimal row that
+ * only carries `featured_until` (and optionally the visibility fields), so the
+ * pure-timestamp call sites in tests continue to work.
  */
-export function isFeaturedNow(property: Pick<Property, 'featured_until'>): boolean {
-  if (!property.featured_until) return false;
-  return new Date(property.featured_until) > new Date();
+export function isFeaturedNow(property: Pick<Property, 'featured_until' | 'status' | 'deleted_at' | 'draft_status' | 'moderation_state'>): boolean {
+  return isFeaturedEligible(property);
 }
 
 /** Fields that are copied when duplicating a property. */
@@ -311,6 +379,14 @@ export async function createProperty(
     if (amenityError) return { success: false, error: amenityError };
   }
 
+  // Enforce the shared guest-capacity range at creation (#944).
+  if (payload.max_guests !== undefined) {
+    const guestError = validateMaxGuests(payload.max_guests);
+    if (guestError) {
+      return { success: false, error: guestError, statusCode: 400, field: 'max_guests' };
+    }
+  }
+
   // Sanitize user-generated text fields before storing
   const sanitized: Partial<Property> = {
     ...payload,
@@ -415,6 +491,14 @@ export async function updateProperty(
     if (amenityError) return { success: false, error: amenityError };
   }
 
+  // Enforce the shared guest-capacity range on update (#944).
+  if (payload.max_guests !== undefined) {
+    const guestError = validateMaxGuests(payload.max_guests);
+    if (guestError) {
+      return { success: false, error: guestError, statusCode: 400, field: 'max_guests' };
+    }
+  }
+
   // Sanitize user-generated text fields before storing
   // The slug is server-owned and immutable once set (migration 00072). Drop any
   // client-supplied value rather than letting the write fail.
@@ -501,12 +585,87 @@ export async function updateProperty(
     });
   }
 
+  // Notify tenants with upcoming bookings when material fields changed.
+  const materialChanges = buildPropertyChangeSummary(before as Partial<Property>, updated);
+  if (materialChanges.length > 0) {
+    import('./notification.service.js').then(({ notifyBookedTenantsOfPropertyChange }) => {
+      notifyBookedTenantsOfPropertyChange({
+        propertyId:    updated.id,
+        propertyTitle: updated.title,
+        propertySlug:  updated.slug ?? updated.id,
+        bookingId:     '', // fan-out uses all upcoming bookings; individual IDs set inside
+        checkIn:       '',
+        checkOut:      '',
+        changeSummary: materialChanges,
+      }).catch((err) =>
+        console.error('[updateProperty] notifyBookedTenantsOfPropertyChange failed:', err),
+      );
+    });
+  }
+
   // Record a version snapshot when tracked fields changed.
   recordPropertyVersion(id, before, updated, changedBy, changeSource, changeNotes).catch((err) =>
     console.warn('[updateProperty] version record failed:', err),
   );
 
   return { success: true, data: updated };
+}
+
+// ─── Material-change detection ────────────────────────────────────────────────
+
+/**
+ * Fields whose change is material to an upcoming stay and should trigger a
+ * tenant notification.  Cosmetic or administrative fields (e.g. slug, images,
+ * average_rating, featured_until) are intentionally excluded.
+ */
+export const MATERIAL_PROPERTY_FIELDS = [
+  // Location / access
+  'address',
+  'city',
+  'country',
+  // Stay policy
+  'check_in_time',
+  'check_out_time',
+  'min_nights',
+  'max_nights',
+  'max_guests',
+  // House rules
+  'pets_allowed',
+  'smoking_allowed',
+  'events_allowed',
+  'quiet_hours_start',
+  'quiet_hours_end',
+  'additional_rules',
+  // Core offering
+  'amenities',
+] as const satisfies readonly (keyof Property)[];
+
+export type MaterialPropertyField = (typeof MATERIAL_PROPERTY_FIELDS)[number];
+
+/**
+ * Compare `before` and `after` property snapshots and return a sanitised
+ * summary of every material field that changed.
+ *
+ * The summary omits all private/internal fields (owner_id, on_chain_id, etc.)
+ * so it is safe to embed directly in a notification payload.
+ *
+ * @returns An array of `{ field, before, after }` objects, empty when nothing material changed.
+ */
+export function buildPropertyChangeSummary(
+  before: Partial<Property>,
+  after: Partial<Property>,
+): Array<{ field: MaterialPropertyField; before: unknown; after: unknown }> {
+  const changes: Array<{ field: MaterialPropertyField; before: unknown; after: unknown }> = [];
+
+  for (const field of MATERIAL_PROPERTY_FIELDS) {
+    const a = JSON.stringify(before[field] ?? null);
+    const b = JSON.stringify(after[field] ?? null);
+    if (a !== b) {
+      changes.push({ field, before: before[field] ?? null, after: after[field] ?? null });
+    }
+  }
+
+  return changes;
 }
 
 /** Listing fields a saved search can match on. */
@@ -714,7 +873,14 @@ export async function getFeaturedProperties(
   if (error) return { success: false, error: error.message };
 
   const properties = (data ?? []) as Property[];
-  await cache.set(cacheKey, properties, TTL_FEATURED);
+  // Bound the cache TTL to the soonest promotion expiry so the cache can never
+  // outlive a featured window — an expired promotion is dropped on the next
+  // read rather than served stale for the full TTL.
+  const ttlSeconds = Math.max(
+    1,
+    Math.round(featuredExpiryTtlMs(properties, TTL_FEATURED * 1000) / 1000),
+  );
+  await cache.set(cacheKey, properties, ttlSeconds);
   return { success: true, data: properties };
 }
 
@@ -930,6 +1096,31 @@ export async function advancedSearch(
     if (cached) return { success: true, data: cached };
   }
 
+  // Validate the requested guest count up front so search and booking agree on
+  // the same range (#944). An out-of-range value fails explicitly rather than
+  // silently returning no results.
+  if (filters.guests !== undefined) {
+    if (typeof filters.guests !== 'number' || !Number.isInteger(filters.guests)) {
+      return { success: false, error: 'guests must be an integer', statusCode: 400, field: 'guests' };
+    }
+    if (filters.guests < MIN_GUESTS) {
+      return {
+        success: false,
+        error: `guests must be at least ${MIN_GUESTS}`,
+        statusCode: 400,
+        field: 'guests',
+      };
+    }
+    if (filters.guests > MAX_GUESTS) {
+      return {
+        success: false,
+        error: `guests must be at most ${MAX_GUESTS}`,
+        statusCode: 400,
+        field: 'guests',
+      };
+    }
+  }
+
   const limit = Math.min(filters.limit || 20, 100);
   const page = Math.max(filters.page || 1, 1);
 
@@ -940,7 +1131,7 @@ export async function advancedSearch(
     const { data: bookedRows } = await supabase
       .from('bookings')
       .select('property_id')
-      .neq('status', 'Cancelled')
+      .in('status', [...ACTIVE_BOOKING_STATUSES])
       .lt('check_in', filters.checkOut)
       .gt('check_out', filters.checkIn);
 
@@ -996,27 +1187,27 @@ export async function advancedSearch(
         .lte('longitude', east);
     }
 
-  // Bathroom filter (minimum bathrooms)
-  if (filters.min_bathrooms !== undefined) query = query.gte('bathrooms', filters.min_bathrooms);
+    // Bathroom filter (minimum bathrooms)
+    if (filters.min_bathrooms !== undefined) q = q.gte('bathrooms', filters.min_bathrooms);
 
-  // Property type filter (set membership — OR across supplied values)
-  if (filters.property_types && filters.property_types.length > 0) {
-    // Supabase .in() generates a SQL `column IN (v1, v2, ...)` clause which
-    // uses the idx_properties_property_type index on low-cardinality values.
-    query = query.in('property_type', filters.property_types);
-  } else if (filters.property_type) {
-    // Single-value convenience path (from simple searchProperties call)
-    query = query.eq('property_type', filters.property_type);
-  }
-
-  // Guest capacity
-  if (filters.guests !== undefined) query = query.gte('max_guests', filters.guests);
+    // Property type filter (set membership — OR across supplied values)
+    if (filters.property_types && filters.property_types.length > 0) {
+      // Supabase .in() generates a SQL `column IN (v1, v2, ...)` clause which
+      // uses the idx_properties_property_type index on low-cardinality values.
+      q = q.in('property_type', filters.property_types);
+    } else if (filters.property_type) {
+      // Single-value convenience path (from simple searchProperties call)
+      q = q.eq('property_type', filters.property_type);
+    }
 
     // Bedroom filter
     if (filters.bedrooms !== undefined) q = q.gte('bedrooms', filters.bedrooms);
 
-    // Guest capacity
-    if (filters.guests !== undefined) q = q.gte('max_guests', filters.guests);
+    // Guest capacity — must match the booking rule (#944). A listing qualifies
+    // only when its stored capacity is at least the requested guest count.
+    if (filters.guests !== undefined) {
+      q = q.gte('max_guests', filters.guests);
+    }
 
     // Amenities — must contain all requested amenities
     if (filters.amenities && filters.amenities.length > 0) {
@@ -1109,7 +1300,9 @@ export async function advancedSearch(
       rating: p.average_rating ?? 0,
       review_count: p.review_count ?? 0,
       distance_km: Math.round(dist * 10) / 10,
-      is_featured: false,
+      // Badge derives from the centralized eligibility predicate so an expired
+      // or ineligible listing is never shown as featured.
+      is_featured: isFeaturedEligible(p),
       created_at: p.created_at,
     }));
 
@@ -1173,7 +1366,9 @@ export async function advancedSearch(
     longitude: p.longitude ?? undefined,
     rating: p.average_rating ?? 0,
     review_count: p.review_count ?? 0,
-    is_featured: false,
+    // Badge derives from the centralized eligibility predicate so an expired
+    // or ineligible listing is never shown as featured.
+    is_featured: isFeaturedEligible(p),
     created_at: p.created_at,
   }));
 
@@ -1467,8 +1662,9 @@ function validateDraftPatch(patch: Partial<Property>): string | null {
       return `${field} must be a non-negative integer`;
     }
   }
-  if (patch.max_guests !== undefined && (typeof patch.max_guests !== 'number' || !Number.isInteger(patch.max_guests) || patch.max_guests < 1)) {
-    return 'max_guests must be a positive integer';
+  if (patch.max_guests !== undefined) {
+    const guestError = validateMaxGuests(patch.max_guests);
+    if (guestError) return guestError;
   }
   if (patch.min_nights !== undefined && (typeof patch.min_nights !== 'number' || !Number.isInteger(patch.min_nights) || patch.min_nights < 1)) {
     return 'min_nights must be a positive integer';

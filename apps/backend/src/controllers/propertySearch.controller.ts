@@ -1,7 +1,27 @@
 import type { Request, Response } from 'express';
 import { searchPropertiesByQuery, searchPropertiesNearby } from '@/services/propertySearch.service.js';
 import type { NearbySearchParams } from '@/services/propertySearch.service.js';
-import { redactExactCoordinates } from '@/utils/locationPrivacy.js';
+import { redactPublicLocationResponse } from '@/utils/locationPrivacy.js';
+
+type FieldErrors = Record<string, string>;
+
+function isValidationFailure(
+  result: unknown,
+): result is { success: false; error: string; fields?: FieldErrors } {
+  return (
+    typeof result === 'object' &&
+    result !== null &&
+    (result as { success?: unknown }).success === false
+  );
+}
+
+function respondWithFailure(res: Response, result: { error: string; fields?: FieldErrors }): void {
+  if (result.fields && Object.keys(result.fields).length > 0) {
+    res.status(422).json({ error: result.error, fields: result.fields });
+    return;
+  }
+  res.status(500).json({ error: result.error });
+}
 
 export async function searchPropertiesEndpoint(req: Request, res: Response): Promise<void> {
   const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
@@ -11,15 +31,15 @@ export async function searchPropertiesEndpoint(req: Request, res: Response): Pro
   }
 
   const result = await searchPropertiesByQuery(q);
-  if (!result.success) {
-    res.status(500).json({ error: result.error });
+  if (isValidationFailure(result)) {
+    respondWithFailure(res, result);
     return;
   }
 
   // Search results are always public — redact exact coordinates.
   const redacted = Array.isArray(result.data)
     ? result.data.map((p) =>
-        redactExactCoordinates(p as { id: string; latitude?: number; longitude?: number }) as unknown as Record<string, unknown>,
+        redactPublicLocationResponse(p, { tier: 'public' }) as unknown as Record<string, unknown>,
       )
     : result.data;
 
@@ -34,8 +54,8 @@ export async function searchNearbyEndpoint(req: Request, res: Response): Promise
   }
 
   const result = await searchPropertiesNearby(params);
-  if (!result.success) {
-    res.status(500).json({ error: result.error });
+  if (isValidationFailure(result)) {
+    respondWithFailure(res, result);
     return;
   }
 
@@ -43,7 +63,7 @@ export async function searchNearbyEndpoint(req: Request, res: Response): Promise
   // The spatial query uses server-side exact coordinates; only the response is redacted.
   const items = Array.isArray(result.data) ? result.data : (result.data as { data?: unknown[] }).data ?? [];
   const redacted = items.map((p) =>
-    redactExactCoordinates(p as { id: string; latitude?: number; longitude?: number }) as unknown as Record<string, unknown>,
+    redactPublicLocationResponse(p, { tier: 'public' }) as unknown as Record<string, unknown>,
   );
 
   const responsePayload = Array.isArray(result.data)

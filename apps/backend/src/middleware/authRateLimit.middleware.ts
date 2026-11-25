@@ -30,6 +30,7 @@ import type { NextFunction, Request, Response } from 'express';
 import { RateLimiterMemory, RateLimiterRedis, RateLimiterRes } from 'rate-limiter-flexible';
 import { structuredLog } from './logging.middleware.js';
 import { hashIdentity } from './rateLimiter.js';
+import { getClientIp } from './trustProxy.js';
 
 export interface Limiter {
   consume(key: string): Promise<RateLimiterRes>;
@@ -166,7 +167,9 @@ export function createAuthRouteLimiter(
     res: Response,
     next: NextFunction
   ): Promise<void> {
-    const ipKey = hashIdentity(req.ip || 'unknown');
+    // Use the validated client IP derived from the trusted proxy topology rather
+    // than raw req.ip, which can be influenced by spoofed forwarding headers.
+    const ipKey = hashIdentity(getClientIp(req) || 'unknown');
     const rawAccount = options.accountKey?.(req);
 
     const checks: Array<{ scope: 'ip' | 'account'; bucket: Bucket; key: string }> = [

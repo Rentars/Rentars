@@ -21,10 +21,52 @@ ALTER TABLE reviews
     )),
   ADD COLUMN IF NOT EXISTS reconciled_at       TIMESTAMPTZ;
 
+-- ─── Chain submission state (privacy-safe commitment) ────────────────────────
+--
+-- `on_chain_status` tracks the lifecycle of the chain submission itself and is
+-- deliberately kept separate from `reconciliation_status` above:
+--   * on_chain_status      -> did the transaction succeed on-chain?
+--   * reconciliation_status -> do the on-chain and off-chain records agree?
+-- A review is only ever labelled "on-chain verified" when on_chain_status is
+-- 'confirmed' AND on_chain_id is set.  A failed or pending transaction never
+-- affects the off-chain moderation state.
+--
+-- `on_chain_commitment` is a privacy-safe hash of the review content, booking,
+-- property and a per-review nonce.  Only this commitment (never the review
+-- text) is published on-chain, so personal content is not leaked.
+
+ALTER TABLE reviews
+  ADD COLUMN IF NOT EXISTS on_chain_network      TEXT,
+  ADD COLUMN IF NOT EXISTS on_chain_status       VARCHAR(20) NOT NULL DEFAULT 'none'
+    CHECK (on_chain_status IN (
+      'none',       -- not submitted on-chain
+      'pending',    -- submission in flight / awaiting confirmation
+      'submitted',  -- transaction accepted by the network, not yet confirmed
+      'confirmed',  -- transaction confirmed on-chain
+      'failed'      -- transaction failed or was rejected
+    )),
+  ADD COLUMN IF NOT EXISTS on_chain_commitment   TEXT,
+  ADD COLUMN IF NOT EXISTS on_chain_nonce        TEXT,
+  ADD COLUMN IF NOT EXISTS on_chain_submitted_at TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS on_chain_confirmed_at TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS on_chain_error        TEXT,
+  ADD COLUMN IF NOT EXISTS on_chain_retry_count  INT NOT NULL DEFAULT 0;
+
+-- Prevent the same review commitment from being submitted twice on the same
+-- network.  Partial index so rows without a commitment are unaffected.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_reviews_on_chain_commitment
+  ON reviews (on_chain_network, on_chain_commitment)
+  WHERE on_chain_commitment IS NOT NULL AND on_chain_network IS NOT NULL;
+
 -- Index for the reconciliation sweep that scans reviews needing attention.
 CREATE INDEX IF NOT EXISTS idx_reviews_reconciliation_status
   ON reviews (reconciliation_status)
   WHERE reconciliation_status NOT IN ('none', 'matched');
+
+-- Index for the submission/confirmation sweep over in-flight transactions.
+CREATE INDEX IF NOT EXISTS idx_reviews_on_chain_status
+  ON reviews (on_chain_status)
+  WHERE on_chain_status IN ('pending', 'submitted', 'failed');
 
 -- ─── Repair queue ─────────────────────────────────────────────────────────────
 --

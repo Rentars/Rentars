@@ -1,6 +1,9 @@
 import type { Request, Response } from 'express';
 import { propertySchema, updatePropertySchema } from '@/validators/property.validator.js';
 import type { ZodError } from 'zod';
+import crypto from 'node:crypto';
+import { recordPropertyView, getPropertyViewStats, getPropertyViewCount } from '@/services/propertyView.service.js';
+import { isBot } from '@/utils/botDetection.js';
 
 import {
   createProperty,
@@ -24,7 +27,7 @@ import {
 import { trackSearch, getSearchSuggestions, getTrendingSearches, trackSuggestionEvent } from '@/services/searchAnalytics.service.js';
 import { computeZeroResultSuggestions, getPriceHistogram } from '@/services/propertySearch.service.js';
 import { supabase } from '@/config/supabase.js';
-import { redactExactCoordinates, resolveLocationTier } from '@/utils/locationPrivacy.js';
+import { redactExactCoordinates, resolveLocationTier, markExactLocation } from '@/utils/locationPrivacy.js';
 import type { AuthRequest } from '@/middleware/auth.middleware.js';
 
 // ─── Location-privacy helpers ─────────────────────────────────────────────────
@@ -51,7 +54,7 @@ async function applyLocationPrivacy(
   );
 
   if (tier === 'host' || tier === 'booking') {
-    return property as unknown as Record<string, unknown>;
+    return markExactLocation(property) as unknown as Record<string, unknown>;
   }
 
   return redactExactCoordinates(property as Property & { latitude?: number; longitude?: number }) as unknown as Record<string, unknown>;
@@ -63,7 +66,7 @@ async function applyLocationPrivacy(
  */
 function applyLocationPrivacyToList(properties: Property[]): Record<string, unknown>[] {
   return properties.map((p) =>
-    redactExactCoordinates(p as Property & { latitude?: number; longitude?: number }) as unknown as Record<string, unknown>,
+    redactPublicLocationResponse(p, { tier: 'public' }) as unknown as Record<string, unknown>,
   );
 }
 
@@ -256,6 +259,14 @@ export async function deletePropertyHandler(req: AuthRequest, res: Response): Pr
  * Coordinates in the response are always redacted — map markers must use the
  * approximate_latitude / approximate_longitude fields from the privacy layer.
  */
+/** Maximum viewport area (square degrees) accepted by a map query. */
+const MAX_VIEWPORT_AREA_SQ_DEG = 100;
+
+/** Quantise bounds so sub-pixel pans share one cache entry / result set. */
+function quantizeBound(value: number): number {
+  return Math.round(value * 10_000) / 10_000;
+}
+
 export async function boundsSearchHandler(req: Request, res: Response): Promise<void> {
   const { north, south, east, west } = req.query;
 
@@ -272,15 +283,79 @@ export async function boundsSearchHandler(req: Request, res: Response): Promise<
     return;
   }
 
+  if (
+    parsedSouth < -90 || parsedNorth > 90 ||
+    parsedWest < -180 || parsedEast > 180 ||
+    parsedWest >= parsedEast
+  ) {
+    res.status(400).json({
+      error: 'Invalid viewport: latitude must be within [-90, 90], longitude within [-180, 180], and west must be less than east',
+    });
+    return;
+  }
   if (parsedSouth >= parsedNorth) {
     res.status(400).json({ error: 'south must be less than north' });
     return;
   }
+  if ((parsedNorth - parsedSouth) * (parsedEast - parsedWest) > MAX_VIEWPORT_AREA_SQ_DEG) {
+    res.status(400).json({ error: 'Viewport is too large — zoom in before searching this area' });
+    return;
+  }
 
-  const result = await advancedSearch({
-    bounds: { north: parsedNorth, south: parsedSouth, east: parsedEast, west: parsedWest },
+  const bounds = {
+    north: quantizeBound(parsedNorth),
+    south: quantizeBound(parsedSouth),
+    east: quantizeBound(parsedEast),
+    west: quantizeBound(parsedWest),
+  };
+
+  // Viewport queries must honour the active filters, otherwise markers and the
+  // visible list disagree whenever the user pans. These are the same validated
+  // filters accepted by /search/advanced, plus the validated bounds.
+  const rawTypes = req.query.property_types;
+  const property_types = rawTypes
+    ? (Array.isArray(rawTypes) ? (rawTypes as string[]) : [String(rawTypes)])
+    : undefined;
+  const VALID_TYPES = ['Apartment','House','Villa','Condo','Studio','Room','Townhouse','Cabin','Loft','Boat'];
+  if (property_types?.some((t) => !VALID_TYPES.includes(t))) {
+    res.status(400).json({ error: 'Invalid property_types in viewport search' });
+    return;
+  }
+  const numericFilters: Record<string, number | undefined> = {};
+  for (const key of ['min_price', 'max_price', 'bedrooms', 'min_bathrooms', 'guests'] as const) {
+    const raw = req.query[key];
+    if (raw !== undefined) {
+      const value = Number(raw);
+      if (!Number.isFinite(value) || value < 0) {
+        res.status(400).json({ error: `${key} must be a non-negative number` });
+        return;
+      }
+      numericFilters[key] = value;
+    }
+  }
+  const amenities = req.query.amenities
+    ? (Array.isArray(req.query.amenities)
+        ? (req.query.amenities as string[]).map(String)
+        : [String(req.query.amenities)])
+    : undefined;
+
+  const filters: AdvancedSearchFilters = {
+    bounds,
+    min_price: numericFilters.min_price,
+    max_price: numericFilters.max_price,
+    bedrooms: numericFilters.bedrooms,
+    min_bathrooms: numericFilters.min_bathrooms,
+    guests: numericFilters.guests,
+    property_types,
+    amenities,
+    checkIn: req.query.checkIn as string | undefined,
+    checkOut: req.query.checkOut as string | undefined,
+    sortBy: req.query.sortBy as AdvancedSearchFilters['sortBy'],
+    page: 1,
     limit: 200,
-  });
+  };
+
+  const result = await advancedSearch(filters);
 
   if (!result.success || !result.data) {
     res.status(500).json({ error: result.error ?? 'Search failed' });
@@ -289,10 +364,12 @@ export async function boundsSearchHandler(req: Request, res: Response): Promise<
 
   // Map markers are public — always redact exact coordinates.
   const redacted = result.data.data.map((p) =>
-    redactExactCoordinates(p as { id: string; latitude?: number; longitude?: number }) as unknown as Record<string, unknown>,
+    redactPublicLocationResponse(p, { tier: 'public' }) as unknown as Record<string, unknown>,
   );
 
-  res.json({ data: redacted, count: redacted.length });
+  // Echo the exact query so callers never pair these markers with results
+  // from a different viewport/filter combination.
+  res.json({ data: redacted, count: redacted.length, bounds, filters });
 }
 
 // ─── Advanced Search ──────────────────────────────────────────────────────────
@@ -321,6 +398,21 @@ export async function advancedSearchHandler(req: Request, res: Response): Promis
     return;
   }
 
+  // Validate guests (#944): the same guest-count range enforced at listing
+  // creation, quote, and booking creation. Zero, negative, non-integer, and
+  // non-numeric values fail explicitly instead of being coerced to a default.
+  const guests_raw = req.query.guests !== undefined ? Number(req.query.guests) : undefined;
+  if (
+    guests_raw !== undefined &&
+    (!Number.isInteger(guests_raw) || guests_raw < MIN_GUESTS || guests_raw > MAX_GUESTS)
+  ) {
+    res.status(400).json({
+      error: `guests must be an integer between ${MIN_GUESTS} and ${MAX_GUESTS}`,
+      code: 'INVALID_GUEST_COUNT',
+    });
+    return;
+  }
+
   const filters: AdvancedSearchFilters = {
     query: req.query.q as string,
     city: req.query.city as string,
@@ -330,7 +422,7 @@ export async function advancedSearchHandler(req: Request, res: Response): Promis
     bedrooms: req.query.bedrooms ? Number(req.query.bedrooms) : undefined,
     min_bathrooms: min_bathrooms_raw,
     property_types,
-    guests: req.query.guests ? Number(req.query.guests) : undefined,
+    guests: guests_raw,
     amenities: req.query.amenities
       ? Array.isArray(req.query.amenities)
         ? (req.query.amenities as string[])
@@ -346,11 +438,26 @@ export async function advancedSearchHandler(req: Request, res: Response): Promis
     limit: req.query.limit ? Number(req.query.limit) : 20,
   };
 
+  // Cursors are bound to the filter snapshot and sort mode. Invalid or stale
+  // cursors are a client error, never a silently different result page.
+  const cursorParam = typeof req.query.cursor === 'string' ? req.query.cursor : undefined;
+  const filterFingerprint = searchFilterFingerprint(filters as unknown as Record<string, unknown>);
+  const cursorValidation = validateSearchCursor(cursorParam, filters.sortBy, filterFingerprint);
+  if (!cursorValidation.ok) {
+    res.status(400).json({ error: cursorValidation.error });
+    return;
+  }
+
   const result = await advancedSearch(filters);
   if (!result.success) {
     res.status(500).json({ error: result.error });
     return;
   }
+
+  const lastRow = result.data.data[result.data.data.length - 1] as unknown as Record<string, unknown> | undefined;
+  const nextCursor = lastRow
+    ? searchCursorAfterRow(lastRow, filters.sortBy, filterFingerprint)
+    : null;
 
   const viewerId = (req as AuthRequest).userId;
   const { data: resultData, total, page: resultPage, limit: resultLimit, hasMore } = result.data;
@@ -364,7 +471,7 @@ export async function advancedSearchHandler(req: Request, res: Response): Promis
 
   // Search results are always public — redact coordinates
   const redacted = resultData.map((p) =>
-    redactExactCoordinates(p as { id: string; latitude?: number; longitude?: number }) as unknown as Record<string, unknown>,
+    redactPublicLocationResponse(p, { tier: 'public' }) as unknown as Record<string, unknown>,
   );
 
   if (redacted.length === 0) {
@@ -372,11 +479,11 @@ export async function advancedSearchHandler(req: Request, res: Response): Promis
     if (suggestions.length > 0) {
       trackSuggestionEvent('offered', suggestions.map((s) => s.type).join(','), filters.query, viewerId).catch(() => {});
     }
-    res.json({ data: redacted, count: 0, page: filters.page, histogram: histogramResult, _suggestions: suggestions });
+    res.json({ data: redacted, count: 0, page: filters.page, nextCursor, histogram: histogramResult, _suggestions: suggestions });
     return;
   }
 
-  res.json({ data: redacted, count: redacted.length, page: filters.page, histogram: histogramResult });
+  res.json({ data: redacted, count: redacted.length, page: filters.page, nextCursor, histogram: histogramResult });
 }
 
 export async function searchSuggestionsHandler(req: Request, res: Response): Promise<void> {
@@ -534,6 +641,7 @@ export async function getViewStatsHandler(req: Request, res: Response): Promise<
 // ─── Occupancy heatmap ────────────────────────────────────────────────────────
 
 import { getOccupancyHeatmap } from '@/services/occupancy.service.js';
+import { MIN_GUESTS, MAX_GUESTS } from '@/validators/guestCount.js';
 
 function zodFieldErrors(error: ZodError): Record<string, string[]> {
   const fields: Record<string, string[]> = {};
@@ -760,6 +868,53 @@ export async function getPropertyVersionsHandler(req: AuthRequest, res: Response
   }
 
   res.json(result.data);
+}
+
+/**
+ * GET /api/v1/properties/:id/publish-readiness
+ *
+ * Returns the publish readiness status for a draft property. Owner-only.
+ * Response: { ready: boolean; missingFields: string[]; imageCount: number }
+ */
+export async function getPublishReadinessHandler(req: AuthRequest, res: Response): Promise<void> {
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const propertyId = req.params.id as string;
+
+  const { supabase: supabaseClient } = await import('../config/supabase.js');
+
+  // Verify ownership
+  const { data: property, error: propError } = await supabaseClient
+    .from('properties')
+    .select('*')
+    .eq('id', propertyId)
+    .eq('owner_id', userId)
+    .maybeSingle();
+
+  if (propError || !property) {
+    res.status(404).json({ error: 'Property not found' });
+    return;
+  }
+
+  const { count: imageCount } = await supabaseClient
+    .from('property_images')
+    .select('id', { count: 'exact', head: true })
+    .eq('property_id', propertyId)
+    .in('moderation_status', ['pending', 'approved']);
+
+  const { getPublishReadiness } = await import('../services/property.service.js');
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const readiness = getPublishReadiness(property as any, imageCount ?? 0);
+
+  res.json({
+    ready: readiness.ready,
+    missingFields: readiness.missingFields,
+    imageCount: imageCount ?? 0,
+  });
 }
 
 /**

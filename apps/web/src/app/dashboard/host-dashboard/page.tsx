@@ -6,6 +6,7 @@ import { Plus } from 'lucide-react';
 import { useHostDashboard } from '@/hooks/useHostDashboard';
 import DashboardSummaryCards from '@/components/dashboard/DashboardSummaryCards';
 import HostPropertiesTable from '@/components/dashboard/HostPropertiesTable';
+import { useBookingActionPolicy } from '@/lib/bookings/useBookingActionPolicy';
 import {
   DashboardSummarySkeleton,
   EmptyState,
@@ -32,14 +33,22 @@ export default function HostDashboard() {
   const {
     summary,
     properties,
+    totalProperties,
     isLoadingSummary,
     isLoadingProperties,
     summaryError,
     propertiesError,
+    propertiesPage,
+    propertiesLimit,
     refetchSummary,
     refetchProperties,
     updatePropertyStatus,
   } = useHostDashboard();
+
+  // Derive host-role booking action availability from the shared action
+  // matrix so the same booking state yields the same actions as tenant views.
+  // Backend services remain authoritative for authorization.
+  const { getActionsForBooking, getUnavailableReason } = useBookingActionPolicy('host');
 
   const handleAddProperty = () => {
     setShowAddProperty(false);
@@ -48,9 +57,11 @@ export default function HostDashboard() {
     refetchProperties();
   };
 
-  // For heatmap we use real property ids when available, fall back to mock while loading
+  // For heatmap we use real property ids only when the properties request
+  // succeeded; while loading or after an error we fall back to mock data
+  // rather than presenting stale/partial results as confirmed.
   const heatmapProperties =
-    properties.length > 0
+    !propertiesError && properties.length > 0
       ? properties.map((p) => ({ id: p.id, title: p.title }))
       : mockHostData.properties.map((p) => ({ id: p.id, title: p.title }));
 
@@ -103,18 +114,37 @@ export default function HostDashboard() {
           <EmptyState
             title="No summary data yet"
             description="Once your property gets bookings, revenue and occupancy totals will appear here."
+            action={
+              <button
+                type="button"
+                onClick={refetchSummary}
+                className="text-sm font-medium text-blue-600 dark:text-blue-400 hover:underline"
+              >
+                Refresh
+              </button>
+            }
           />
         )}
 
-        {/* Available Balance (kept from existing earnings flow) */}
+        {/* Available Balance (kept from existing earnings flow). Only the
+            confirmed summary value is shown; otherwise we fall back to the
+            placeholder earnings figure rather than a stale API value. */}
         <AvailableBalance
-          amount={summary?.net_revenue ?? mockHostData.earningsStats.pendingPayout}
+          amount={
+            !summaryError && summary
+              ? summary.net_revenue
+              : mockHostData.earningsStats.pendingPayout
+          }
           onWithdraw={() => {}}
         />
 
-        {/* Booking Stats — use real active count when available */}
+        {/* Booking Stats — use real active count only on confirmed success */}
         <BookingStats
-          activeBookings={summary?.active_bookings ?? mockHostData.bookingStats.activeBookings}
+          activeBookings={
+            !summaryError && summary
+              ? summary.active_bookings
+              : mockHostData.bookingStats.activeBookings
+          }
           completedBookings={mockHostData.bookingStats.completedBookings}
           cancelledBookings={mockHostData.bookingStats.cancelledBookings}
           totalReviews={mockHostData.bookingStats.totalReviews}
@@ -164,10 +194,29 @@ export default function HostDashboard() {
               retryLabel="Retry"
               retrying={isLoadingProperties}
             />
+          ) : properties.length === 0 ? (
+            <EmptyState
+              title="No properties yet"
+              description="Add your first property to start receiving bookings and tracking performance."
+              action={
+                <button
+                  type="button"
+                  onClick={() => setShowAddProperty(true)}
+                  className="text-sm font-medium text-blue-600 dark:text-blue-400 hover:underline"
+                >
+                  Add a property
+                </button>
+              }
+            />
           ) : (
             <HostPropertiesTable
               properties={properties}
+              total={totalProperties}
+              page={propertiesPage}
+              totalPages={inventoryTotalPages}
               onStatusChange={updatePropertyStatus}
+              getBookingActions={getActionsForBooking}
+              getBookingUnavailableReason={getUnavailableReason}
             />
           )}
         </section>

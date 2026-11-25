@@ -24,7 +24,12 @@ export type ChangeRoleResult =
   | {
       ok: false;
       status: 403 | 404 | 409 | 422 | 500;
-      code: RoleTransitionDenial | 'NOT_FOUND' | 'CONCURRENT_UPDATE' | 'DB_ERROR';
+      code:
+        | RoleTransitionDenial
+        | 'NOT_FOUND'
+        | 'CONCURRENT_UPDATE'
+        | 'DB_ERROR'
+        | 'INVALID_REASON';
       message: string;
     };
 
@@ -32,8 +37,42 @@ export interface ChangeRoleParams {
   actorId: string;
   targetId: string;
   toRole: AssignableRole;
+  /** Operator-supplied justification. Required and validated server-side. */
+  reason: string;
   requestId?: string;
   ip?: string;
+}
+
+/** Minimum length for an operator-supplied reason. */
+export const MIN_REASON_LENGTH = 10;
+/** Maximum stored length; longer reasons are rejected rather than truncated. */
+export const MAX_REASON_LENGTH = 500;
+
+/**
+ * Validates an operator-supplied reason. Returns a normalized reason or an
+ * error message. Whitespace-only or too-short reasons are rejected so the
+ * audit trail always carries a meaningful justification.
+ */
+export function validateReason(
+  reason: unknown,
+): { ok: true; reason: string } | { ok: false; message: string } {
+  if (typeof reason !== 'string') {
+    return { ok: false, message: 'A reason is required for role changes.' };
+  }
+  const trimmed = reason.trim();
+  if (trimmed.length < MIN_REASON_LENGTH) {
+    return {
+      ok: false,
+      message: `Reason must be at least ${MIN_REASON_LENGTH} characters.`,
+    };
+  }
+  if (trimmed.length > MAX_REASON_LENGTH) {
+    return {
+      ok: false,
+      message: `Reason must be at most ${MAX_REASON_LENGTH} characters.`,
+    };
+  }
+  return { ok: true, reason: trimmed };
 }
 
 const STATUS_BY_CODE: Partial<Record<RoleTransitionDenial, 403 | 409 | 422>> = {
@@ -47,6 +86,30 @@ const STATUS_BY_CODE: Partial<Record<RoleTransitionDenial, 403 | 409 | 422>> = {
 
 export async function changeUserRole(params: ChangeRoleParams): Promise<ChangeRoleResult> {
   const { actorId, targetId, toRole, requestId, ip } = params;
+
+  const auditBase = {
+    actorId,
+    action: 'admin.user_role_change' as const,
+    resourceType: 'user' as const,
+    resourceId: targetId,
+    correlationId: requestId,
+    ip,
+  };
+
+  // Reason is validated before anything else so a missing justification is
+  // never silently dropped from the audit trail.
+  const reasonCheck = validateReason(params.reason);
+  if (!reasonCheck.ok) {
+    await auditLogger.log({
+      ...auditBase,
+      action: 'admin.user_role_change_denied',
+      success: false,
+      error: 'INVALID_REASON',
+      meta: { new_role: toRole, reason: 'INVALID_REASON' },
+    });
+    return { ok: false, status: 422, code: 'INVALID_REASON', message: reasonCheck.message };
+  }
+  const reason = reasonCheck.reason;
 
   const { data: actor, error: actorErr } = await supabase
     .from('users')
@@ -83,22 +146,13 @@ export async function changeUserRole(params: ChangeRoleParams): Promise<ChangeRo
     adminCount: adminCount ?? 0,
   });
 
-  const auditBase = {
-    actorId,
-    action: 'admin.user_role_change' as const,
-    resourceType: 'user' as const,
-    resourceId: targetId,
-    correlationId: requestId,
-    ip,
-  };
-
   if (!decision.allowed) {
     await auditLogger.log({
       ...auditBase,
       action: 'admin.user_role_change_denied',
       success: false,
       error: decision.code,
-      meta: { old_role: target.role, new_role: toRole, reason: decision.code },
+      meta: { old_role: target.role, new_role: toRole, reason, denial: decision.code },
     });
     return {
       ok: false,
@@ -132,7 +186,7 @@ export async function changeUserRole(params: ChangeRoleParams): Promise<ChangeRo
   await auditLogger.log({
     ...auditBase,
     success: true,
-    meta: { old_role: target.role, new_role: toRole },
+    meta: { old_role: target.role, new_role: toRole, reason },
   });
 
   return { ok: true, userId: targetId, oldRole: target.role, newRole: toRole };

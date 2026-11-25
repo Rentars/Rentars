@@ -34,7 +34,7 @@
  * information leakage.
  */
 
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHmac, timingSafeEqual, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { supabase } from '@/config/supabase.js';
 import { usdcToStroops } from '@/utils/payment.utils.js';
@@ -43,9 +43,19 @@ import {
   mapProviderStatus,
   hashEventPayload,
   getPaymentByBookingId,
+  appendPaymentEvent,
+  derivePaymentStatus,
 } from './payment.service.js';
+import {
+  reconcileEscrowOperation,
+  type EscrowOperationType,
+} from './escrowOperation.service.js';
 import { verifyOnChainEscrowEvent } from './escrowEventVerification.service.js';
 import type { ServiceResponse } from './index.js';
+import {
+  paymentWorkflowTotal,
+  paymentWorkflowDurationSeconds,
+} from '@/observability/metrics.js';
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -86,6 +96,14 @@ export const callbackBodySchema = z.object({
   providerAccountId: z.string().min(1),
   /** Optional Stellar transaction hash associated with the event. */
   txHash: z.string().optional(),
+  /** Optional escrow operation key this event settles (idempotency key). */
+  operationKey: z.string().min(1).optional(),
+  /** Optional escrow operation type this event settles. */
+  operationType: z.enum(['create', 'release', 'refund']).optional(),
+  /** Optional provider-side escrow reference. */
+  providerReference: z.string().min(1).optional(),
+  /** Optional correlation ID propagated from the originating request. */
+  correlationId: z.string().min(1).optional(),
 }).passthrough();
 
 export type CallbackBody = z.infer<typeof callbackBodySchema>;
@@ -107,6 +125,43 @@ export interface CallbackVerificationResult {
   httpStatus: number;
   /** Safe message to surface to the provider (no internals). */
   message: string;
+}
+
+// ─── Correlation context ──────────────────────────────────────────────────────
+
+/**
+ * Nonsecret correlation identifiers attached to every callback log line.
+ * Never includes signatures, auth headers, wallet secrets or payload bodies.
+ */
+interface CallbackCorrelation {
+  correlationId: string;
+  bookingId: string;
+  operationId?: string;
+  operationKey?: string;
+  eventId: string;
+}
+
+/**
+ * Emit a structured, redacted log line for callback processing.
+ * Only nonsecret identifiers and coarse statuses are included.
+ */
+function logCallback(
+  level: 'info' | 'warn' | 'error',
+  message: string,
+  ctx: Partial<CallbackCorrelation> & Record<string, unknown>,
+): void {
+  const safe = {
+    correlationId: ctx.correlationId ?? 'unknown',
+    bookingId: ctx.bookingId ?? 'unknown',
+    operationId: ctx.operationId ?? null,
+    operationKey: ctx.operationKey ?? null,
+    eventId: ctx.eventId ?? null,
+    ...ctx,
+  };
+  const line = `[Callback] ${message} ${JSON.stringify(safe)}`;
+  if (level === 'error') console.error(line);
+  else if (level === 'warn') console.warn(line);
+  else console.info(line);
 }
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
@@ -150,11 +205,16 @@ async function isReplay(eventId: string): Promise<boolean> {
 
 /**
  * Persist an event ID to the replay ledger.
+ *
+ * Idempotent: a duplicate insert (same event_id) is ignored via upsert so
+ * concurrent deliveries of the same callback cannot create duplicate rows or
+ * financial effects. Returns true when the event was newly recorded.
  */
 async function recordEvent(
   eventId: string,
   bookingId: string,
   eventHash: string,
+  correlation?: { correlationId?: string; operationId?: string; operationKey?: string },
 ): Promise<void> {
   await supabase
     .from('payment_callback_events')
@@ -162,9 +222,58 @@ async function recordEvent(
       event_id: eventId,
       booking_id: bookingId,
       event_hash: eventHash,
+      correlation_id: correlation?.correlationId ?? null,
+      operation_id: correlation?.operationId ?? null,
+      operation_key: correlation?.operationKey ?? null,
       created_at: new Date().toISOString(),
     })
     .select(); // fire-and-forget but await to avoid unhandled rejections
+}
+
+/**
+ * Reconcile an escrow operation referenced by a callback.
+ *
+ * When the callback carries an operation key/type, the operation state
+ * machine is advanced from `pending`/`ambiguous` to a terminal state using
+ * the provider's authoritative outcome. This is what allows a timed-out
+ * submission to be resolved without a second external call.
+ */
+async function reconcileFromCallback(
+  body: CallbackBody,
+  canonicalStatus: string,
+  ctx: CallbackCorrelation,
+): Promise<void> {
+  if (!body.operationKey || !body.operationType) return;
+
+  try {
+    const result = await reconcileEscrowOperation({
+      bookingId: body.bookingId,
+      operationKey: body.operationKey,
+      operationType: body.operationType as EscrowOperationType,
+      providerReference: body.providerReference ?? body.txHash ?? null,
+      providerStatus: canonicalStatus,
+      correlationId: ctx.correlationId,
+    });
+
+    if (!result.success) {
+      logCallback('warn', 'escrow operation reconciliation failed', {
+        ...ctx,
+        error: result.error,
+      });
+      return;
+    }
+
+    logCallback('info', 'escrow operation reconciled', {
+      ...ctx,
+      operationId: result.data?.id,
+      operationState: result.data?.state,
+    });
+  } catch (err) {
+    logCallback('error', 'escrow operation reconciliation threw', {
+      ...ctx,
+      error: err instanceof Error ? err.message : 'unknown',
+    });
+  }
 }
 
 // ─── Main verifier ────────────────────────────────────────────────────────────
@@ -188,70 +297,96 @@ export async function verifyAndProcessCallback(
   webhookSecret: string,
   expectedProviderId: string,
 ): Promise<CallbackVerificationResult> {
+  const startedAt = process.hrtime.bigint();
+
+  // Emit exactly one outcome counter + one duration observation per handled
+  // callback, regardless of which return path is taken. Labels are bounded
+  // (operation/outcome only) — never eventId, bookingId or txHash.
+  const finish = (result: CallbackVerificationResult): CallbackVerificationResult => {
+    const outcome = mapOutcomeLabel(result.status);
+    paymentWorkflowTotal.inc({ operation: 'callback', outcome });
+    const elapsedSeconds = Number(process.hrtime.bigint() - startedAt) / 1e9;
+    paymentWorkflowDurationSeconds.observe({ operation: 'callback' }, elapsedSeconds);
+    return result;
+  };
 
   // ── 1. Signature presence ────────────────────────────────────────────────
   if (!signatureHeader) {
-    return {
+    return finish({
       status: 'invalid_signature',
       httpStatus: 401,
       message: 'Missing signature header',
-    };
+    });
   }
 
   // ── 2. HMAC signature verification (constant time) ───────────────────────
   const expected = computeHmac(rawBody, webhookSecret);
   if (!safeCompare(signatureHeader, expected)) {
-    return {
+    return finish({
       status: 'invalid_signature',
       httpStatus: 401,
       message: 'Signature verification failed',
-    };
+    });
   }
 
   // ── 3. Payload schema validation ─────────────────────────────────────────
   const parseResult = callbackBodySchema.safeParse(parsedBody);
   if (!parseResult.success) {
-    return {
+    return finish({
       status: 'invalid_payload',
       httpStatus: 400,
       message: 'Malformed callback payload',
-    };
+    });
   }
 
   const body = parseResult.data;
 
+  // Correlation context — nonsecret identifiers only.
+  const ctx: CallbackCorrelation = {
+    correlationId: body.correlationId ?? body.eventId,
+    bookingId: body.bookingId,
+    operationKey: body.operationKey,
+    eventId: body.eventId,
+  };
+
   // ── 4. Clock skew check ───────────────────────────────────────────────────
   const eventAge = Date.now() - new Date(body.timestamp).getTime();
   if (Math.abs(eventAge) > MAX_CLOCK_SKEW_MS) {
+    logCallback('warn', 'event timestamp outside acceptable window', {
+      ...ctx,
+      eventAgeMs: eventAge,
+    });
     return {
       status: 'invalid_timestamp',
       httpStatus: 400,
       message: 'Event timestamp outside acceptable window',
-    };
+    });
   }
 
   // ── 5. Provider account identity check ───────────────────────────────────
   if (body.providerAccountId !== expectedProviderId) {
     // Potential cross-tenant injection; quarantine
-    console.error(
-      `[Callback] Provider account mismatch: got=${body.providerAccountId} expected=${expectedProviderId}`,
-    );
+    logCallback('error', 'provider account identity mismatch', {
+      ...ctx,
+      providerAccountId: body.providerAccountId,
+    });
     return {
       status: 'mismatch',
       httpStatus: 422,
       message: 'Provider account identity mismatch',
-    };
+    });
   }
 
   // ── 6. Replay detection ───────────────────────────────────────────────────
   const eventHash = hashEventPayload(body as unknown as Record<string, unknown>);
 
   if (await isReplay(body.eventId)) {
+    logCallback('info', 'duplicate callback event ignored', ctx);
     return {
       status: 'replayed',
       httpStatus: 200,
       message: 'Event already processed',
-    };
+    });
   }
 
   // ── 7. Load payment and cross-reference booking + amount ─────────────────
@@ -259,12 +394,12 @@ export async function verifyAndProcessCallback(
 
   if (!payment) {
     // Booking not found — could be a test event or mis-routed webhook
-    console.warn(`[Callback] No payment found for bookingId=${body.bookingId}`);
+    logCallback('warn', 'no payment found for booking', ctx);
     return {
       status: 'mismatch',
       httpStatus: 422,
       message: 'Booking not found',
-    };
+    });
   }
 
   const incomingStroops = BigInt(body.amountStroops);
@@ -275,12 +410,15 @@ export async function verifyAndProcessCallback(
     .single();
 
   if (bookingError) {
-    console.error(`[Callback] Failed to verify booking amount for ${body.bookingId}:`, bookingError.message);
+    logCallback('error', 'failed to verify booking amount', {
+      ...ctx,
+      error: bookingError.message,
+    });
     return {
       status: 'quarantined',
       httpStatus: 503,
       message: 'Booking verification is temporarily unavailable; retry the event',
-    };
+    });
   }
 
   let bookingAmountStroops: bigint | null = null;
@@ -299,11 +437,12 @@ export async function verifyAndProcessCallback(
     payment.amount_stroops !== bookingAmountStroops
   ) {
     // Amount mismatch — quarantine; do NOT mark paid
-    console.error(
-      `[Callback] Amount mismatch or booking lookup failure for bookingId=${body.bookingId}: ` +
-      `provider=${incomingStroops} payment=${payment.amount_stroops} ` +
-      `booking=${bookingAmountStroops ?? 'unavailable'}`,
-    );
+    logCallback('error', 'amount mismatch or booking lookup failure', {
+      ...ctx,
+      providerStroops: incomingStroops.toString(),
+      paymentStroops: payment.amount_stroops.toString(),
+      bookingStroops: bookingAmountStroops?.toString() ?? 'unavailable',
+    });
     // Transition to under_review so the discrepancy is auditable
     await transitionPaymentStatus(
       payment.id,
@@ -311,15 +450,16 @@ export async function verifyAndProcessCallback(
       {
         ...body,
         _reason: 'amount_mismatch',
+        _correlationId: correlationId,
       } as unknown as Record<string, unknown>,
     );
     // Record in replay ledger to avoid re-processing
-    await recordEvent(body.eventId, body.bookingId, eventHash);
+    await recordEvent(body.eventId, body.bookingId, eventHash, ctx);
     return {
       status: 'mismatch',
       httpStatus: 422,
       message: 'Amount mismatch — payment under review',
-    };
+    });
   }
 
   // ── 8. Map provider status ────────────────────────────────────────────────
@@ -331,20 +471,21 @@ export async function verifyAndProcessCallback(
   // matching this booking, amount and provider reference.
   if (TERMINAL_SETTLEMENT_STATUSES.has(canonicalStatus)) {
     if (!body.txHash) {
-      console.error(
-        `[Callback] Terminal status '${canonicalStatus}' without txHash for bookingId=${body.bookingId}`,
-      );
+      logCallback('error', 'terminal status without on-chain evidence', {
+        ...ctx,
+        canonicalStatus,
+      });
       await transitionPaymentStatus(
         payment.id,
         'under_review',
         { ...body, _reason: 'terminal_without_on_chain_evidence' } as unknown as Record<string, unknown>,
       );
-      await recordEvent(body.eventId, body.bookingId, eventHash);
-      return {
+      await recordEvent(body.eventId, body.bookingId, eventHash, ctx);
+      return finish({
         status: 'mismatch',
         httpStatus: 422,
         message: 'Terminal transition requires on-chain evidence — payment under review',
-      };
+      });
     }
 
     const verification = await verifyOnChainEscrowEvent({
@@ -358,23 +499,25 @@ export async function verifyAndProcessCallback(
     if (verification.status === 'unavailable') {
       // Do NOT transition; ask the provider to retry so we never settle on
       // unverifiable evidence.
-      console.error(
-        `[Callback] On-chain verification unavailable for bookingId=${body.bookingId}: ${verification.reason}`,
-      );
-      return {
+      logCallback('error', 'on-chain verification unavailable', {
+        ...ctx,
+        reason: verification.reason,
+      });
+      return finish({
         status: 'quarantined',
         httpStatus: 503,
         message: 'On-chain verification is temporarily unavailable; retry the event',
-      };
+      });
     }
 
     if (verification.status !== 'verified') {
       // On-chain and provider state disagree (or evidence is forged/mismatched).
       // Surface the disagreement via under_review; never silently resolve.
-      console.error(
-        `[Callback] On-chain evidence rejected for bookingId=${body.bookingId} ` +
-        `txHash=${body.txHash}: ${verification.reason}`,
-      );
+      logCallback('error', 'on-chain evidence rejected', {
+        ...ctx,
+        txHash: body.txHash,
+        reason: verification.reason,
+      });
       await transitionPaymentStatus(
         payment.id,
         'under_review',
@@ -384,62 +527,138 @@ export async function verifyAndProcessCallback(
           _onChainReason: verification.reason,
         } as unknown as Record<string, unknown>,
       );
-      await recordEvent(body.eventId, body.bookingId, eventHash);
-      return {
+      await recordEvent(body.eventId, body.bookingId, eventHash, ctx);
+      return finish({
         status: 'mismatch',
         httpStatus: 422,
         message: 'On-chain state disagrees with provider event — payment under review',
-      };
+      });
     }
   }
 
-  // ── 8b. Apply transition ──────────────────────────────────────────────────
+  // ── 8b. Append to the canonical ledger ────────────────────────────────────
+  // Append the validated event first. The ledger is append-only and idempotent
+  // on eventId, so duplicate deliveries cannot create duplicate effects.
+  await appendLedgerEvent({
+    paymentId: payment.id,
+    bookingId: body.bookingId,
+    providerAccountId: body.providerAccountId,
+    eventId: body.eventId,
+    eventHash,
+    canonicalStatus,
+    amountStroops: incomingStroops,
+    txHash: body.txHash ?? null,
+    correlationId,
+    rawPayload: body as unknown as Record<string, unknown>,
+  });
+
+  // Recompute the derived status from stored events (order-independent).
+  const derived = await derivePaymentStatus(payment.id);
+  if (!derived.success) {
+    console.error(
+      `[Callback] Failed to derive status for payment=${payment.id} correlationId=${correlationId}:`,
+      derived.error,
+    );
+  }
+
   const transitionResult = await transitionPaymentStatus(
     payment.id,
     canonicalStatus,
-    body as unknown as Record<string, unknown>,
+    {
+      ...body,
+      _correlationId: correlationId,
+    } as unknown as Record<string, unknown>,
     body.txHash ?? null,
   );
 
   // Record in replay ledger regardless of transition outcome
-  await recordEvent(body.eventId, body.bookingId, eventHash);
+  await recordEvent(body.eventId, body.bookingId, eventHash, ctx);
 
   if (!transitionResult.success) {
-    console.error(`[Callback] Transition failed for payment=${payment.id}:`, transitionResult.error);
+    logCallback('error', 'payment transition failed', {
+      ...ctx,
+      paymentId: payment.id,
+      error: transitionResult.error,
+    });
     // Still return 200 to the provider (we received it fine; our internal
     // state diverged, which is a separate alert path).
-    return {
+    return finish({
       status: 'quarantined',
       httpStatus: 200,
       message: 'Event received; payment under review',
-    };
+    });
   }
 
   const transition = transitionResult.data;
   if (!transition) {
-    console.error(`[Callback] Transition returned no data for payment=${payment.id}`);
+    logCallback('error', 'payment transition returned no data', {
+      ...ctx,
+      paymentId: payment.id,
+    });
     return {
       status: 'quarantined',
       httpStatus: 200,
       message: 'Event received; payment under review',
-    };
+    });
   }
+
+  // ── 9. Reconcile any escrow operation this callback settles ───────────────
+  // Runs after the payment transition so the operation state machine sees
+  // the authoritative provider outcome. Duplicate callbacks are already
+  // filtered by the replay ledger above, and reconciliation itself is
+  // idempotent on the operation key.
+  await reconcileFromCallback(body, canonicalStatus, ctx);
 
   const { replayed } = transition;
 
   if (transition.payment.status === 'under_review') {
+    logCallback('warn', 'payment under review after callback', {
+      ...ctx,
+      paymentId: payment.id,
+    });
     return {
       status: 'quarantined',
       httpStatus: 200,
       message: 'Event received; payment under review',
-    };
+    });
   }
+
+  logCallback('info', replayed ? 'duplicate callback acknowledged' : 'callback acknowledged', {
+    ...ctx,
+    paymentId: payment.id,
+    canonicalStatus,
+  });
 
   return {
     status: replayed ? 'replayed' : 'acknowledged',
     httpStatus: 200,
     message: replayed ? 'Event already processed' : 'Event acknowledged',
-  };
+  });
+}
+
+/**
+ * Collapse the internal verification status into the bounded set of
+ * `outcome` label values used by payment_workflow_total. Keeps cardinality
+ * fixed so dashboards and alerts stay stable.
+ */
+function mapOutcomeLabel(
+  status: CallbackVerificationStatus,
+): 'acknowledged' | 'replayed' | 'mismatch' | 'quarantined' | 'rejected' {
+  switch (status) {
+    case 'acknowledged':
+      return 'acknowledged';
+    case 'replayed':
+      return 'replayed';
+    case 'mismatch':
+      return 'mismatch';
+    case 'quarantined':
+      return 'quarantined';
+    case 'invalid_signature':
+    case 'invalid_timestamp':
+    case 'invalid_payload':
+    default:
+      return 'rejected';
+  }
 }
 
 // ─── HTTP handler helper ──────────────────────────────────────────────────────

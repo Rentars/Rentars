@@ -1,5 +1,6 @@
 import type { Request, Response, NextFunction } from 'express';
 import { uploadImage } from '@/config/supabase-storage.js';
+import { uploadRateLimiter } from '@/middleware/rateLimiter.middleware.js';
 
 export async function uploadPropertyImage(
   req: Request,
@@ -20,3 +21,12 @@ export async function uploadPropertyImage(
     next(error);
   }
 }
+
+/**
+ * Upload-specific rate limiting middleware.
+ *
+ * Uploads have their own budget (separate from general API limits) and are
+ * keyed by authenticated user ID where available. Anonymous callers fall back
+ * to a trusted-proxy-derived IP key (never a raw, spoofable forwarding header).
+ */
+export const uploadRateLimit = uploadRateLimiter;

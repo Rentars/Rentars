@@ -33,7 +33,6 @@ export default function Map({
   const [center, setCenter] = useState<[number, number]>([40.7128, -74.006]);
   const [mapKey, setMapKey] = useState(0);
   const [currentBounds, setCurrentBounds] = useState<LatLngBounds | null>(null);
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mapRef = useRef<LeafletMap | null>(null);
 
   const validProperties = useMemo(
@@ -57,9 +56,9 @@ export default function Map({
 
   const handleBoundsChanged = (bounds: LatLngBounds) => {
     setCurrentBounds(bounds);
-    if (!onBoundsChanged) return;
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => onBoundsChanged(bounds), 350);
+    // BoundsListener already debounces and enforces the movement threshold;
+    // a second debounce here delayed requests and let stale markers render.
+    onBoundsChanged?.(bounds);
   };
 
   const handleSearchThisArea = () => {

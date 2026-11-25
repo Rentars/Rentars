@@ -20,15 +20,67 @@ interface SpecialEvent {
   is_blocked: boolean;
 }
 
+// ─── Feature 3: typed unavailability intervals ─────────────────────────────────
+
+type ReasonType =
+  | 'confirmed_booking'
+  | 'pending_booking'
+  | 'expired_hold'
+  | 'personal_block'
+  | 'maintenance';
+
+interface BookingContext {
+  status: string;
+  check_in: string;
+  check_out: string;
+  hold_expired: boolean;
+}
+
+interface CalendarInterval {
+  id: string;
+  start_date: string;
+  end_date: string;
+  reason_type: ReasonType;
+  label: string;
+  source: 'booking' | 'block';
+  editable: boolean;
+  booking_context?: BookingContext;
+  note?: string;
+}
+
+interface IntervalsResult {
+  intervals: CalendarInterval[];
+  summary: Record<ReasonType, number>;
+}
+
+const REASON_LEGEND: { type: ReasonType; label: string; color: string }[] = [
+  { type: 'confirmed_booking', label: 'Confirmed booking', color: '#dc2626' },
+  { type: 'pending_booking', label: 'Pending booking (hold)', color: '#f59e0b' },
+  { type: 'expired_hold', label: 'Expired booking hold', color: '#9ca3af' },
+  { type: 'maintenance', label: 'Maintenance', color: '#8b5cf6' },
+  { type: 'personal_block', label: 'Personal block', color: '#0284c7' },
+];
+
+const REASON_COLOR: Record<ReasonType, string> = Object.fromEntries(
+  REASON_LEGEND.map((r) => [r.type, r.color]),
+) as Record<ReasonType, string>;
+
 interface HostCalendarProps {
   propertyId: string;
 }
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
 
+function authHeaders(): Record<string, string> {
+  const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null;
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
 export default function HostCalendarManagement({ propertyId }: HostCalendarProps) {
   const [seasonalPricing, setSeasonalPricing] = useState<SeasonalPricing[]>([]);
   const [specialEvents, setSpecialEvents] = useState<SpecialEvent[]>([]);
+  const [intervals, setIntervals] = useState<CalendarInterval[]>([]);
+  const [intervalsLoading, setIntervalsLoading] = useState(false);
   const [loading, setLoading] = useState(true);
   const [showPricingForm, setShowPricingForm] = useState(false);
   const [showEventForm, setShowEventForm] = useState(false);
@@ -36,6 +88,32 @@ export default function HostCalendarManagement({ propertyId }: HostCalendarProps
   useEffect(() => {
     fetchData();
   }, [propertyId]);
+
+  const fetchIntervals = async () => {
+    setIntervalsLoading(true);
+    try {
+      const today = new Date().toISOString().slice(0, 10);
+      const future = (() => {
+        const d = new Date();
+        d.setUTCDate(d.getUTCDate() + 90);
+        return d.toISOString().slice(0, 10);
+      })();
+      const res = await fetch(
+        `${API_URL}/api/v1/calendar/${propertyId}/intervals?from=${today}&to=${future}`,
+        { headers: { ...authHeaders() } },
+      );
+      if (res.ok) {
+        const data: IntervalsResult = await res.json();
+        setIntervals(data.intervals ?? []);
+      } else {
+        setIntervals([]);
+      }
+    } catch {
+      setIntervals([]);
+    } finally {
+      setIntervalsLoading(false);
+    }
+  };
 
   const fetchData = async () => {
     setLoading(true);
@@ -54,6 +132,8 @@ export default function HostCalendarManagement({ propertyId }: HostCalendarProps
     } finally {
       setLoading(false);
     }
+    // Fetch typed intervals (host-only) in parallel completion.
+    fetchIntervals();
   };
 
   const handleAddSeasonalPricing = async (e: React.FormEvent<HTMLFormElement>) => {
@@ -115,6 +195,79 @@ export default function HostCalendarManagement({ propertyId }: HostCalendarProps
 
   return (
     <div className="space-y-8">
+      {/* Feature 3: Typed unavailability intervals + legend */}
+      <div className="bg-white dark:bg-gray-900 rounded-lg shadow-md p-6">
+        <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-3">
+          Unavailability calendar
+        </h3>
+
+        {/* Legend */}
+        <div className="flex flex-wrap gap-3 mb-4 text-xs text-gray-600 dark:text-gray-400">
+          {REASON_LEGEND.map((entry) => (
+            <span key={entry.type} className="flex items-center gap-1.5">
+              <span
+                className="inline-block w-3 h-3 rounded-full"
+                style={{ background: entry.color }}
+              />
+              {entry.label}
+            </span>
+          ))}
+        </div>
+
+        {intervalsLoading ? (
+          <p className="text-sm text-gray-500 dark:text-gray-400">Loading unavailability…</p>
+        ) : intervals.length === 0 ? (
+          <p className="text-sm text-gray-500 dark:text-gray-400">
+            No unavailable dates in the next 90 days.
+          </p>
+        ) : (
+          <ul className="space-y-2">
+            {intervals.map((iv) => (
+              <li
+                key={`${iv.source}-${iv.id}`}
+                className="flex items-start justify-between gap-3 p-3 bg-gray-50 dark:bg-gray-800 rounded-lg"
+              >
+                <div className="flex items-start gap-2 flex-1">
+                  <span
+                    className="inline-block w-2.5 h-2.5 rounded-full mt-1.5 shrink-0"
+                    style={{ background: REASON_COLOR[iv.reason_type] }}
+                  />
+                  <div className="min-w-0">
+                    <p className="font-medium text-sm text-gray-900 dark:text-white">{iv.label}</p>
+                    <p className="text-xs text-gray-600 dark:text-gray-400">
+                      {iv.start_date} → {iv.end_date}
+                      {iv.source === 'booking' && iv.booking_context
+                        ? ` • ${iv.booking_context.status}`
+                        : iv.note
+                          ? ` • ${iv.note.replace(/^(maintenance|personal):/, '')}`
+                          : ''}
+                    </p>
+                    {iv.source === 'booking' && iv.booking_context?.hold_expired && (
+                      <p className="text-xs text-amber-600 dark:text-amber-500 mt-0.5">
+                        Booking hold expired — these dates may be reclaimable.
+                      </p>
+                    )}
+                  </div>
+                </div>
+                <span
+                  className={`text-xs px-2 py-0.5 rounded-full shrink-0 ${
+                    iv.editable
+                      ? 'bg-blue-100 text-blue-700 dark:bg-blue-950 dark:text-blue-300'
+                      : 'bg-gray-200 text-gray-500 dark:bg-gray-700 dark:text-gray-400'
+                  }`}
+                >
+                  {iv.editable ? 'Editable' : 'Locked'}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+        <p className="text-xs text-gray-400 dark:text-gray-500 mt-3">
+          Tenant identity and payment details are never shown here. Locked intervals
+          (bookings) can only be changed through the booking lifecycle, not the calendar.
+        </p>
+      </div>
+
       {/* Seasonal Pricing */}
       <div className="bg-white dark:bg-gray-900 rounded-lg shadow-md p-6">
         <div className="flex items-center justify-between mb-4">

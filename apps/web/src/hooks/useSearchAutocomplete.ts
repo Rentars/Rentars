@@ -37,6 +37,12 @@ export function useSearchAutocomplete({ onSearch }: UseSearchAutocompleteOptions
   const listRef = useRef<HTMLUListElement>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout>>();
   const abortRef = useRef<AbortController | null>(null);
+  // Monotonic request id: a response is only applied when it still belongs to
+  // the query currently shown in the input, even if abort() is unsupported.
+  const requestSeqRef = useRef(0);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [lastResultQuery, setLastResultQuery] = useState('');
 
   const suggestions = localSuggestions;
 
@@ -44,8 +50,11 @@ export function useSearchAutocomplete({ onSearch }: UseSearchAutocompleteOptions
     if (debounceRef.current) clearTimeout(debounceRef.current);
 
     const trimmed = input.trim();
+    const requestId = ++requestSeqRef.current;
 
     if (trimmed.length >= 2) {
+      setIsLoading(true);
+      setError(null);
       debounceRef.current = setTimeout(async () => {
         if (abortRef.current) abortRef.current.abort();
         const controller = new AbortController();
@@ -55,8 +64,11 @@ export function useSearchAutocomplete({ onSearch }: UseSearchAutocompleteOptions
         cleanCache();
         const cached = geocodeCache.get(normalized);
         if (cached) {
+          if (requestId !== requestSeqRef.current) return;
           setLocalSuggestions(cached.suggestions);
+          setLastResultQuery(trimmed);
           setShowSuggestions(true);
+          setIsLoading(false);
           return;
         }
 
@@ -67,23 +79,33 @@ export function useSearchAutocomplete({ onSearch }: UseSearchAutocompleteOptions
           );
           if (!res.ok) throw new Error('Geocode failed');
           const data = (await res.json()) as { address?: string };
-          if (data?.address) {
-            const suggestions_ = [data.address];
-            geocodeCache.set(normalized, { ts: Date.now(), suggestions: suggestions_ });
-            setLocalSuggestions(suggestions_);
-            setShowSuggestions(true);
-          }
+          if (requestId !== requestSeqRef.current) return;
+          const suggestions_ = data?.address ? [data.address] : [];
+          geocodeCache.set(normalized, { ts: Date.now(), suggestions: suggestions_ });
+          setLocalSuggestions(suggestions_);
+          setLastResultQuery(trimmed);
+          setShowSuggestions(true);
         } catch {
-          // cancelled or failed
+          if (requestId !== requestSeqRef.current || controller.signal.aborted) return;
+          // A failure must never clear the user's query or their old results.
+          setError('Suggestions are temporarily unavailable. You can still search.');
+          setShowSuggestions(false);
+        } finally {
+          if (requestId === requestSeqRef.current) setIsLoading(false);
         }
       }, DEBOUNCE_MS);
-    } else if (trimmed.length === 0) {
-      getTrending();
-      setLocalSuggestions([]);
-      setShowSuggestions(true);
     } else {
+      setIsLoading(false);
+      setError(null);
+      setLastResultQuery('');
+      abortRef.current?.abort();
+      if (trimmed.length === 0) {
+        getTrending();
+        setShowSuggestions(true);
+      } else {
+        setShowSuggestions(false);
+      }
       setLocalSuggestions([]);
-      setShowSuggestions(false);
     }
     setActiveIndex(-1);
 
@@ -109,6 +131,11 @@ export function useSearchAutocomplete({ onSearch }: UseSearchAutocompleteOptions
   };
 
   const handleKeyDown = (key: string, preventDefault: () => void) => {
+    if (key === 'Escape' || key === 'Tab') {
+      setShowSuggestions(false);
+      setActiveIndex(-1);
+      return;
+    }
     if (!showSuggestions || suggestions.length === 0) return;
 
     if (key === 'ArrowDown') {
@@ -120,9 +147,6 @@ export function useSearchAutocomplete({ onSearch }: UseSearchAutocompleteOptions
     } else if (key === 'Enter' && activeIndex >= 0) {
       preventDefault();
       handleSelectSuggestion(suggestions[activeIndex]);
-    } else if (key === 'Escape' || key === 'Tab') {
-      setShowSuggestions(false);
-      setActiveIndex(-1);
     }
   };
 
@@ -142,6 +166,9 @@ export function useSearchAutocomplete({ onSearch }: UseSearchAutocompleteOptions
     suggestions,
     isOpen,
     activeIndex,
+    isLoading,
+    error,
+    lastResultQuery,
     listId,
     inputRef,
     listRef,

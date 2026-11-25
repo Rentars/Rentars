@@ -10,7 +10,7 @@ import HouseRulesAcknowledgement, {
 } from '@/components/booking/HouseRulesAcknowledgement';
 import { TermsDisclosure, type TermsAcceptance } from '@/components/shared/TermsDisclosure';
 import { ErrorState } from '@/components/ui/async-states';
-import { isValidStellarAddress } from '@/lib/freighter-utils';
+import { isValidStellarAddress } from '@/lib/isValidStellarAddress';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
 
@@ -19,6 +19,9 @@ interface BookingPayload {
   checkOut: Date;
   guestCount: number;
   totalPrice: number;
+  quoteId: string;
+  quoteToken: string;
+  quoteAcceptedAt: string;
 }
 
 export default function BookingPage() {
@@ -38,6 +41,13 @@ export default function BookingPage() {
   // Remembered so a failed submission can be retried without losing or
   // re-entering any of the user's input.
   const lastBookingRef = useRef<BookingPayload | null>(null);
+  // One operation key and one immutable body per booking attempt. Retries reuse
+  // both so the server's canonical request hash matches exactly.
+  const bookingOperationRef = useRef<{
+    payload: BookingPayload;
+    key: string;
+    body: Record<string, unknown>;
+  } | null>(null);
 
   // House rules state
   const [houseRules, setHouseRules] = useState<HouseRules | null>(null);
@@ -126,6 +136,28 @@ export default function BookingPage() {
       setSubmitError(null);
       lastBookingRef.current = data;
 
+      if (bookingOperationRef.current?.payload !== data) {
+        bookingOperationRef.current = {
+          payload: data,
+          key: crypto.randomUUID(),
+          body: {
+            property_id: propertyId,
+            check_in: data.checkIn.toISOString(),
+            check_out: data.checkOut.toISOString(),
+            guest_count: data.guestCount,
+            total_price: data.totalPrice,
+            quote_id: data.quoteId,
+            quote_token: data.quoteToken,
+            quote_accepted_at: data.quoteAcceptedAt,
+            wallet_address: walletAddress,
+            rules_acknowledged_at: rulesAcknowledgedAt || new Date().toISOString(),
+            terms_version: termsAcceptance.termsVersion,
+            terms_accepted_at: termsAcceptance.termsAcceptedAt,
+          },
+        };
+      }
+      const operation = bookingOperationRef.current!;
+
       try {
         const token = localStorage.getItem('token');
         const response = await fetch(`${API_URL}/api/bookings`, {
@@ -133,18 +165,9 @@ export default function BookingPage() {
           headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${token}`,
+            'Idempotency-Key': operation.key,
           },
-          body: JSON.stringify({
-            property_id: propertyId,
-            check_in: data.checkIn.toISOString(),
-            check_out: data.checkOut.toISOString(),
-            guest_count: data.guestCount,
-            total_price: data.totalPrice,
-            wallet_address: walletAddress,
-            rules_acknowledged_at: rulesAcknowledgedAt || new Date().toISOString(),
-            terms_version: termsAcceptance.termsVersion,
-            terms_accepted_at: termsAcceptance.termsAcceptedAt,
-          }),
+          body: JSON.stringify(operation.body),
         });
 
         if (response.ok) {
@@ -204,10 +227,12 @@ export default function BookingPage() {
   };
 
   return (
-    <main className="min-h-screen bg-gray-50 dark:bg-gray-950 py-8">
-      <div className="max-w-2xl mx-auto px-4">
-        <h1 className="text-3xl font-bold text-gray-900 dark:text-white mb-2">Book your stay</h1>
-        <p className="text-gray-600 dark:text-gray-400 mb-8">
+    <main className="min-h-screen bg-gray-50 dark:bg-gray-950 py-6 sm:py-8">
+      <div className="max-w-2xl mx-auto px-4 pb-28 sm:pb-8">
+        <h1 className="text-2xl sm:text-3xl font-bold text-gray-900 dark:text-white mb-2">
+          Book your stay
+        </h1>
+        <p className="text-sm sm:text-base text-gray-600 dark:text-gray-400 mb-6 sm:mb-8">
           Confirm your dates and complete payment from your wallet.
         </p>
 
@@ -254,14 +279,33 @@ export default function BookingPage() {
           </div>
         )}
 
-        {/* House Rules — must be acknowledged before booking */}
+        {/* House Rules — must be acknowledged before booking.
+            On narrow viewports this secondary content collapses into an
+            accessible disclosure so the primary form stays in view. */}
         {houseRules && (
           <div className="mb-6">
-            <HouseRulesAcknowledgement
-              rules={houseRules}
-              acknowledged={!!rulesAcknowledgedAt}
-              onAcknowledge={(ts) => setRulesAcknowledgedAt(ts)}
-            />
+            <details
+              className="sm:hidden rounded-lg border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900"
+              open={!rulesGatePassed}
+            >
+              <summary className="cursor-pointer select-none px-4 py-3 text-sm font-medium text-gray-900 dark:text-white">
+                House rules{rulesGatePassed ? ' (acknowledged)' : ' — review required'}
+              </summary>
+              <div className="px-4 pb-4">
+                <HouseRulesAcknowledgement
+                  rules={houseRules}
+                  acknowledged={!!rulesAcknowledgedAt}
+                  onAcknowledge={(ts) => setRulesAcknowledgedAt(ts)}
+                />
+              </div>
+            </details>
+            <div className="hidden sm:block">
+              <HouseRulesAcknowledgement
+                rules={houseRules}
+                acknowledged={!!rulesAcknowledgedAt}
+                onAcknowledge={(ts) => setRulesAcknowledgedAt(ts)}
+              />
+            </div>
           </div>
         )}
 
@@ -305,6 +349,36 @@ export default function BookingPage() {
             disabled={!termsAcceptance}
           />
         </div>
+      </div>
+
+      {/* Sticky mobile action bar — keeps the primary action reachable without
+          horizontal scrolling or being pushed off-screen by long content. */}
+      <div className="fixed inset-x-0 bottom-0 z-30 border-t border-gray-200 dark:border-gray-800 bg-white/95 dark:bg-gray-900/95 backdrop-blur px-4 py-3 sm:hidden">
+        {walletConnected && walletAddress ? (
+          <button
+            type="button"
+            onClick={() => {
+              const form = document.querySelector<HTMLFormElement>('form[data-booking-form]');
+              if (form) {
+                form.requestSubmit();
+              } else {
+                form?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+              }
+            }}
+            disabled={isSubmitting || !termsAcceptance || !rulesGatePassed}
+            className="w-full min-h-[44px] rounded-lg bg-blue-600 px-4 py-3 text-sm font-semibold text-white disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
+          >
+            {isSubmitting ? 'Booking…' : 'Confirm booking'}
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={() => setShowWalletModal(true)}
+            className="w-full min-h-[44px] rounded-lg bg-blue-600 px-4 py-3 text-sm font-semibold text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
+          >
+            Connect wallet to book
+          </button>
+        )}
       </div>
 
       <WalletConnectionModal

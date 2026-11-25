@@ -1,0 +1,166 @@
+name: Contracts CI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'apps/contracts/**'
+      - '.github/workflows/contracts.yml'
+  pull_request:
+    paths:
+      - 'apps/contracts/**'
+      - '.github/workflows/contracts.yml'
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: "1.81.0"
+  WASM_TARGET: "wasm32-unknown-unknown"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  contracts:
+    name: Format, Lint, Test & WASM Build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/contracts
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ env.WASM_TARGET }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry, git and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            apps/contracts/target
+          key: ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('apps/contracts/Cargo.lock', 'apps/contracts/**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      - name: cargo build (release wasm)
+        run: cargo build --release --target ${{ env.WASM_TARGET }} --workspace
+
+      - name: Generate WASM manifest
+        run: bash scripts/generate-wasm-manifest.sh
+
+      - name: Verify expected artifacts and hashes
+        run: |
+          set -euo pipefail
+          ARTIFACT_DIR="target/${WASM_TARGET}/release"
+          MANIFEST="target/wasm-manifest.json"
+          EXPECTED=(
+            "booking.wasm"
+            "property-listing.wasm"
+            "rentars-review-contract.wasm"
+            "rentars-rental-contract.wasm"
+          )
+          missing=0
+          for name in "${EXPECTED[@]}"; do
+            path="${ARTIFACT_DIR}/${name}"
+            if [ ! -f "$path" ]; then
+              echo "::error::Missing expected WASM artifact: $path"
+              missing=1
+              continue
+            fi
+            if [ ! -s "$path" ]; then
+              echo "::error::WASM artifact is empty: $path"
+              missing=1
+              continue
+            fi
+            echo "Found $name ($(stat -c%s "$path") bytes)"
+          done
+          if [ ! -f "$MANIFEST" ]; then
+            echo "::error::WASM manifest not found at $MANIFEST"
+            missing=1
+          else
+            echo "Manifest contents:"
+            cat "$MANIFEST"
+            for name in "${EXPECTED[@]}"; do
+              if ! grep -q "$name" "$MANIFEST"; then
+                echo "::error::Manifest missing entry for $name"
+                missing=1
+              fi
+            done
+            # Ensure hashes are present and non-empty (32+ hex chars)
+            if ! grep -Eq '"[a-fA-F0-9]{32,}"' "$MANIFEST"; then
+              echo "::error::Manifest does not contain non-empty hashes"
+              missing=1
+            fi
+          fi
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Upload WASM artifacts and manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: contracts-wasm-${{ github.sha }}
+          path: |
+            apps/contracts/target/${{ env.WASM_TARGET }}/release/*.wasm
+            apps/contracts/target/wasm-manifest.json
+          if-no-files-found: error
+          retention-days: 30
+
+  resource-budgets:
+    name: Resource Budget Regression Check
+    runs-on: ubuntu-latest
+    needs: contracts
+    defaults:
+      run:
+        working-directory: apps/contracts
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ env.WASM_TARGET }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry, git and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            apps/contracts/target
+          key: ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('apps/contracts/Cargo.lock', 'apps/contracts/**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Check resource budgets
+        run: bash scripts/check-resource-budgets.sh
+
+      - name: Upload resource budget report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: contracts-resource-budgets-${{ github.sha }}
+          path: |
+            apps/contracts/target/resource-budget-report.json
+            apps/contracts/target/resource-budget-report.txt
+          if-no-files-found: ignore
+          retention-days: 30

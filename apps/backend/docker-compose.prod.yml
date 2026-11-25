@@ -1,35 +1,84 @@
-version: '3.8'
+# ─────────────────────────────────────────────────────────────────────────────
+# Rentars Backend — production-like Compose (backend services only)
+#
+# PURPOSE: Run the API + Redis with production-hardened settings for local
+#          production-parity testing.  Not a replacement for the full staging
+#          stack at infra/docker-compose.staging.yml, which adds nginx, TLS,
+#          the web frontend, and a password-protected Redis.
+#
+# USAGE:
+#   cp .env.production.example .env.production
+#   # Edit .env.production — fill in all required values
+#   docker compose -f docker-compose.prod.yml --env-file .env.production up -d
+#
+# PORTS:
+#   3000 → api  (host-bound; use a reverse proxy in real production)
+#   Redis is NOT exposed to the host — only accessible inside the stack network.
+#
+# DIFFERENCES FROM dev (docker-compose.yml):
+#   - NODE_ENV=production
+#   - No source-code volume mounts
+#   - restart: unless-stopped on all services
+#   - Redis not exposed on host port
+#   - Logging capped at 50 MB / 5 rotated files
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
 
 services:
+
   api:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     ports:
       - "3000:3000"
+    env_file:
+      - .env.production
     environment:
-      - PORT=3000
-      - SUPABASE_URL=${SUPABASE_URL}
-      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
-      - JWT_SECRET=${JWT_SECRET}
-      - REDIS_URL=redis://redis:6379
-      - CORS_ORIGIN=${CORS_ORIGIN}
-      - STELLAR_NETWORK=${STELLAR_NETWORK}
-      - STELLAR_RPC_URL=${STELLAR_RPC_URL}
-      - PROPERTY_LISTING_CONTRACT_ID=${PROPERTY_LISTING_CONTRACT_ID}
-      - BOOKING_CONTRACT_ID=${BOOKING_CONTRACT_ID}
-      - TRUSTLESS_WORK_API_URL=${TRUSTLESS_WORK_API_URL}
-      - TRUSTLESS_WORK_API_KEY=${TRUSTLESS_WORK_API_KEY}
+      PORT: "3000"
+      NODE_ENV: production
+      REDIS_URL: redis://redis:6379
     depends_on:
-      - redis
-    restart: always
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    logging: *default-logging
     networks:
-      - rentars
+      - rentars-backend
 
   redis:
-    image: redis:7-alpine
-    restart: always
+    image: redis:7.4-alpine
+    # No host port binding — Redis must not be reachable outside the stack.
+    expose:
+      - "6379"
+    command: >
+      redis-server
+      --save 60 1
+      --loglevel warning
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    logging: *default-logging
     networks:
-      - rentars
+      - rentars-backend
 
 networks:
-  rentars:
+  rentars-backend:
     driver: bridge

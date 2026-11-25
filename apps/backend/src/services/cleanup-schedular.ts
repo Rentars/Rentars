@@ -2,6 +2,11 @@ import { syncAllBookings, syncAllProperties, reconcileAllPendingEscrows } from '
 import { purgeExpired as purgeExpiredIdempotencyKeys } from './idempotency.service.js';
 import { BookingService } from './booking.service.js';
 import { processDueAccountDeletions } from './privacy.service.js';
+import {
+  runRetentionJobs,
+  type RetentionOptions,
+  type RetentionRunSummary,
+} from './retention.service.js';
 import { env } from '@/config/env.js';
 
 const bookingService = new BookingService();
@@ -11,6 +16,7 @@ const RECONCILIATION_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const IDEMPOTENCY_CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const BOOKING_EXPIRY_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
 const ACCOUNT_DELETION_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+const NOTIFICATION_OUTBOX_INTERVAL_MS = 60 * 1000; // 1 minute
 const MAX_CONCURRENT_RECONCILIATIONS = 5;
 const INITIAL_BACKOFF_MS = 1000; // 1 second
 const MAX_BACKOFF_MS = 30000; // 30 seconds
@@ -98,6 +104,7 @@ async function runEscrowReconciliation(): Promise<void> {
 }
 
 export function startSyncScheduler(): void {
+  if (process.env.NODE_ENV === 'test') return;
   // Blockchain sync
   setInterval(() => {
     runSync().catch((err) => console.error('[sync] Scheduler error:', err));
@@ -243,24 +250,55 @@ async function runBookingExpiryCleanup(): Promise<void> {
 /**
  * Run one full data-retention sweep, guarding against overlapping runs so two
  * scheduled invocations can never mutate the same tables concurrently.
+ *
+ * This wrapper deliberately delegates all eligibility, protection (active
+ * bookings, legal holds, audit/payment obligations) and batching decisions to
+ * `runRetentionJobs` in retention.service.ts — the scheduler never bypasses or
+ * re-implements that protection logic. It only adds overlap guarding and
+ * observable logging.
+ *
  * Returns the per-class summary, or null when a run was already in progress.
  */
 async function runDataRetention(
   options: RetentionOptions & { label?: string } = {},
-): Promise<void> {
+): Promise<RetentionRunSummary | null> {
+  const label = options.label ?? 'scheduled';
   if (retentionRunning) {
-    console.log(`[retention] Skipping ${options.label ?? 'run'} — previous sweep still in progress`);
-    return;
+    console.log(`[retention] Skipping ${label} — previous sweep still in progress`);
+    return null;
   }
   retentionRunning = true;
+  const startedAt = Date.now();
   try {
-    const summary = await runRetentionJobs({ dryRun: options.dryRun, batchSize: options.batchSize });
+    const summary = await runRetentionJobs({
+      dryRun: options.dryRun,
+      batchSize: options.batchSize,
+    });
+    const mode = summary.dry_run ? 'Dry-run' : 'Cleanup';
     console.log(
-      `[retention] ${summary.dry_run ? 'Dry-run' : 'Cleanup'} (${options.label ?? 'scheduled'}) — ` +
+      `[retention] ${mode} (${label}) — ` +
       `${summary.total_deleted} deleted, ${summary.total_eligible} eligible, ` +
       `${summary.total_held_skipped} held, ${summary.elapsed_ms}ms` +
       (summary.failed_classes.length ? `, failures: ${summary.failed_classes.join(',')}` : ''),
     );
+    // Per-class breakdown for observability / metrics scraping.
+    for (const cls of summary.classes) {
+      console.log(
+        `[retention] ${mode} (${label}) class=${cls.class} ` +
+        `deleted=${cls.deleted} retained=${cls.retained} ` +
+        `held_skipped=${cls.held_skipped} failed=${cls.failed}` +
+        (cls.error ? ` error=${cls.error}` : ''),
+      );
+    }
+    return summary;
+  } catch (err) {
+    // Never let a retention failure crash the scheduler; log with context so
+    // operators can alert on it.
+    console.error(
+      `[retention] ${label} failed after ${Date.now() - startedAt}ms:`,
+      err,
+    );
+    return null;
   } finally {
     retentionRunning = false;
   }

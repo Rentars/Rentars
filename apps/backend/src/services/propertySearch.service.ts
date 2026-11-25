@@ -1,8 +1,16 @@
 import { supabase } from '@/config/supabase.js';
 import type { ServiceResponse } from './index.js';
-import { isFeaturedNow, FEATURED_CAP, type Property, type AdvancedSearchFilters } from './property.service.js';
+import { FEATURED_CAP, type Property, type AdvancedSearchFilters } from './property.service.js';
+import { isFeaturedEligible } from '../utils/featuredEligibility.js';
 import { recordSearchMetric } from './searchPerformance.service.js';
 import { isSlowQuery } from '../utils/searchMetrics.js';
+import {
+  validateCoordinates,
+  clampRadiusKm,
+  MAX_SEARCH_RADIUS_KM,
+  type FieldError,
+} from '../validators/location.validator.js';
+import { MAX_GUESTS, MIN_GUESTS } from '../validators/property.validator.js';
 
 type SearchEndpoint = 'text' | 'nearby';
 
@@ -41,6 +49,12 @@ export interface NearbySearchParams {
   radiusKm: number;
 }
 
+/** Field-level validation failure returned for malformed geospatial input. */
+export interface NearbySearchValidationError {
+  error: string;
+  fields: FieldError[];
+}
+
 export interface NearbySearchResult {
   id: string;
   title: string;
@@ -69,16 +83,62 @@ export async function searchPropertiesNearby(
   return result;
 }
 
+/**
+ * Validate the lat/lng pair and radius before touching PostGIS.
+ *
+ * - Coordinates are validated as a pair (both present, finite, in range).
+ * - Radius is clamped to MAX_SEARCH_RADIUS_KM rather than rejected so a
+ *   slightly-too-large request still returns useful results.
+ * - Invalid input returns a 422-style failure with field-level errors so the
+ *   UI can highlight the offending control instead of showing an empty result.
+ */
+function validateNearbyParams(
+  params: NearbySearchParams,
+): { ok: true; lat: number; lng: number; radiusKm: number } | { ok: false; failure: ServiceResponse<NearbySearchResult[]> } {
+  const fields: FieldError[] = [];
+
+  const coordResult = validateCoordinates(params.lat, params.lng);
+  if (!coordResult.valid) {
+    fields.push(...coordResult.errors);
+  }
+
+  const radiusResult = clampRadiusKm(params.radiusKm);
+  if (!radiusResult.valid) {
+    fields.push(...radiusResult.errors);
+  }
+
+  if (fields.length > 0) {
+    return {
+      ok: false,
+      failure: {
+        success: false,
+        error: 'Invalid geospatial search parameters',
+        status: 422,
+        fields,
+      } as ServiceResponse<NearbySearchResult[]>,
+    };
+  }
+
+  return {
+    ok: true,
+    lat: coordResult.lat,
+    lng: coordResult.lng,
+    radiusKm: radiusResult.radiusKm,
+  };
+}
+
 async function runNearbySearch(
   params: NearbySearchParams,
 ): Promise<ServiceResponse<NearbySearchResult[]>> {
-  const { lat, lng, radiusKm } = params;
+  const validated = validateNearbyParams(params);
+  if (!validated.ok) return validated.failure;
 
-  // Validate radius — must be a finite positive number.
-  if (!Number.isFinite(radiusKm) || radiusKm <= 0) {
-    return { success: false, error: 'radiusKm must be a finite positive number' };
-  }
+  const { lat, lng, radiusKm } = validated;
 
+  // The RPC uses ST_DWithin(properties.location, point, radius) which is
+  // backed by the GIST index on properties.location (see PostGIS migrations).
+  // Keep the predicate in the RPC so the planner can use the index; do not
+  // replace it with a client-side distance filter.
   const { data, error } = await supabase.rpc('search_nearby_properties', {
     lat,
     lng,
@@ -86,11 +146,55 @@ async function runNearbySearch(
   });
 
   if (error) {
+    // Missing geospatial schema (e.g. PostGIS not installed / function absent)
+    // must not surface as a confusing empty result. Fall back to a plain
+    // non-geospatial listing search so unrelated inventory is still shown.
+    if (isMissingGeospatialSchemaError(error)) {
+      return fallbackNonGeospatialSearch();
+    }
     return { success: false, error: error.message };
   }
 
   // Normalise a null response (e.g. RPC returns no rows) to an empty array.
   return { success: true, data: (data ?? []) as NearbySearchResult[] };
+}
+
+/** Detect errors that indicate the geospatial schema is unavailable. */
+function isMissingGeospatialSchemaError(error: { code?: string; message?: string }): boolean {
+  const code = error.code ?? '';
+  const message = (error.message ?? '').toLowerCase();
+  return (
+    code === '42883' || // undefined_function
+    code === '42P01' || // undefined_table
+    code === '42703' || // undefined_column
+    message.includes('does not exist') ||
+    message.includes('postgis') ||
+    message.includes('st_dwithin')
+  );
+}
+
+/**
+ * Safe fallback when geospatial search is unavailable: return recent active
+ * listings without a distance filter. distance_km is reported as 0 since no
+ * distance could be computed; callers should treat it as unknown.
+ */
+async function fallbackNonGeospatialSearch(): Promise<ServiceResponse<NearbySearchResult[]>> {
+  const { data, error } = await supabase
+    .from('properties')
+    .select('id, title, price_per_night, city, country, bedrooms, amenities')
+    .eq('status', 'available')
+    .is('deleted_at', null)
+    .limit(50);
+
+  if (error) {
+    return { success: false, error: error.message };
+  }
+
+  const rows = (data ?? []) as Omit<NearbySearchResult, 'distance_km'>[];
+  return {
+    success: true,
+    data: rows.map((row) => ({ ...row, distance_km: 0 })),
+  };
 }
 
 // ─── Text-search helpers ──────────────────────────────────────────────────────
@@ -130,6 +234,7 @@ function toTsQuery(input: string) {
 export function promoteFeatureToTop(
   properties: Property[],
   cap = FEATURED_CAP,
+  now: Date = new Date(),
 ): (Property & { is_featured: boolean })[] {
   const effectiveCap = Math.min(Math.max(0, cap), FEATURED_CAP);
 
@@ -141,7 +246,10 @@ export function promoteFeatureToTop(
   const organic:            Property[] = [];
 
   for (const p of properties) {
-    if (isFeaturedNow(p)) {
+    // Use the centralized eligibility predicate so expired, soft-deleted,
+    // draft, or moderation-hidden listings are never promoted even if their
+    // featured_until is still in the future.
+    if (isFeaturedEligible(p, now)) {
       featuredCandidates.push(p);
     } else {
       organic.push(p);
@@ -252,7 +360,12 @@ export async function computeZeroResultSuggestions(
     if (merged.property_types && merged.property_types.length > 0) {
       q = q.in('property_type', merged.property_types);
     }
-    if (merged.guests !== undefined) q = q.gte('max_guests', merged.guests);
+    if (merged.guests !== undefined) {
+      // Invalid guest counts are rejected upstream; guard here so a bad value
+      // can never silently widen the result set.
+      if (!isValidGuestCount(merged.guests)) return 0;
+      q = q.gte('max_guests', merged.guests);
+    }
     if (merged.amenities && merged.amenities.length > 0) {
       q = q.contains('amenities', merged.amenities);
     }
@@ -433,10 +546,57 @@ function applyNonPriceFilters<T>(
   if (filters.property_types && filters.property_types.length > 0) {
     q = q.in('property_type', filters.property_types);
   }
-  if (filters.guests !== undefined) q = q.gte('max_guests', filters.guests);
+  if (filters.guests !== undefined) {
+    // Guest count must match the booking-side range. Invalid values are
+    // rejected by validateGuestCount before reaching here; if one slips
+    // through, exclude everything rather than defaulting to an unsafe filter.
+    if (!isValidGuestCount(filters.guests)) {
+      q = q.eq('id', '00000000-0000-0000-0000-000000000000');
+    } else {
+      q = q.gte('max_guests', filters.guests);
+    }
+  }
   if (filters.amenities && filters.amenities.length > 0) {
     q = q.contains('amenities', filters.amenities);
   }
 
   return q as unknown as T;
 }
+
+/**
+ * Guest count is valid when it is an integer within the shared
+ * [MIN_GUESTS, MAX_GUESTS] range used by listing creation and booking.
+ * Listings with missing legacy capacity are backfilled to a documented
+ * default by migration; search never treats NULL capacity as unlimited.
+ */
+export function isValidGuestCount(guests: unknown): guests is number {
+  return (
+    typeof guests === 'number' &&
+    Number.isInteger(guests) &&
+    guests >= MIN_GUESTS &&
+    guests <= MAX_GUESTS
+  );
+}
+
+/**
+ * Validate the guest count on an advanced search request. Returns field-level
+ * errors so the API can respond 422 instead of silently returning results
+ * that disagree with booking validation.
+ */
+export function validateSearchGuestCount(
+  guests: unknown,
+): { valid: true } | { valid: false; errors: FieldError[] } {
+  if (guests === undefined || guests === null) return { valid: true };
+  if (isValidGuestCount(guests)) return { valid: true };
+  return {
+    valid: false,
+    errors: [
+      {
+        field: 'guests',
+        message: `guests must be an integer between ${MIN_GUESTS} and ${MAX_GUESTS}`,
+      },
+    ],
+  };
+}
+
+export { MAX_SEARCH_RADIUS_KM };

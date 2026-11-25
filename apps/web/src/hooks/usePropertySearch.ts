@@ -178,10 +178,13 @@ export function usePropertySearch(options: UseSearchOptions = {}) {
 
         try {
           const params = new URLSearchParams();
-          params.append('north', String(bounds.getNorth()));
-          params.append('south', String(bounds.getSouth()));
-          params.append('east', String(bounds.getEast()));
-          params.append('west', String(bounds.getWest()));
+          // Quantise viewport edges so tiny pans reuse the same cached query
+          // and markers always correspond to the list's result set.
+          const q = (n: number) => String(Math.round(n * 10_000) / 10_000);
+          params.append('north', q(bounds.getNorth()));
+          params.append('south', q(bounds.getSouth()));
+          params.append('east', q(bounds.getEast()));
+          params.append('west', q(bounds.getWest()));
           if (filters.priceMin !== undefined) params.append('min_price', String(filters.priceMin));
           if (filters.priceMax !== undefined) params.append('max_price', String(filters.priceMax));
           if (filters.guests !== undefined) params.append('guests', String(filters.guests));

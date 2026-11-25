@@ -29,48 +29,60 @@ import { describe, it, expect, beforeAll, beforeEach, mock } from 'bun:test';
 import request from 'supertest';
 import jwt from 'jsonwebtoken';
 
-// ── Environment bootstrap ──────────────────────────────────────────────────────
+// ── Environment bootstrap (must be set immediately at module load time) ────────
+process.env.NODE_ENV = 'test';
+process.env.JWT_SECRET = 'concurrency-test-secret-min-32-chars';
+process.env.SUPABASE_URL = 'https://mock.supabase.co';
+process.env.SUPABASE_SERVICE_ROLE_KEY = 'mock-service-role-key';
+process.env.FRONTEND_URL = 'https://rentars.app';
+process.env.REDIS_URL = '';
+process.env.TRUSTLESS_WORK_API_URL = 'https://sandbox.trustlesswork.com';
+process.env.TRUSTLESS_WORK_API_KEY = 'test-api-key';
+process.env.PREF_TOKEN_SECRET = 'concurrency-pref-secret-min-32-chars!';
+process.env.STELLAR_NETWORK = 'testnet';
+process.env.STELLAR_RPC_URL = 'https://soroban-testnet.stellar.org';
+process.env.STELLAR_NETWORK_PASSPHRASE = 'Test SDF Network ; September 2015';
+
 beforeAll(() => {
-  process.env.NODE_ENV = 'test';
-  process.env.JWT_SECRET = 'concurrency-test-secret-min-32-chars';
-  process.env.SUPABASE_URL = 'https://mock.supabase.co';
-  process.env.SUPABASE_SERVICE_ROLE_KEY = 'mock-service-role-key';
-  process.env.FRONTEND_URL = 'https://rentars.app';
-  process.env.REDIS_URL = '';
-  process.env.TRUSTLESS_WORK_API_URL = 'https://sandbox.trustlesswork.com';
-  process.env.TRUSTLESS_WORK_API_KEY = 'test-api-key';
-  process.env.PREF_TOKEN_SECRET = 'concurrency-pref-secret-min-32-chars!';
-  process.env.STELLAR_NETWORK = 'testnet';
-  process.env.STELLAR_RPC_URL = 'https://soroban-testnet.stellar.org';
-  process.env.STELLAR_NETWORK_PASSPHRASE = 'Test SDF Network ; September 2015';
 });
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
-const PROPERTY_ID = 'cc000000-0000-0000-0000-000000000001';
-const PROPERTY_ID_B = 'cc000000-0000-0000-0000-000000000002';
+const PROPERTY_ID = 'cc000000-0000-4000-8000-000000000001';
+const PROPERTY_ID_B = 'cc000000-0000-4000-8000-000000000002';
 const OWNER_ID = 'cc-owner-user-id-00000000000000001';
 const ESCROW_ID_PREFIX = 'escrow-cc-';
 
-const OWNER_STELLAR = 'GBRPYHIL2CI3WHZDTOOQFC6EB4CGQOFSNHERX3LRJCX5FWCL46664F3';
+const OWNER_STELLAR = 'GBKEO4K64J3GLTFCHROHKGUD7VDLNTORZ3XHERQ4RVW5OJCBNWJS3J52';
 
 // Ten concurrent tenants
 const TENANT_IDS = Array.from({ length: 10 }, (_, i) =>
   `cc-tenant-${String(i + 1).padStart(2, '0')}-000000000000`,
 );
 
+const VALID_TENANT_STELLAR = [
+  'GBZLV3BAHGQVI77O474M7VJGXVKTJEUMRNLHYIMT22VFGXOZCA2L3HYK',
+  'GB7POOGKUBBKONZMI2NZIYHUPSJDIDQBYFCBO3MOHE5DWEQLHIIZ5WZA',
+  'GAFJW4RKW75LBR4EDP2GURXSYWZ5MOK652XZES5V4YPH5ZY5AU5MHZST',
+  'GD2CTKZPLWMFTMASUVAXXSU3DF47XWH6FEXRYKLCJEXLDFMFW6YUZ3WU',
+  'GDA3L2WLVEXVKOQCV6XMMEOF5ZODZG4TQXVXHXYXOIDZEE2L2TX5BH4O',
+  'GBBMHLJMOJTSB3E2JKQJDVHSCHT7QR5CSTI5RMENZXHKSCBH4ZJ5HKSY',
+  'GCQPIHTUXVTCVOEEDAYPS7UE6C4FTWWOPSCFWY2VSTFM5BRRJF75Z4RE',
+  'GCFW5XJDINCAPUFUAQ74V74K4JEWI7SOUIYN2LEXI3DP77COIOIJPY42',
+  'GDIFRQQAWVUGNWKH7T6TFBJP6XS66OGCESUSP4SSFYPX54K5HUA4L4CU',
+  'GATMMF5QGNBY5JUVIQ2CYIAMWVZLZ4SWSAPOAJ2MLHRXDGWTCERKIPXR',
+];
+
 const STELLAR_ADDRESSES: Record<string, string> = {
   [OWNER_ID]: OWNER_STELLAR,
 };
 TENANT_IDS.forEach((id, i) => {
-  // Generate deterministic-looking Stellar addresses (56 chars, starts with G)
-  const pad = String(i + 1).padStart(2, '0');
-  STELLAR_ADDRESSES[id] = `G${'BD47UZQ2EOPZMQAAMAEWBVHQWWPGVIOTQOI5DQWUB3DJWQX5DVXC'.slice(0, 53)}${pad}`;
+  STELLAR_ADDRESSES[id] = VALID_TENANT_STELLAR[i];
 });
 
 function makeToken(userId: string): string {
   return jwt.sign(
-    { userId, email_verified: true },
+    { userId, role: 'admin', email_verified: true },
     process.env.JWT_SECRET as string,
     { expiresIn: '1h' },
   );
@@ -136,8 +148,27 @@ const mockSupabase = {
   rpc: mockRpc,
 };
 
-const supabaseMod = await import('../../src/config/supabase.js');
-(supabaseMod as unknown as { supabase: typeof mockSupabase }).supabase = mockSupabase;
+mock.module('../../src/config/supabase.js', () => ({
+  supabase: mockSupabase,
+}));
+
+const fakeRedis = {
+  isOpen: true,
+  isReady: true,
+  set: mock(async () => 'OK'),
+  get: mock(async () => null),
+  del: mock(async () => 1),
+  incr: mock(async () => 1),
+  expire: mock(async () => true),
+  ttl: mock(async () => 3600),
+  sendCommand: mock(async () => 'OK'),
+  zAdd: mock(async () => 1),
+  zRangeByScore: mock(async () => []),
+  zRemRangeByScore: mock(async () => 0),
+  zCard: mock(async () => 0),
+  scanIterator: async function* () {},
+};
+mock.module('../../src/config/redis.js', () => ({ redisClient: fakeRedis }));
 
 function setupMocks() {
   mockRpc.mockImplementation((fn: string, args: Record<string, unknown>) => {
@@ -252,21 +283,27 @@ function setupMocks() {
     }
 
     if (table === 'properties') {
+      const propResult = (val: string) => ({
+        id: val,
+        owner_id: OWNER_ID,
+        on_chain_id: null,
+        max_guests: 10,
+        min_nights: 1,
+        max_nights: null,
+        check_in_time: null,
+        check_out_time: null,
+        deleted_at: null,
+        cancellation_policy: 'flexible',
+      });
       return {
         select: mock(() => ({
           eq: mock((_col: string, val: string) => ({
             single: mock(async () => ({
-              data: {
-                id: val,
-                owner_id: OWNER_ID,
-                on_chain_id: null,
-                max_guests: 10,
-                min_nights: 1,
-                max_nights: null,
-                check_in_time: null,
-                check_out_time: null,
-                deleted_at: null,
-              },
+              data: propResult(val),
+              error: null,
+            })),
+            maybeSingle: mock(async () => ({
+              data: propResult(val),
               error: null,
             })),
           })),
@@ -274,13 +311,31 @@ function setupMocks() {
       };
     }
 
-    if (table === 'profiles') {
+    if (table === 'property_versions') {
+      return {
+        select: mock(() => ({
+          eq: mock(() => ({
+            order: mock(() => ({
+              limit: mock(() => ({
+                maybeSingle: mock(async () => ({
+                  data: { version_number: 1 },
+                  error: null,
+                })),
+              })),
+            })),
+          })),
+        })),
+      };
+    }
+
+    if (table === 'profiles' || table === 'users') {
       return {
         select: mock(() => ({
           eq: mock((_col: string, val: string) => ({
             single: mock(async () => ({
               data: {
-                stellar_address: STELLAR_ADDRESSES[val] ?? `G${'A'.repeat(54)}01`,
+                id: val,
+                stellar_address: STELLAR_ADDRESSES[val] ?? OWNER_STELLAR,
                 email_verified: true,
               },
               error: null,
@@ -318,7 +373,7 @@ function setupMocks() {
       };
     }
 
-    if (table === 'blockchain_logs') {
+    if (table === 'blockchain_logs' || table === 'booking_status_history') {
       return { insert: mock(async () => ({ error: null })) };
     }
 
@@ -327,15 +382,47 @@ function setupMocks() {
         select: mock(() => ({
           eq: mock(() => ({
             eq: mock(() => ({
+              gte: mock(() => ({
+                maybeSingle: mock(async () => ({ data: null, error: null })),
+              })),
               single: mock(async () => ({ data: null, error: { code: 'PGRST116' } })),
+              maybeSingle: mock(async () => ({ data: null, error: null })),
+            })),
+            gte: mock(() => ({
+              maybeSingle: mock(async () => ({ data: null, error: null })),
             })),
           })),
         })),
-        insert: mock(async () => ({ error: null })),
+        insert: mock(() => ({
+          select: mock(() => ({
+            single: mock(async () => ({ data: { id: 'key-1' }, error: null })),
+          })),
+        })),
+        update: mock(() => ({
+          eq: mock(() => Promise.resolve({ error: null })),
+        })),
+        delete: mock(() => ({
+          eq: mock(() => ({
+            eq: mock(() => Promise.resolve({ error: null })),
+          })),
+        })),
+        upsert: mock(async () => ({ error: null })),
       };
     }
 
-    return {};
+    return {
+      select: mock(() => ({
+        eq: mock(() => ({
+          maybeSingle: mock(async () => ({ data: null, error: null })),
+          single: mock(async () => ({ data: null, error: null })),
+        })),
+        maybeSingle: mock(async () => ({ data: null, error: null })),
+      })),
+      insert: mock(() => Promise.resolve({ data: null, error: null })),
+      update: mock(() => ({
+        eq: mock(() => Promise.resolve({ data: null, error: null })),
+      })),
+    };
   });
 }
 
@@ -350,22 +437,34 @@ const mockTrustlessWork = {
   releaseEscrow: mock(async () => {}),
 };
 
-const trustlessMod = await import('../../src/blockchain/trustlessWork.js');
-(trustlessMod as unknown as { trustlessWorkClient: typeof mockTrustlessWork }).trustlessWorkClient = mockTrustlessWork;
+mock.module('../../src/blockchain/trustlessWork.js', () => ({
+  trustlessWorkClient: mockTrustlessWork,
+}));
 
 // ── Email / logging mocks ──────────────────────────────────────────────────────
 
-const emailMod = await import('../../src/services/email.service.js');
-(emailMod as unknown as { emailService: Record<string, ReturnType<typeof mock>> }).emailService = {
-  sendBookingCreated: mock(async () => {}),
-  sendBookingConfirmed: mock(async () => {}),
-  sendBookingCancelled: mock(async () => {}),
-};
+mock.module('../../src/services/email.service.js', () => ({
+  emailService: {
+    sendBookingCreated: mock(async () => {}),
+    sendBookingConfirmed: mock(async () => {}),
+    sendBookingCancelled: mock(async () => {}),
+  },
+}));
 
-const logMod = await import('../../src/services/logging.service.js');
-(logMod as unknown as { loggingService: Record<string, ReturnType<typeof mock>> }).loggingService = {
-  logBlockchainOperation: mock(() => {}),
-};
+mock.module('../../src/services/logging.service.js', () => ({
+  loggingService: {
+    logBlockchainOperation: mock(() => {}),
+  },
+}));
+
+mock.module('../../src/services/pricing.service.js', () => ({
+  assertQuotedTotal: mock(async (input: any) => ({
+    success: true,
+    data: { total: input.clientTotal, quote: { total: input.clientTotal, available: true } },
+  })),
+  calculateRangePrice: mock(async () => ({ success: true, data: { total: 400, breakdown: [] } })),
+  getPropertyQuote: mock(async () => ({ success: true, data: { total: 400, available: true } })),
+}));
 
 // ── App import ────────────────────────────────────────────────────────────────
 import { app } from '../../src/index.js';
@@ -419,6 +518,7 @@ describe('Concurrency: exclusive booking — same property, same dates', () => {
           .send(bookingPayload(TENANT_IDS[i], PROPERTY_ID, checkIn, checkOut)),
       ),
     );
+
 
     const successes = results.filter((r) => r.status === 201);
     const conflicts = results.filter((r) => r.status === 409);

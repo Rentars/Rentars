@@ -12,10 +12,25 @@
  *   - network          — Stellar network the contract is deployed on
  *   - deployedAt       — ISO-8601 deployment timestamp (optional)
  *   - compatibleApps   — semver ranges of app releases known to work
+ *   - upgradeable      — whether the deployed contract can be upgraded
+ *   - upgradeAuthority — admin address authorized to upgrade, or 'immutable'
  *
  * All fields except wasmHash and deployedAt are required for production.
  * A mismatch between the registry entry and the configured contract ID is
  * detected at startup via validateContractRegistry().
+ *
+ * Upgrade policy (issue 120):
+ *   - `upgradeable` is sourced from UPGRADEABLE_<CONTRACT> ("true"/"false",
+ *     default "false"). Contracts default to immutable: an operator must opt
+ *     in explicitly before a contract is treated as upgradeable.
+ *   - `upgradeAuthority` is sourced from UPGRADE_AUTHORITY_<CONTRACT>. For
+ *     upgradeable contracts it must be a valid Stellar account (StrKey G...)
+ *     address that holds the contract admin role. For immutable contracts it
+ *     must be unset or the literal string 'immutable'.
+ *   - validateContractRegistry() rejects inconsistent combinations (e.g. an
+ *     upgradeable contract with no admin, or an immutable contract with an
+ *     admin address) so operators can always determine whether a deployed
+ *     contract can be upgraded and who may authorize it.
  *
  * Upgrade sequencing:
  *   1. Deploy new WASM to staging; update WASM_HASH_<CONTRACT> env vars.
@@ -93,6 +108,18 @@ export interface ContractRegistryEntry {
    * Derived from DEPLOY_ENV.  Defaults to NODE_ENV.
    */
   environment: string;
+  /**
+   * Whether the deployed contract can be upgraded in place.
+   * Set via UPGRADEABLE_<CONTRACT_NAME> env var ("true"/"false").
+   * Defaults to false (immutable) when unset.
+   */
+  upgradeable: boolean;
+  /**
+   * Admin address authorized to authorize an upgrade, or the literal
+   * 'immutable' when the contract cannot be upgraded.
+   * Set via UPGRADE_AUTHORITY_<CONTRACT_NAME> env var.
+   */
+  upgradeAuthority: string;
 }
 
 export interface ContractRegistryValidationError {
@@ -111,6 +138,11 @@ function resolveEnvironment(): string {
   return process.env.DEPLOY_ENV ?? env.NODE_ENV;
 }
 
+function parseUpgradeable(raw: string | undefined): boolean {
+  if (raw === undefined || raw.trim() === '') return false;
+  return raw.trim().toLowerCase() === 'true';
+}
+
 function buildEntry(
   name: string,
   contractId: string,
@@ -118,8 +150,16 @@ function buildEntry(
   wasmHashEnvKey: string,
   deployTimeEnvKey: string,
   compatibleAppsEnvKey: string,
+  upgradeableEnvKey: string,
+  upgradeAuthorityEnvKey: string,
 ): ContractRegistryEntry {
   const prefix = name.replace(/([A-Z])/g, '_$1').toUpperCase();
+  const upgradeable = parseUpgradeable(process.env[upgradeableEnvKey]);
+  const rawAuthority = process.env[upgradeAuthorityEnvKey];
+  const upgradeAuthority = upgradeable
+    ? (rawAuthority ?? '')
+    : (rawAuthority && rawAuthority.trim() !== '' ? rawAuthority : 'immutable');
+
   return {
     name,
     contractId,
@@ -133,6 +173,8 @@ function buildEntry(
     buildTarget: process.env[`BUILD_TARGET_${prefix}`] ?? '',
     initTxHash: process.env[`INIT_TX_${prefix}`] ?? null,
     environment: resolveEnvironment(),
+    upgradeable,
+    upgradeAuthority,
   };
 }
 
@@ -148,6 +190,8 @@ export const CONTRACT_REGISTRY: Readonly<Record<string, ContractRegistryEntry>> 
     'WASM_HASH_BOOKING',
     'DEPLOY_TIME_BOOKING',
     'COMPATIBLE_APPS_BOOKING',
+    'UPGRADEABLE_BOOKING',
+    'UPGRADE_AUTHORITY_BOOKING',
   ),
   propertyListing: buildEntry(
     'propertyListing',
@@ -156,6 +200,8 @@ export const CONTRACT_REGISTRY: Readonly<Record<string, ContractRegistryEntry>> 
     'WASM_HASH_PROPERTY_LISTING',
     'DEPLOY_TIME_PROPERTY_LISTING',
     'COMPATIBLE_APPS_PROPERTY_LISTING',
+    'UPGRADEABLE_PROPERTY_LISTING',
+    'UPGRADE_AUTHORITY_PROPERTY_LISTING',
   ),
   review: buildEntry(
     'review',
@@ -164,6 +210,8 @@ export const CONTRACT_REGISTRY: Readonly<Record<string, ContractRegistryEntry>> 
     'WASM_HASH_REVIEW',
     'DEPLOY_TIME_REVIEW',
     'COMPATIBLE_APPS_REVIEW',
+    'UPGRADEABLE_REVIEW',
+    'UPGRADE_AUTHORITY_REVIEW',
   ),
 });
 
@@ -173,6 +221,15 @@ function isValidContractId(id: string): boolean {
   if (!id) return false;
   try {
     return StrKey.isValidContract(id);
+  } catch {
+    return false;
+  }
+}
+
+function isValidAccountId(id: string): boolean {
+  if (!id) return false;
+  try {
+    return StrKey.isValidEd25519PublicKey(id);
   } catch {
     return false;
   }
@@ -223,6 +280,30 @@ export function validateContractRegistry(
         contract: key,
         field: 'network',
         message: `Registry network '${entry.network}' does not match STELLAR_NETWORK='${env.STELLAR_NETWORK}'.`,
+      });
+    }
+
+    // Upgrade policy: operators must be able to tell whether the contract is
+    // upgradeable and, if so, which admin address may authorize the upgrade.
+    if (entry.upgradeable) {
+      if (!entry.upgradeAuthority || entry.upgradeAuthority === 'immutable') {
+        errors.push({
+          contract: key,
+          field: 'upgradeAuthority',
+          message: `Contract '${key}' is marked upgradeable but has no upgrade authority. Set UPGRADE_AUTHORITY_${key.replace(/([A-Z])/g, '_$1').toUpperCase()} to the admin account address.`,
+        });
+      } else if (!isValidAccountId(entry.upgradeAuthority)) {
+        errors.push({
+          contract: key,
+          field: 'upgradeAuthority',
+          message: `Upgrade authority for '${key}' is not a valid Stellar account address: ${entry.upgradeAuthority}`,
+        });
+      }
+    } else if (entry.upgradeAuthority !== 'immutable') {
+      errors.push({
+        contract: key,
+        field: 'upgradeAuthority',
+        message: `Contract '${key}' is marked immutable but UPGRADE_AUTHORITY_${key.replace(/([A-Z])/g, '_$1').toUpperCase()} is set to '${entry.upgradeAuthority}'. Unset it or set UPGRADEABLE_${key.replace(/([A-Z])/g, '_$1').toUpperCase()}=true.`,
       });
     }
 
@@ -413,6 +494,8 @@ export interface PublicContractInfo {
   buildTarget: string;
   initTxHash: string | null;
   environment: string;
+  upgradeable: boolean;
+  upgradeAuthority: string;
 }
 
 export function getPublicContractInfo(): PublicContractInfo[] {
@@ -429,5 +512,7 @@ export function getPublicContractInfo(): PublicContractInfo[] {
     buildTarget: e.buildTarget,
     initTxHash: e.initTxHash,
     environment: e.environment,
+    upgradeable: e.upgradeable,
+    upgradeAuthority: e.upgradeAuthority,
   }));
 }

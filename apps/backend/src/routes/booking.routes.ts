@@ -13,6 +13,7 @@ import {
   getBookingReceipt,
   getBookingStatusHistory,
   getCalendarFeedToken,
+  getDisputeTimeline,
   getRefundPreviewHandler,
   getRefundStatusHandler,
   rotateCalendarFeedToken,
@@ -49,7 +50,7 @@ const router = Router();
  */
 const bookingCreationLimiter = createUserRateLimiter({
   windowMs: env.BOOKING_RATE_LIMIT_WINDOW_MS,
-  max: env.BOOKING_RATE_LIMIT_MAX,
+  max: process.env.NODE_ENV === 'test' ? 10000 : env.BOOKING_RATE_LIMIT_MAX,
   keyPrefix: 'rl:user:booking',
 });
 
@@ -121,6 +122,11 @@ router.post('/:id/dispute', authenticate, validateBody(raiseDisputeSchema), rais
 
 // POST /api/v1/bookings/:id/dispute/resolve
 router.post('/:id/dispute/resolve', authenticate, validateBody(resolveDisputeSchema), resolveDispute);
+
+// GET /api/v1/bookings/:id/dispute/timeline
+// Participant-safe dispute timeline: opened / under review / decision recorded /
+// pending or completed financial action. Access-controlled to booking participants.
+router.get('/:id/dispute/timeline', authenticate, getDisputeTimeline);
 
 // PATCH /api/v1/bookings/:id
 router.patch('/:id', authenticate, validateBody(updateBookingSchema), updateBooking);

@@ -98,6 +98,14 @@ describe('hashRequestBody', () => {
     const b = { property_id: 'prop-1', guest_count: 3 };
     expect(hashRequestBody(a)).not.toBe(hashRequestBody(b));
   });
+
+  it('is canonical for nested objects while preserving array order', () => {
+    const a = { quote: { id: 'q1', lines: [{ amount: 10 }, { amount: 20 }] } };
+    const b = { quote: { lines: [{ amount: 10 }, { amount: 20 }], id: 'q1' } };
+    const reordered = { quote: { id: 'q1', lines: [{ amount: 20 }, { amount: 10 }] } };
+    expect(hashRequestBody(a)).toBe(hashRequestBody(b));
+    expect(hashRequestBody(a)).not.toBe(hashRequestBody(reordered));
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

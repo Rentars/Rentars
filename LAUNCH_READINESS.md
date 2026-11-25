@@ -70,8 +70,8 @@ Performance, Privacy, Monitoring, Backup, Support.
 | # | Pri | Criterion | Status | Evidence link |
 |---|---|---|---|---|
 | F1 | 🔴 | All P0/P1 bugs are resolved or have an accepted workaround documented | ☐ | |
-| F2 | 🔴 | Booking lifecycle (create → confirm → release escrow) tested end-to-end | ☐ | |
-| F3 | 🔴 | Property creation, image upload, and search return correct results | ☐ | |
+| F2 | 🔴 | Booking lifecycle (create → confirm → release escrow) tested end-to-end | ☐ | See [`docs/CAPABILITY_MATRIX.md`](docs/CAPABILITY_MATRIX.md) — Booking section |
+| F3 | 🔴 | Property creation, image upload, and search return correct results | ☐ | See [`docs/CAPABILITY_MATRIX.md`](docs/CAPABILITY_MATRIX.md) — Listings section |
 | F4 | 🔴 | Cancellation and refund flow matches the configured refund policy | ☐ | |
 | F5 | 🔴 | Dispute raise/resolve flow works (backend + frontend — issue #112) | ☐ | |
 | F6 | 🔴 | Notifications (email + push) delivered for all booking lifecycle events | ☐ | |
@@ -172,7 +172,7 @@ Performance, Privacy, Monitoring, Backup, Support.
 
 | # | Pri | Criterion | Status | Evidence link |
 |---|---|---|---|---|
-| A1 | 🔴 | WCAG 2.1 AA automated scan passes on key pages (search, property detail, booking, confirmation) | ☐ | |
+| A1 | 🔴 | WCAG 2.1 AA automated scan passes on key pages (search, property detail, booking, confirmation) | ☐ | `accessibility-audit` CI job — `e2e/accessibility.spec.ts` |
 | A2 | 🔴 | Keyboard navigation tested end-to-end for booking flow | ☐ | |
 | A3 | 🟡 | Screen reader (VoiceOver / NVDA) tested on booking and search flows | ☐ | |
 | A4 | 🔴 | All interactive map markers have accessible names (see PropertyMapPin) | ☐ | |

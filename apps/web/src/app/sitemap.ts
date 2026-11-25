@@ -22,7 +22,7 @@ type PropertyRow = {
 
 /**
  * Public, non-draft property rows from the backend.
- * Draft listings are unpublished and must never be indexed.
+ * Draft, deleted, and private listings are unpublished and must never be indexed.
  */
 export async function getPublicProperties(): Promise<PropertyRow[]> {
   const res = await fetch(`${API_URL}/api/v1/properties`, { cache: 'no-store' });
@@ -31,7 +31,9 @@ export async function getPublicProperties(): Promise<PropertyRow[]> {
   const data = (await res.json()) as unknown;
   if (!Array.isArray(data)) return [];
 
-  return (data as PropertyRow[]).filter((p) => p?.id && p.status !== 'draft');
+  return (data as PropertyRow[]).filter(
+    (p) => p?.id && p.status === 'active',
+  );
 }
 
 export default async function sitemap(): Promise<MetadataRoute.Sitemap> {

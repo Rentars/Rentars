@@ -38,3 +38,65 @@ export function parseTrustProxy(raw: string | undefined): TrustProxySetting {
   if (entries.length === 0) return false;
   return entries;
 }
+
+/**
+ * Minimal shape of the Express request fields needed to resolve a client IP.
+ * Kept structural so this helper can be unit-tested without a full Request.
+ */
+export interface ClientIpRequest {
+  ip?: string;
+  ips?: string[];
+  socket?: { remoteAddress?: string };
+}
+
+/**
+ * Resolves the real client IP for rate-limit keying.
+ *
+ * Express already applies the `trust proxy` setting when populating `req.ip`
+ * and `req.ips`:
+ *   - `req.ips` contains the X-Forwarded-For chain, left-to-right, but only
+ *     entries that come from trusted proxies are retained.
+ *   - `req.ip` is the left-most untrusted address (the real client) when
+ *     proxies are trusted, otherwise the direct socket peer.
+ *
+ * We therefore prefer `req.ip` and fall back to the right-most `req.ips`
+ * entry (the closest hop) and finally the socket peer. We never read the raw
+ * X-Forwarded-For header, so spoofed entries are ignored.
+ */
+export function resolveClientIp(req: ClientIpRequest): string {
+  const direct = normalizeIp(req.ip);
+  if (direct) return direct;
+
+  const ips = req.ips;
+  if (Array.isArray(ips) && ips.length > 0) {
+    // Right-most entry is the hop closest to us and the least spoofable.
+    const closest = normalizeIp(ips[ips.length - 1]);
+    if (closest) return closest;
+  }
+
+  const peer = normalizeIp(req.socket?.remoteAddress);
+  if (peer) return peer;
+
+  return 'unknown';
+}
+
+/**
+ * Normalizes an IP string: trims whitespace, strips IPv6 brackets and an
+ * IPv4-mapped IPv6 prefix so the same client always maps to one key.
+ */
+function normalizeIp(value: string | undefined): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  let ip = value.trim();
+  if (ip === '') return undefined;
+
+  // Strip surrounding brackets from bracketed IPv6 (e.g. "[::1]").
+  if (ip.startsWith('[') && ip.endsWith(']')) {
+    ip = ip.slice(1, -1);
+  }
+
+  // Collapse IPv4-mapped IPv6 (::ffff:1.2.3.4) to plain IPv4.
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(ip);
+  if (mapped) return mapped[1];
+
+  return ip;
+}
