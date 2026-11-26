@@ -18,6 +18,12 @@
 
 import { supabase } from '@/config/supabase.js';
 import type { ServiceResponse } from './index.js';
+import {
+  parseDateRange,
+  resolveTimezone,
+  calendarDateInTz,
+  type DateRangeMeta,
+} from './analytics/dateRange.js';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -50,6 +56,18 @@ export interface RecordViewInput {
 export interface ViewCountResult {
   propertyId: string;
   viewCount:  number;
+}
+
+export interface ViewStatsResult {
+  total: number;
+  daily: { date: string; count: number }[];
+  /** Explicit window, timezone, and inclusion rules for this aggregate. */
+  meta: DateRangeMeta & {
+    /** Views are counted per deduplicated view event (1/hour/viewer). */
+    metric: 'property_views';
+    /** Calendar bucketing timezone used for the daily breakdown. */
+    bucketTimezone: string;
+  };
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -162,32 +180,45 @@ export async function getPropertyViewCount(
 }
 
 /**
- * Return the total view count and a daily breakdown for the last N days.
+ * Return the total view count and a daily breakdown for a date window.
  * Used in the host dashboard.
+ *
+ * The window is resolved through the shared date-range parser so dashboard
+ * cards, charts, and exports all agree on boundaries. Daily buckets are
+ * grouped by calendar date in the requested timezone (default UTC), matching
+ * the dashboard's calendar rules.
+ *
+ * Accepts either an explicit `{ from, to }` range or a trailing `days` window.
  */
 export async function getPropertyViewStats(
   propertyId: string,
-  days = 30,
-): Promise<ServiceResponse<{ total: number; daily: { date: string; count: number }[] }>> {
+  options: { days?: number; from?: string; to?: string; timezone?: string } = {},
+): Promise<ServiceResponse<ViewStatsResult>> {
   if (!propertyId) return { success: false, error: 'propertyId is required' };
 
-  const since = new Date();
-  since.setUTCDate(since.getUTCDate() - days);
+  const { days = 30, from, to, timezone } = options;
+
+  const range = parseDateRange({ from, to, days });
+  if (!range.success) return { success: false, error: range.error };
+  const { start, end, meta } = range.data;
+
+  const tz = resolveTimezone(timezone);
 
   const { data, error } = await supabase
     .from('property_views')
     .select('viewed_at')
     .eq('property_id', propertyId)
-    .gte('viewed_at', since.toISOString());
+    .gte('viewed_at', start.toISOString())
+    .lt('viewed_at', end.toISOString());
 
   if (error) return { success: false, error: error.message };
 
   const rows = (data ?? []) as { viewed_at: string }[];
 
-  // Group by calendar date (UTC)
+  // Group by calendar date in the requested timezone
   const byDate: Record<string, number> = {};
   for (const row of rows) {
-    const date = row.viewed_at.slice(0, 10); // YYYY-MM-DD
+    const date = calendarDateInTz(new Date(row.viewed_at), tz);
     byDate[date] = (byDate[date] ?? 0) + 1;
   }
 
@@ -195,5 +226,12 @@ export async function getPropertyViewStats(
     .map(([date, count]) => ({ date, count }))
     .sort((a, b) => a.date.localeCompare(b.date));
 
-  return { success: true, data: { total: rows.length, daily } };
+  return {
+    success: true,
+    data: {
+      total: rows.length,
+      daily,
+      meta: { ...meta, metric: 'property_views', bucketTimezone: tz },
+    },
+  };
 }

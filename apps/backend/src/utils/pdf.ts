@@ -98,9 +98,144 @@ export class PdfBuilder {
   private _stream: string[] = [];  // content stream commands
   private _fonts = new Set<string>(['F1', 'F2', 'F3', 'F4']); // always include all Helvetica variants
 
+  // ── Streaming / pagination state (issue #981) ──────────────────────────────
+  // When streaming is enabled, completed pages are flushed into `_pages` and
+  // the active content stream is reset, so memory stays bounded by a single
+  // page's worth of commands rather than the whole document.
+  private _streaming = false;
+  private _pages: string[] = [];
+  private _cursorY = 0; // y from top of the current page
+
   // Add a content stream command
   private op(cmd: string) {
     this._stream.push(cmd);
+  }
+
+  // ── Bounded-memory streaming helpers ───────────────────────────────────────
+
+  /**
+   * Enable streaming mode. Subsequent drawing calls accumulate into a single
+   * page buffer; call `newPage()` (or the row helpers) to flush completed
+   * pages. `build()` assembles all flushed pages plus the active page.
+   */
+  enableStreaming(): this {
+    this._streaming = true;
+    this._cursorY = 0;
+    return this;
+  }
+
+  /** True when the builder is in streaming mode. */
+  get streaming(): boolean {
+    return this._streaming;
+  }
+
+  /** Current vertical cursor (points from top of the active page). */
+  get cursorY(): number {
+    return this._cursorY;
+  }
+
+  /** Set the vertical cursor (points from top of the active page). */
+  setCursorY(y: number): this {
+    this._cursorY = y;
+    return this;
+  }
+
+  /** Flush the active page buffer and begin a fresh page. */
+  newPage(): this {
+    if (this._stream.length > 0) {
+      this._pages.push(this._stream.join('\n'));
+      this._stream = [];
+    }
+    this._cursorY = 0;
+    return this;
+  }
+
+  /** Number of pages flushed so far (excludes the active page). */
+  get flushedPageCount(): number {
+    return this._pages.length;
+  }
+
+  /**
+   * Render one table row at the current cursor and advance it. If the row
+   * would fall below `bottomMargin`, a new page is started first and the
+   * header row (if provided) is re-rendered at the top of the new page.
+   *
+   * `cells` are drawn left-to-right starting at `x`; `colWidths` gives each
+   * column's width in points. Only the current row is held in memory.
+   */
+  tableRow(
+    cells: string[],
+    x: number,
+    colWidths: number[],
+    opts: {
+      rowHeight?: number;
+      size?: number;
+      bold?: boolean;
+      colour?: string;
+      bottomMargin?: number;
+      topMargin?: number;
+      header?: string[];
+    } = {},
+  ): this {
+    const rowHeight = opts.rowHeight ?? 16;
+    const size = opts.size ?? 9;
+    const bottomMargin = opts.bottomMargin ?? 60;
+    const topMargin = opts.topMargin ?? 60;
+
+    // Page break if this row would overflow the printable area.
+    if (this._cursorY + rowHeight > PdfBuilder.PAGE_HEIGHT - bottomMargin) {
+      this.newPage();
+      this._cursorY = topMargin;
+      if (opts.header) {
+        this.tableRow(opts.header, x, colWidths, {
+          ...opts,
+          header: undefined,
+          bold: true,
+          colour: '#374151',
+        });
+      }
+    }
+
+    let cx = x;
+    for (let i = 0; i < cells.length; i++) {
+      const w = colWidths[i] ?? 0;
+      this.text(cells[i] ?? '', cx, this._cursorY, {
+        size,
+        bold: opts.bold,
+        colour: opts.colour,
+      });
+      cx += w;
+    }
+    this._cursorY += rowHeight;
+    return this;
+  }
+
+  /**
+   * Iterate a (possibly lazy) row source, rendering each row with `tableRow`.
+   * Rows are consumed one at a time so arbitrarily large datasets can be
+   * exported without materialising the full table in memory.
+   */
+  async tableRows(
+    rows: Iterable<string[]> | AsyncIterable<string[]>,
+    x: number,
+    colWidths: number[],
+    opts: Parameters<PdfBuilder['tableRow']>[3] = {},
+  ): Promise<this> {
+    if (opts.header) {
+      this.tableRow(opts.header, x, colWidths, { ...opts, header: undefined, bold: true });
+    }
+
+    const isAsync = typeof (rows as AsyncIterable<string[]>)[Symbol.asyncIterator] === 'function';
+    if (isAsync) {
+      for await (const row of rows as AsyncIterable<string[]>) {
+        this.tableRow(row, x, colWidths, { ...opts, header: undefined });
+      }
+    } else {
+      for (const row of rows as Iterable<string[]>) {
+        this.tableRow(row, x, colWidths, { ...opts, header: undefined });
+      }
+    }
+    return this;
   }
 
   // ── Drawing primitives ─────────────────────────────────────────────────────
@@ -248,6 +383,98 @@ export class PdfBuilder {
     // ── Trailer
     emit('trailer');
     emit(`<< /Size ${offsets.length} /Root 1 0 R >>`);
+    emit('startxref');
+    emit(String(xrefPos));
+    emit('%%EOF');
+
+    return Buffer.from(lines.join('\n'), 'latin1');
+  }
+
+  /**
+   * Assemble a multi-page PDF from the flushed pages plus the active page.
+   * Only one page's commands are held in the active buffer at a time, so
+   * memory stays bounded regardless of total row count (issue #981).
+   */
+  buildMultiPage(): Buffer {
+    const pageBodies = [...this._pages];
+    if (this._stream.length > 0 || pageBodies.length === 0) {
+      pageBodies.push(this._stream.join('\n'));
+    }
+
+    const lines: string[] = [];
+    const offsets: number[] = [];
+    let pos = 0;
+
+    const emit = (s: string) => {
+      lines.push(s);
+      pos += Buffer.byteLength(s + '\n', 'latin1');
+    };
+
+    // Object numbering: 1=Catalog, 2=Pages, 3=Fonts, then per page:
+    //   page object = 4 + i*2, content object = 5 + i*2
+    const pageCount = pageBodies.length;
+    const pageObjNum = (i: number) => 4 + i * 2;
+    const contentObjNum = (i: number) => 5 + i * 2;
+    const totalObjects = 3 + pageCount * 2;
+
+    emit('%PDF-1.4');
+
+    offsets[1] = pos;
+    emit('1 0 obj');
+    emit('<< /Type /Catalog /Pages 2 0 R >>');
+    emit('endobj');
+
+    const kids = pageBodies.map((_, i) => `${pageObjNum(i)} 0 R`).join(' ');
+    offsets[2] = pos;
+    emit('2 0 obj');
+    emit(`<< /Type /Pages /Kids [${kids}] /Count ${pageCount} >>`);
+    emit('endobj');
+
+    const fontDict = [
+      '/F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>',
+      '/F2 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>',
+      '/F3 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Oblique /Encoding /WinAnsiEncoding >>',
+      '/F4 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica-BoldOblique /Encoding /WinAnsiEncoding >>',
+    ].join(' ');
+
+    offsets[3] = pos;
+    emit('3 0 obj');
+    emit(`<< ${fontDict} >>`);
+    emit('endobj');
+
+    for (let i = 0; i < pageCount; i++) {
+      const body = pageBodies[i];
+      const bodyBytes = Buffer.from(body, 'latin1');
+
+      offsets[contentObjNum(i)] = pos;
+      emit(`${contentObjNum(i)} 0 obj`);
+      emit(`<< /Length ${bodyBytes.length} >>`);
+      emit('stream');
+      lines.push(body);
+      pos += bodyBytes.length + 1;
+      emit('endstream');
+      emit('endobj');
+
+      offsets[pageObjNum(i)] = pos;
+      emit(`${pageObjNum(i)} 0 obj`);
+      emit(`<< /Type /Page /Parent 2 0 R`);
+      emit(`   /MediaBox [0 0 ${PdfBuilder.PAGE_WIDTH} ${PdfBuilder.PAGE_HEIGHT}]`);
+      emit(`   /Resources << /Font << ${fontDict} >> >>`);
+      emit(`   /Contents ${contentObjNum(i)} 0 R`);
+      emit('>>');
+      emit('endobj');
+    }
+
+    const xrefPos = pos;
+    emit('xref');
+    emit(`0 ${totalObjects + 1}`);
+    emit('0000000000 65535 f ');
+    for (let i = 1; i <= totalObjects; i++) {
+      emit((offsets[i] ?? 0).toString().padStart(10, '0') + ' 00000 n ');
+    }
+
+    emit('trailer');
+    emit(`<< /Size ${totalObjects + 1} /Root 1 0 R >>`);
     emit('startxref');
     emit(String(xrefPos));
     emit('%%EOF');

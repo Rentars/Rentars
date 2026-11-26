@@ -5,6 +5,45 @@ import {
   getHostProperties,
   updatePropertyStatus,
 } from '@/services/hostDashboard.service.js';
+import {
+  parseDateRange,
+  resolveTimezone,
+  resolveCurrency,
+  type MetricWindow,
+} from '@/lib/metrics.js';
+
+/**
+ * Parses and validates the shared metric window query params
+ * (`from`, `to`, `timezone`, `currency`) used by host analytics endpoints.
+ * Returns either a resolved window or an error message for a 422 response.
+ */
+function resolveMetricWindow(query: Record<string, unknown>):
+  | { ok: true; window: MetricWindow }
+  | { ok: false; error: string } {
+  const range = parseDateRange(query.from, query.to);
+  if (!range.success) {
+    return { ok: false, error: range.error };
+  }
+
+  const timezone = resolveTimezone(query.timezone);
+  if (!timezone.success) {
+    return { ok: false, error: timezone.error };
+  }
+
+  const currency = resolveCurrency(query.currency);
+  if (!currency.success) {
+    return { ok: false, error: currency.error };
+  }
+
+  return {
+    ok: true,
+    window: {
+      ...range.data,
+      timezone: timezone.data,
+      currency: currency.data,
+    },
+  };
+}
 
 /**
  * GET /api/v1/host/dashboard
@@ -19,7 +58,13 @@ export async function getHostDashboard(req: AuthRequest, res: Response): Promise
     return;
   }
 
-  const result = await getHostDashboardSummary(hostId);
+  const window = resolveMetricWindow(req.query as Record<string, unknown>);
+  if (!window.ok) {
+    res.status(422).json({ error: window.error });
+    return;
+  }
+
+  const result = await getHostDashboardSummary(hostId, window.window);
   if (!result.success) {
     res.status(400).json({ error: result.error });
     return;
@@ -38,6 +83,12 @@ export async function listHostProperties(req: AuthRequest, res: Response): Promi
   const hostId = req.userId;
   if (!hostId) {
     res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const window = resolveMetricWindow(req.query as Record<string, unknown>);
+  if (!window.ok) {
+    res.status(422).json({ error: window.error });
     return;
   }
 

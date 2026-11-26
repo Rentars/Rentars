@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 
@@ -77,7 +77,10 @@ export default function AdminDisputesPage() {
   const [resolveModal, setResolveModal] = useState<ResolveModal | null>(null);
   const [resolutionNote, setResolutionNote] = useState('');
   const [outcome, setOutcome] = useState<'refund_tenant' | 'release_to_host' | 'split'>('release_to_host');
+  const [paymentConsequence, setPaymentConsequence] = useState<'refund' | 'release' | 'split' | 'none'>('none');
   const [actionLoading, setActionLoading] = useState(false);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [evidenceError, setEvidenceError] = useState<string | null>(null);
 
   const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null;
 
@@ -106,18 +109,31 @@ export default function AdminDisputesPage() {
             Authorization: `Bearer ${token}`,
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify({ resolution_note: resolutionNote, outcome }),
+          body: JSON.stringify({
+            resolution_note: resolutionNote,
+            outcome,
+            payment_consequence: paymentConsequence,
+          }),
         },
       );
-      if (!response.ok) throw new Error('Failed to resolve');
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        throw new Error(body?.error?.message || 'Failed to resolve');
+      }
       setResolveModal(null);
       setResolutionNote('');
+      setPaymentConsequence('none');
       fetchDisputes();
-    } catch {
-      setError('Failed to resolve dispute');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to resolve dispute');
     } finally {
       setActionLoading(false);
     }
+  };
+
+  const toggleExpanded = (id: string) => {
+    setEvidenceError(null);
+    setExpandedId((current) => (current === id ? null : id));
   };
 
   if (loading) return <p className="text-gray-500">Loading disputes...</p>;
@@ -233,8 +249,28 @@ export default function AdminDisputesPage() {
             </div>
 
             <div>
+              <label htmlFor="payment-consequence" className="block text-sm font-medium text-gray-700 mb-1">
+                Payment consequence
+              </label>
+              <select
+                id="payment-consequence"
+                className="w-full border border-gray-300 rounded-md px-3 py-2 text-sm"
+                value={paymentConsequence}
+                onChange={(e) => setPaymentConsequence(e.target.value as typeof paymentConsequence)}
+              >
+                <option value="none">No payment action</option>
+                <option value="refund">Refund tenant</option>
+                <option value="release">Release to host</option>
+                <option value="split">Split</option>
+              </select>
+              <p className="mt-1 text-xs text-gray-500">
+                The decision is recorded first; settlement is processed and verified separately.
+              </p>
+            </div>
+
+            <div>
               <label htmlFor="resolution-note" className="block text-sm font-medium text-gray-700 mb-1">
-                Resolution Note <span className="text-red-500">*</span>
+                Decision Reasoning <span className="text-red-500">*</span>
               </label>
               <textarea
                 id="resolution-note"

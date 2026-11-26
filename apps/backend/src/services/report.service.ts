@@ -2,6 +2,7 @@
  * Report service — abuse reports against listings (properties) and reviews.
  */
 
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { supabase } from '../config/supabase.js';
 import { createNotification, shouldSendInApp } from './notification.service.js';
 import type { ServiceResponse } from './index.js';
@@ -51,6 +52,235 @@ const UNIQUE_VIOLATION = '23505';
 
 /** Maximum length of an appeal reason, in characters. */
 const MAX_APPEAL_REASON_LENGTH = 2_000;
+
+// ---------------------------------------------------------------------------
+// Report / analytics exports
+// ---------------------------------------------------------------------------
+
+/** Roles that may request an export. */
+export type ExportRole = 'host' | 'admin';
+
+/** Datasets that can be exported. */
+export type ExportDataset = 'reports' | 'analytics';
+
+/** A single row of an export, restricted to the projected fields. */
+export type ExportRow = Record<string, string | number | boolean | null>;
+
+/** A generated export, ready to be streamed to the requester. */
+export interface ExportResult {
+  dataset: ExportDataset;
+  role: ExportRole;
+  fields: readonly string[];
+  rows: ExportRow[];
+  rowCount: number;
+  generatedAt: string;
+}
+
+/** A short-lived, ownership-bound download reference. */
+export interface ExportDownload {
+  token: string;
+  expiresAt: string;
+  dataset: ExportDataset;
+  role: ExportRole;
+  accountId: string;
+}
+
+/** Lifetime of a download reference, in milliseconds. */
+const EXPORT_LINK_TTL_MS = 5 * 60 * 1000;
+
+/** Maximum number of rows materialized per export (bounded memory). */
+const EXPORT_MAX_ROWS = 5_000;
+
+/** Page size used when streaming rows out of the database. */
+const EXPORT_PAGE_SIZE = 500;
+
+/**
+ * Explicit per-role, per-dataset field allowlists. Anything not listed here is
+ * never included in an export, regardless of what the underlying table holds.
+ */
+export const EXPORT_FIELDS: Record<ExportDataset, Record<ExportRole, readonly string[]>> = {
+  reports: {
+    host: ['id', 'target_type', 'reason', 'status', 'created_at'],
+    admin: [
+      'id',
+      'target_type',
+      'target_id',
+      'reason',
+      'status',
+      'severity',
+      'assigned_to',
+      'created_at',
+      'resolved_at',
+    ],
+  },
+  analytics: {
+    host: ['listing_id', 'views', 'bookings', 'revenue_total', 'period_start', 'period_end'],
+    admin: [
+      'listing_id',
+      'owner_id',
+      'views',
+      'bookings',
+      'revenue_total',
+      'period_start',
+      'period_end',
+    ],
+  },
+};
+
+/** Source table backing each export dataset. */
+const EXPORT_SOURCES: Record<ExportDataset, string> = {
+  reports: 'reports',
+  analytics: 'listing_analytics',
+};
+
+function exportSigningSecret(): string {
+  return process.env.EXPORT_SIGNING_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY || 'dev-export-secret';
+}
+
+function signExportPayload(payload: string): string {
+  return createHmac('sha256', exportSigningSecret()).update(payload).digest('base64url');
+}
+
+function safeEqual(a: string, b: string): boolean {
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return timingSafeEqual(bufA, bufB);
+}
+
+/** Keep only the allowlisted fields for the requesting role. */
+function projectRow(row: Record<string, unknown>, fields: readonly string[]): ExportRow {
+  const projected: ExportRow = {};
+  for (const field of fields) {
+    const value = row[field];
+    projected[field] =
+      value === undefined || value === null
+        ? null
+        : typeof value === 'object'
+          ? JSON.stringify(value)
+          : (value as string | number | boolean);
+  }
+  return projected;
+}
+
+/**
+ * Create an export for the given role and account. Only documented fields for
+ * that role are included, rows are paged out of the database so memory stays
+ * bounded, and the action is audited without any row contents.
+ */
+export async function createExport(
+  role: ExportRole,
+  accountId: string,
+  dataset: ExportDataset,
+): Promise<ServiceResponse<ExportResult>> {
+  if (!accountId) {
+    return { success: false, error: 'Account is required', statusCode: 401 };
+  }
+  if (role !== 'host' && role !== 'admin') {
+    return { success: false, error: 'Unsupported export role', statusCode: 403 };
+  }
+  if (!(dataset in EXPORT_FIELDS)) {
+    return { success: false, error: 'Unsupported export dataset', statusCode: 400 };
+  }
+
+  const fields = EXPORT_FIELDS[dataset][role];
+  const source = EXPORT_SOURCES[dataset];
+  const rows: ExportRow[] = [];
+
+  for (let offset = 0; offset < EXPORT_MAX_ROWS; offset += EXPORT_PAGE_SIZE) {
+    const limit = Math.min(EXPORT_PAGE_SIZE, EXPORT_MAX_ROWS - offset);
+    let query = supabase.from(source).select(fields.join(', '));
+
+    // Hosts only ever see their own data.
+    if (role === 'host') {
+      query = query.eq(dataset === 'reports' ? 'reporter_id' : 'owner_id', accountId);
+    }
+
+    const { data, error } = await query.range(offset, offset + limit - 1);
+    if (error) return { success: false, error: error.message };
+
+    const page = (data ?? []) as unknown as Record<string, unknown>[];
+    for (const row of page) rows.push(projectRow(row, fields));
+    if (page.length < limit) break;
+  }
+
+  const result: ExportResult = {
+    dataset,
+    role,
+    fields,
+    rows,
+    rowCount: rows.length,
+    generatedAt: new Date().toISOString(),
+  };
+
+  const { record } = await import('./auditLog.service.js');
+  await record(accountId, 'export.generated', 'export', `${dataset}:${role}`, {
+    dataset,
+    role,
+    rowCount: rows.length,
+    fields: [...fields],
+  });
+
+  return { success: true, data: result };
+}
+
+/**
+ * Issue a short-lived, ownership-bound download reference for an export.
+ * The token encodes the dataset, role, account, and expiry, and is signed so
+ * it cannot be forged or extended.
+ */
+export function createExportDownload(
+  role: ExportRole,
+  accountId: string,
+  dataset: ExportDataset,
+): ExportDownload {
+  const expiresAt = new Date(Date.now() + EXPORT_LINK_TTL_MS).toISOString();
+  const nonce = randomBytes(8).toString('hex');
+  const payload = Buffer.from(
+    JSON.stringify({ dataset, role, accountId, expiresAt, nonce }),
+  ).toString('base64url');
+  const token = `${payload}.${signExportPayload(payload)}`;
+  return { token, expiresAt, dataset, role, accountId };
+}
+
+/**
+ * Validate a download reference: signature, expiry, and ownership. A host can
+ * only redeem a link issued to their own account, and expired links stop working.
+ */
+export function getExportDownload(
+  token: string,
+  requesterId: string,
+  requesterRole: ExportRole,
+): ServiceResponse<ExportDownload> {
+  if (!token || typeof token !== 'string') {
+    return { success: false, error: 'Download token is required', statusCode: 400 };
+  }
+
+  const [payload, signature] = token.split('.');
+  if (!payload || !signature || !safeEqual(signature, signExportPayload(payload))) {
+    return { success: false, error: 'Invalid download token', statusCode: 403 };
+  }
+
+  let parsed: ExportDownload;
+  try {
+    parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as ExportDownload;
+  } catch {
+    return { success: false, error: 'Invalid download token', statusCode: 403 };
+  }
+
+  if (Date.parse(parsed.expiresAt) <= Date.now()) {
+    return { success: false, error: 'Download link has expired', statusCode: 410 };
+  }
+
+  if (parsed.accountId !== requesterId) {
+    return { success: false, error: 'This download belongs to another account', statusCode: 403 };
+  }
+  if (requesterRole !== 'admin' && parsed.role !== requesterRole) {
+    return { success: false, error: 'This download is not available for your role', statusCode: 403 };
+  }
+
+  return { success: true, data: parsed };
+}
 
 /**
  * Confirm a report target exists and is still live. For listings, also return the

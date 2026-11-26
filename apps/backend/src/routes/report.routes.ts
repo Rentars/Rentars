@@ -1,7 +1,11 @@
 import { Router } from 'express';
 import { authenticate, requireRole } from '../middleware/auth.middleware.js';
 import { validateBody } from '../validators/booking.validator.js';
-import { createReportSchema, resolveReportSchema } from '../validators/report.validator.js';
+import {
+  createReportSchema,
+  resolveReportSchema,
+  createExportSchema,
+} from '../validators/report.validator.js';
 import {
   createReport,
   listReportsHandler,
@@ -15,6 +19,9 @@ import {
   submitAppealHandler,
   reviewAppealHandler,
   getReportImpactHandler,
+  createExportHandler,
+  listExportsHandler,
+  downloadExportHandler,
 } from '../controllers/report.controller.js';
 
 const router = Router();
@@ -62,5 +69,27 @@ router.patch('/:id/appeal/review', authenticate, requireRole('admin'), reviewApp
 
 // GET /api/v1/reports/impact — get report impact stats
 router.get('/impact', getReportImpactHandler);
+
+// ─── Report & Analytics Exports ──────────────────────────────────────────────
+
+// POST /api/v1/reports/exports — request a role-scoped export (host or admin)
+router.post(
+  '/exports',
+  authenticate,
+  requireRole('host', 'admin'),
+  validateBody(createExportSchema),
+  createExportHandler,
+);
+
+// GET /api/v1/reports/exports — list exports owned by the requesting account
+router.get('/exports', authenticate, requireRole('host', 'admin'), listExportsHandler);
+
+// GET /api/v1/reports/exports/:token/download — short-lived, ownership-checked download
+router.get(
+  '/exports/:token/download',
+  authenticate,
+  requireRole('host', 'admin'),
+  downloadExportHandler,
+);
 
 export default router;

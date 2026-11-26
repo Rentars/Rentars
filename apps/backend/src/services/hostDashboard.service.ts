@@ -35,10 +35,18 @@ export interface HostProperty {
 /**
  * Returns a summary of the host's properties, bookings, and revenue
  * for use in the host dashboard overview section.
+ *
+ * All aggregates share the same calculation window, timezone and inclusion
+ * rules so that dashboard widgets and exports report identical numbers.
  */
 export async function getHostDashboardSummary(
   hostId: string,
+  rangeInput?: DateRangeInput,
+  timezone: string = DEFAULT_TIMEZONE,
+  currency: string = DEFAULT_CURRENCY,
 ): Promise<ServiceResponse<HostDashboardSummary>> {
+  const range = resolveDateRange(rangeInput, timezone);
+
   // Fetch all properties for the host
   const { data: properties, error: propError } = await supabase
     .from('properties')
@@ -49,6 +57,17 @@ export async function getHostDashboardSummary(
 
   const propertyIds = (properties ?? []).map((p: { id: string }) => p.id);
   const total_properties = propertyIds.length;
+
+  const metadata = toRangeMetadata(range, currency, {
+    total_properties: 'Count of all properties owned by the host (not windowed).',
+    active_bookings:
+      'Confirmed bookings whose stay overlaps the window and has not been cancelled.',
+    upcoming_reservations:
+      'Confirmed bookings with check-in inside the window and not yet checked out.',
+    total_revenue:
+      'Gross total_price of non-cancelled bookings whose check-in falls inside the window.',
+    net_revenue: `Gross revenue minus a ${Math.round(PLATFORM_FEE_RATE * 100)}% platform fee.`,
+  });
 
   if (total_properties === 0) {
     return {
@@ -66,25 +85,26 @@ export async function getHostDashboardSummary(
     };
   }
 
-  const now = new Date().toISOString();
-  const sevenDaysFromNow = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+  const windowStart = range.start.toISOString();
+  const windowEnd = range.end.toISOString();
 
-  // Active bookings (Confirmed status, not yet checked out)
+  // Active bookings (Confirmed, stay overlaps window, not cancelled)
   const { count: activeCount } = await supabase
     .from('bookings')
     .select('id', { count: 'exact', head: true })
     .in('property_id', propertyIds)
     .eq('status', 'Confirmed')
-    .gte('check_out', now);
+    .gte('check_out', windowStart)
+    .lte('check_in', windowEnd);
 
-  // Upcoming reservations (check-in within next 7 days)
+  // Upcoming reservations (Confirmed, check-in inside window)
   const { count: upcomingCount } = await supabase
     .from('bookings')
     .select('id', { count: 'exact', head: true })
     .in('property_id', propertyIds)
     .eq('status', 'Confirmed')
-    .gte('check_in', now)
-    .lte('check_in', sevenDaysFromNow);
+    .gte('check_in', windowStart)
+    .lte('check_in', windowEnd);
 
   // Total + net revenue are derived from the canonical append-only ledger so
   // the dashboard reconciles with the earnings view (Feature 4). Previously

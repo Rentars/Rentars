@@ -10,25 +10,28 @@ import {
   type LedgerCurrency,
   type LedgerEntry,
 } from '@/services/ledger.service.js';
+import {
+  parseDateRange,
+  type DateRangeMetadata,
+} from '@/services/analytics/date-range.service.js';
+import { EARNINGS_METRIC_DEFINITIONS } from '@/services/analytics/metric-definitions.js';
 
 const earningsService = new EarningsService();
 
-const DATE_RE = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2}(\.\d+)?Z)?$/;
-
+/**
+ * Parses and validates the `from`/`to` query parameters using the shared
+ * date-range parser so every host widget and export resolves windows the
+ * same way (calendar timezone, inclusive end-of-day, partial periods).
+ */
 function validateDateParams(
   from: unknown,
   to: unknown,
-): { from: string; to: string } | null {
-  if (typeof from !== 'string' || typeof to !== 'string') return null;
-  if (!DATE_RE.test(from) || !DATE_RE.test(to)) return null;
-  const start = new Date(from);
-  const end = new Date(to);
-  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end < start) return null;
-  return {
-    from: from.length === 10 ? `${from}T00:00:00.000Z` : from,
-    to: to.length === 10 ? `${to}T23:59:59.999Z` : to,
-  };
+  timezone?: unknown,
+): DateRangeMetadata | null {
+  const parsed = parseDateRange({ from, to, timezone });
+  return parsed.success ? parsed.data : null;
 }
+======
 
 function parseCurrency(value: unknown): LedgerCurrency | null {
   if (value === undefined) return 'USDC';
@@ -48,20 +51,25 @@ export async function getHostEarnings(req: AuthRequest, res: Response): Promise<
     return;
   }
 
-  const { from, to } = req.query as { from?: string; to?: string };
+  const { from, to, timezone } = req.query as {
+    from?: string;
+    to?: string;
+    timezone?: string;
+  };
   if (!from || !to) {
     res.status(422).json({ error: 'from and to query parameters are required (YYYY-MM-DD)' });
     return;
   }
 
-  const dates = validateDateParams(from, to);
-  if (!dates) {
+  const range = validateDateParams(from, to, timezone);
+  if (!range) {
     res.status(422).json({ error: 'from and to must be valid dates in YYYY-MM-DD format' });
     return;
   }
 
   const result = await earningsService.getReconciledEarnings(hostId, {
-    ...dates,
+    from: range.from,
+    to: range.to,
     currency: 'USDC',
   });
   if (!result.success) {
@@ -69,8 +77,16 @@ export async function getHostEarnings(req: AuthRequest, res: Response): Promise<
     return;
   }
 
-  res.json(result.data);
+  res.json({
+    ...result.data,
+    metadata: {
+      range,
+      currency: 'USDC',
+      definitions: EARNINGS_METRIC_DEFINITIONS,
+    },
+  });
 }
+======
 
 /**
  * GET /api/v1/host/ledger?from=&to=&currency=USDC&page=1&limit=50
@@ -84,14 +100,15 @@ export async function getLedgerEntries(req: AuthRequest, res: Response): Promise
     return;
   }
 
-  const { from, to, currency } = req.query as {
+  const { from, to, currency, timezone } = req.query as {
     from?: string;
     to?: string;
     currency?: string;
+    timezone?: string;
   };
 
-  const dates = validateDateParams(from, to);
-  if (!dates) {
+  const range = validateDateParams(from, to, timezone);
+  if (!range) {
     res.status(422).json({ error: 'from and to are required (YYYY-MM-DD or ISO-8601)' });
     return;
   }
@@ -106,7 +123,7 @@ export async function getLedgerEntries(req: AuthRequest, res: Response): Promise
 
   const result = await listLedgerEntries(
     hostId,
-    { ...dates, currency: parsedCurrency },
+    { from: range.from, to: range.to, currency: parsedCurrency },
     page,
     limit,
   );
@@ -116,8 +133,16 @@ export async function getLedgerEntries(req: AuthRequest, res: Response): Promise
     return;
   }
 
-  res.json(result.data);
+  res.json({
+    ...result.data,
+    metadata: {
+      range,
+      currency: parsedCurrency,
+      definitions: EARNINGS_METRIC_DEFINITIONS,
+    },
+  });
 }
+======
 
 /**
  * GET /api/v1/host/ledger/balance?from=&to=&currency=USDC
@@ -133,14 +158,15 @@ export async function getLedgerBalance(req: AuthRequest, res: Response): Promise
     return;
   }
 
-  const { from, to, currency } = req.query as {
+  const { from, to, currency, timezone } = req.query as {
     from?: string;
     to?: string;
     currency?: string;
+    timezone?: string;
   };
 
-  const dates = validateDateParams(from, to);
-  if (!dates) {
+  const range = validateDateParams(from, to, timezone);
+  if (!range) {
     res.status(422).json({ error: 'from and to are required (YYYY-MM-DD or ISO-8601)' });
     return;
   }
@@ -152,7 +178,7 @@ export async function getLedgerBalance(req: AuthRequest, res: Response): Promise
 
   const result = await getHostLedgerBalance(
     hostId,
-    { ...dates, currency: parsedCurrency },
+    { from: range.from, to: range.to, currency: parsedCurrency },
   );
 
   if (!result.success) {
@@ -160,8 +186,16 @@ export async function getLedgerBalance(req: AuthRequest, res: Response): Promise
     return;
   }
 
-  res.json(result.data);
+  res.json({
+    ...result.data,
+    metadata: {
+      range,
+      currency: parsedCurrency,
+      definitions: EARNINGS_METRIC_DEFINITIONS,
+    },
+  });
 }
+======
 
 /**
  * GET /api/v1/host/ledger/reconcile?from=&to=&currency=USDC
@@ -176,14 +210,15 @@ export async function getReconciliationReport(req: AuthRequest, res: Response): 
     return;
   }
 
-  const { from, to, currency } = req.query as {
+  const { from, to, currency, timezone } = req.query as {
     from?: string;
     to?: string;
     currency?: string;
+    timezone?: string;
   };
 
-  const dates = validateDateParams(from, to);
-  if (!dates) {
+  const range = validateDateParams(from, to, timezone);
+  if (!range) {
     res.status(422).json({ error: 'from and to are required (YYYY-MM-DD or ISO-8601)' });
     return;
   }
@@ -195,7 +230,7 @@ export async function getReconciliationReport(req: AuthRequest, res: Response): 
 
   const result = await reconcileHostLedger(
     hostId,
-    { ...dates, currency: parsedCurrency },
+    { from: range.from, to: range.to, currency: parsedCurrency },
   );
 
   if (!result.success) {
@@ -203,8 +238,16 @@ export async function getReconciliationReport(req: AuthRequest, res: Response): 
     return;
   }
 
-  res.json(result.data);
+  res.json({
+    ...result.data,
+    metadata: {
+      range,
+      currency: parsedCurrency,
+      definitions: EARNINGS_METRIC_DEFINITIONS,
+    },
+  });
 }
+======
 
 /**
  * POST /api/v1/admin/host/:hostId/ledger/adjustment
