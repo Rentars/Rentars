@@ -50,6 +50,10 @@ interface PriceQuote {
   platform_fee: number;
   total: number;
   breakdown: Array<{ date: string; price: number; is_available: boolean; reason?: string }>;
+  quote_id?: string;
+  quote_token?: string | null;
+  expires_at?: string;
+  line_items?: Array<{ id: string; label: string; amount: number; currency: string }>;
 }
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
@@ -72,6 +76,7 @@ export default function BookingForm({
   const [dateError, setDateError] = useState('');
   const [guestError, setGuestError] = useState('');
   const [pricing, setPricing] = useState<PriceQuote | null>(null);
+  const [quoteAccepted, setQuoteAccepted] = useState(false);
   const [availabilityError, setAvailabilityError] = useState('');
   const errorSummaryRef = useRef<HTMLDivElement | null>(null);
 
@@ -89,12 +94,13 @@ export default function BookingForm({
     const fetchPricing = async () => {
       try {
         const res = await fetch(
-          `${API_URL}/api/v1/properties/${propertyId}/quote?start=${checkIn}&end=${checkOut}`,
+          `${API_URL}/api/v1/properties/${propertyId}/quote?start=${checkIn}&end=${checkOut}&guests=${guestCount}`,
           { signal: controller.signal },
         );
 
         if (res.ok) {
           setPricing(await res.json());
+          setQuoteAccepted(false);
           setDateError('');
         } else {
           const body = await res.json();
@@ -115,7 +121,7 @@ export default function BookingForm({
     return () => {
       controller.abort();
     };
-  }, [checkIn, checkOut, propertyId]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [checkIn, checkOut, propertyId, guestCount]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleGuestChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const val = parseInt(e.target.value, 10);
@@ -218,6 +224,24 @@ export default function BookingForm({
       return;
     }
 
+    if (!pricing.quote_id || !pricing.quote_token || !pricing.expires_at) {
+      setDateError('A complete booking quote is unavailable; please try again.');
+      focusFirstError('booking-error-summary');
+      return;
+    }
+
+    if (Date.parse(pricing.expires_at) <= Date.now()) {
+      setDateError('This quote has expired. Change the dates to refresh it, then review again.');
+      focusFirstError('booking-error-summary');
+      return;
+    }
+
+    if (!quoteAccepted) {
+      setDateError('Please review and accept the booking quote before continuing.');
+      focusFirstError('booking-error-summary');
+      return;
+    }
+
     const hasBlocked = pricing.breakdown.some((d) => !d.is_available);
     if (hasBlocked) {
       setDateError(t('hasBlockedDates'));
@@ -230,6 +254,9 @@ export default function BookingForm({
       checkOut: new Date(checkOut),
       guestCount,
       totalPrice: pricing.total,
+      quoteId: pricing.quote_id,
+      quoteToken: pricing.quote_token,
+      quoteAcceptedAt: new Date().toISOString(),
     });
   };
 
@@ -530,12 +557,44 @@ export default function BookingForm({
         </div>
       )}
 
+      {/* ── Complete quote disclosure and explicit acceptance ───────────── */}
+      {pricing?.line_items && pricing.line_items.length > 0 && (
+        <fieldset className="rounded-lg border border-gray-200 dark:border-gray-700 p-4 space-y-2">
+          <legend className="px-1 text-sm font-semibold">Review your quote</legend>
+          <ul className="text-sm space-y-1">
+            {pricing.line_items.map((item) => (
+              <li key={item.id} className="flex justify-between gap-3">
+                <span>{item.label}</span>
+                <span className="tabular-nums">
+                  {formatCurrency(item.amount, locale)} {item.currency}
+                </span>
+              </li>
+            ))}
+          </ul>
+          {pricing.expires_at && (
+            <p className="text-xs text-gray-500 dark:text-gray-400">
+              Quote {pricing.quote_id ? `ID ${pricing.quote_id} ` : ''}valid until{' '}
+              {new Date(pricing.expires_at).toLocaleString(locale)}
+            </p>
+          )}
+          <label className="flex items-start gap-2 text-sm font-medium">
+            <input
+              type="checkbox"
+              checked={quoteAccepted}
+              onChange={(e) => setQuoteAccepted(e.target.checked)}
+              className="mt-0.5 h-4 w-4"
+            />
+            <span>I have reviewed the line items and accept this total before booking.</span>
+          </label>
+        </fieldset>
+      )}
+
       <button
         type="submit"
-        disabled={disabled || isLoading || nights <= 0 || !pricing || !!guestError || isOverCapacity || stayViolation}
+        disabled={disabled || isLoading || nights <= 0 || !pricing || !quoteAccepted || (!!pricing.expires_at && Date.parse(pricing.expires_at) <= Date.now()) || !!guestError || isOverCapacity || stayViolation}
         className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 dark:disabled:bg-gray-600 text-white font-medium py-2 px-4 rounded-lg transition min-h-[44px]"
         aria-busy={isLoading}
-        aria-disabled={disabled || isLoading || nights <= 0 || !pricing || !!guestError || isOverCapacity || stayViolation}
+        aria-disabled={disabled || isLoading || nights <= 0 || !pricing || !quoteAccepted || (!!pricing.expires_at && Date.parse(pricing.expires_at) <= Date.now()) || !!guestError || isOverCapacity || stayViolation}
       >
         {isLoading ? t('processing') : t('bookNow')}
       </button>

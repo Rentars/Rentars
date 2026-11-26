@@ -38,8 +38,11 @@ import type { CursorPaginatedResult } from './notification.service.js';
 import type { ServiceResponse } from './index.js';
 import {
   incCounter,
+  observeHistogram,
   bookingsCreatedTotal,
   escrowFailuresTotal,
+  bookingWorkflowTotal,
+  bookingWorkflowDurationSeconds,
 } from '@/middleware/metrics.middleware.js';
 import { checkDateRangeAvailability } from './availability.service.js';
 import { calculateRangePrice, pricingSnapshotFromQuote } from './pricing.service.js';
@@ -48,6 +51,137 @@ import {
   type BookingActor,
 } from './bookingAuthorization.service.js';
 import { auditLogger } from './auditLogger.service.js';
+
+// ─── Guest-count validation ───────────────────────────────────────────────────
+
+/**
+ * Field-level error for an invalid guest count. Returned to API callers so the
+ * offending field can be highlighted without parsing a free-text message.
+ */
+export interface GuestCountFieldError {
+  field: 'guest_count';
+  code: 'GUEST_COUNT_REQUIRED' | 'GUEST_COUNT_INVALID' | 'GUEST_COUNT_EXCEEDS_CAPACITY' | 'CAPACITY_UNKNOWN';
+  message: string;
+}
+
+/**
+ * Validate a requested guest count against a listing's current capacity.
+ *
+ * This is the single source of truth shared by booking creation, quote
+ * generation, and modification requests so search, quote, and booking can
+ * never disagree about the maximum number of guests.
+ *
+ * Rules:
+ *  - The count must be present, finite, an integer, and >= 1. Zero, negative,
+ *    fractional, and non-numeric values are rejected explicitly rather than
+ *    coerced to a default.
+ *  - The count must not exceed the listing's current `max_guests`.
+ *  - A listing with a missing/NULL `max_guests` (legacy row that predates the
+ *    capacity backfill) is treated as unknown capacity and rejected explicitly
+ *    rather than defaulting to an unsafe unlimited capacity.
+ */
+export function validateGuestCount(
+  guestCount: unknown,
+  maxGuests: number | null | undefined,
+): { ok: true; guestCount: number } | { ok: false; error: GuestCountFieldError } {
+  if (guestCount === undefined || guestCount === null || guestCount === '') {
+    return {
+      ok: false,
+      error: {
+        field: 'guest_count',
+        code: 'GUEST_COUNT_REQUIRED',
+        message: 'guest_count is required',
+      },
+    };
+  }
+
+  const numeric = typeof guestCount === 'number' ? guestCount : Number(guestCount);
+  if (!Number.isFinite(numeric) || !Number.isInteger(numeric) || numeric < 1) {
+    return {
+      ok: false,
+      error: {
+        field: 'guest_count',
+        code: 'GUEST_COUNT_INVALID',
+        message: 'guest_count must be a positive integer',
+      },
+    };
+  }
+
+  if (maxGuests === undefined || maxGuests === null) {
+    return {
+      ok: false,
+      error: {
+        field: 'guest_count',
+        code: 'CAPACITY_UNKNOWN',
+        message: 'This property does not have a valid guest capacity configured',
+      },
+    };
+  }
+
+  if (!Number.isFinite(maxGuests) || !Number.isInteger(maxGuests) || maxGuests < 1) {
+    return {
+      ok: false,
+      error: {
+        field: 'guest_count',
+        code: 'CAPACITY_UNKNOWN',
+        message: 'This property does not have a valid guest capacity configured',
+      },
+    };
+  }
+
+  if (numeric > maxGuests) {
+    return {
+      ok: false,
+      error: {
+        field: 'guest_count',
+        code: 'GUEST_COUNT_EXCEEDS_CAPACITY',
+        message: `Guest count (${numeric}) exceeds property capacity (${maxGuests})`,
+      },
+    };
+  }
+
+  return { ok: true, guestCount: numeric };
+}
+
+// ─── Dispute timeline read model ──────────────────────────────────────────────
+
+/**
+ * Participant-safe dispute timeline event kinds. These deliberately collapse
+ * internal detail (evidence, reviewer notes, admin identity) into a small set
+ * of states both parties are allowed to see.
+ */
+export type DisputeTimelineEventKind =
+  | 'dispute_opened'
+  | 'under_review'
+  | 'decision_recorded'
+  | 'financial_action_pending'
+  | 'financial_action_completed'
+  | 'financial_action_failed';
+
+export interface DisputeTimelineEvent {
+  kind: DisputeTimelineEventKind;
+  /** ISO timestamp of the event. */
+  at: string;
+  /** Participant-safe summary. Never contains evidence or reviewer notes. */
+  message: string;
+  /** For financial events: which action the decision called for. */
+  financial_action?: 'refund_tenant' | 'release_to_host';
+  /** For financial events: the verified provider/ledger state. */
+  financial_state?: 'pending' | 'completed' | 'failed';
+}
+
+export interface DisputeTimeline {
+  booking_id: string;
+  /** Authoritative, participant-safe dispute status. */
+  status: 'opened' | 'under_review' | 'decision_recorded' | 'settled' | 'settlement_failed';
+  /** True only once the financial action has been verified as completed. */
+  settlement_completed: boolean;
+  /** True while a decision exists but the financial action has not completed. */
+  settlement_pending: boolean;
+  /** True when the financial action failed and needs operator attention. */
+  settlement_failed: boolean;
+  events: DisputeTimelineEvent[];
+}
 
 // ─── Atomic availability helpers ───────────────────────────────────────────────
 
@@ -322,6 +456,10 @@ export interface CreateBookingInput {
   on_chain_property_id?: bigint;
   /** Quote token from GET /properties/:id/quote, binding total_price to the quoted stay. */
   quote_token?: string;
+  /** Stable identifier of the quote the tenant reviewed and accepted. */
+  quote_id?: string;
+  /** UTC timestamp when the tenant explicitly accepted the quote. */
+  quote_accepted_at?: string;
 }
 
 export interface RequestModificationInput {
@@ -368,6 +506,76 @@ async function fetchStellarAddress(userId: string): Promise<string | null> {
   return (data as { stellar_address?: string } | null)?.stellar_address ?? null;
 }
 
+/**
+ * User moderation policy for bookings (see issue #978 / #083).
+ *
+ * Suspension effects on bookings:
+ *  - A suspended user may not create new bookings (as tenant) nor request or
+ *    accept booking modifications. Existing bookings are NOT cancelled by the
+ *    suspension itself — cancelling would trigger refund/escrow settlement,
+ *    which is a separate, deliberate moderation decision.
+ *  - Instead, active bookings held by a suspended user are flagged for admin
+ *    review (`flagged_for_review` + `review_reason`) so operators can decide
+ *    per-booking whether to cancel, resolve, or leave them in place.
+ *
+ * Restoration policy:
+ *  - Restoring a user re-enables the ability to create/modify bookings, but it
+ *    does NOT reinstate bookings that were cancelled during the suspension, and
+ *    it does NOT release or refund any escrow funds. Reversal of a suspension is
+ *    limited to access; financial and booking-state changes made while suspended
+ *    stand and must be reversed through their own audited flows.
+ */
+const SUSPENDED_BOOKING_REVIEW_REASON =
+  'Account suspended — active booking flagged for admin review';
+
+/** Booking statuses that count as "active" for suspension review purposes. */
+const ACTIVE_BOOKING_STATUSES = ['Pending', 'Confirmed', 'Disputed'] as const;
+
+/**
+ * Returns true when the given user is currently suspended. A missing profile or
+ * a lookup failure is treated as "not suspended" so a transient DB error cannot
+ * silently block every booking; the authorization layer remains authoritative.
+ */
+async function isUserSuspended(userId: string): Promise<boolean> {
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('account_status')
+    .eq('id', userId)
+    .maybeSingle();
+  if (error) return false;
+  return (data as { account_status?: string } | null)?.account_status === 'suspended';
+}
+
+/**
+ * Flag every active booking held by a suspended user for admin review. This is
+ * intentionally non-destructive: it never cancels bookings or touches escrow.
+ * Best-effort — failures are logged and never block the suspension itself.
+ */
+async function flagActiveBookingsForSuspension(userId: string): Promise<void> {
+  try {
+    const { error } = await supabase
+      .from('bookings')
+      .update({
+        flagged_for_review: true,
+        review_reason: SUSPENDED_BOOKING_REVIEW_REASON,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('tenant_id', userId)
+      .in('status', ACTIVE_BOOKING_STATUSES as unknown as string[]);
+    if (error) {
+      console.error(
+        `[BookingService] Failed to flag active bookings for suspended user=${userId}:`,
+        error,
+      );
+    }
+  } catch (e) {
+    console.error(
+      `[BookingService] Failed to flag active bookings for suspended user=${userId}:`,
+      e,
+    );
+  }
+}
+
 // ─── Service class ────────────────────────────────────────────────────────────
 
 export class BookingService {
@@ -394,7 +602,7 @@ export class BookingService {
    *
    * @param extra - Additional columns to update alongside `status` (e.g. cancelled_at).
    */
-  private async transitionStatus(
+  async transitionStatus(
     bookingId: string,
     fromStatus: string,
     toStatus: string,
@@ -419,6 +627,34 @@ export class BookingService {
     }
 
     const payload: Record<string, unknown> = { status: toStatus, ...extra };
+
+    // Preferred path: one transaction updates the booking and inserts exactly
+    // one history row. A NULL result means another caller already claimed the
+    // transition, so no history is written.
+    const actorUuid =
+      typeof actorId === 'string' &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(actorId)
+        ? actorId
+        : null;
+    const rpcResult = await supabase.rpc?.('transition_booking_status_atomic', {
+      p_booking_id: bookingId,
+      p_from_status: fromStatus,
+      p_to_status: toStatus,
+      p_changed_by: actorUuid,
+      p_reason: reason ?? null,
+      p_extra: extra ?? {},
+    });
+    if (rpcResult && !rpcResult.error) {
+      if (!rpcResult.data) {
+        return {
+          success: false,
+          error: `Booking is no longer ${fromStatus.toLowerCase()}`,
+          code: 'STALE_TRANSITION',
+          statusCode: 409,
+        };
+      }
+      return { success: true, data: rpcResult.data as Booking };
+    }
 
     // Condition the write on the expected current status ("optimistic claim").
     // Without this, two concurrent callers racing on the same booking (e.g. an
@@ -836,6 +1072,19 @@ export class BookingService {
    *   7. Create on-chain booking record
    */
   async createBooking(input: CreateBookingInput): Promise<ServiceResponse<Booking>> {
+    const startedAt = process.hrtime.bigint();
+    const result = await this.createBookingInner(input);
+    observeHistogram(bookingWorkflowDurationSeconds, Number(process.hrtime.bigint() - startedAt) / 1e9, {
+      stage: 'create',
+    });
+    incCounter(bookingWorkflowTotal, {
+      stage: 'create',
+      outcome: result.success ? 'success' : 'failure',
+    });
+    return result;
+  }
+
+  private async createBookingInner(input: CreateBookingInput): Promise<ServiceResponse<Booking>> {
     const { property_id, tenant_id, check_in, check_out, guest_count, total_price, rules_acknowledged_at, terms_version, terms_accepted_at } = input;
 
     if (!property_id || !tenant_id || !check_in || !check_out) {
@@ -849,8 +1098,28 @@ export class BookingService {
       return { success: false, error: 'total_price must be a positive number' };
     }
 
+    // Guest count is validated against the property's *current* capacity below,
+    // after the property row is loaded. Reject obviously invalid values here so
+    // we never hit the database with a nonsensical request.
     if (!Number.isFinite(guest_count) || !Number.isInteger(guest_count) || guest_count < 1) {
-      return { success: false, error: 'guest_count must be at least 1' };
+      return {
+        success: false,
+        error: 'guest_count must be a positive integer',
+        statusCode: 400,
+        code: 'GUEST_COUNT_INVALID',
+        details: { field: 'guest_count' },
+      };
+    }
+
+    // Suspended tenants may not create new bookings. Existing bookings are left
+    // untouched (see SUSPENDED_BOOKING_REVIEW_REASON policy above).
+    if (await isUserSuspended(tenant_id)) {
+      return {
+        success: false,
+        error: 'Your account is suspended and cannot create new bookings',
+        statusCode: 403,
+        code: 'ACCOUNT_SUSPENDED',
+      };
     }
 
     // Require rules acknowledgement
@@ -914,11 +1183,16 @@ export class BookingService {
       };
     }
 
-    // Capacity check
-    if (prop.max_guests !== undefined && prop.max_guests !== null && guest_count > prop.max_guests) {
+    // Capacity check — the same validator used by search/quote/modification so
+    // every path agrees on the maximum guests for this listing.
+    const guestCheck = validateGuestCount(guest_count, prop.max_guests);
+    if (!guestCheck.ok) {
       return {
         success: false,
-        error: `Guest count (${guest_count}) exceeds property capacity (${prop.max_guests})`,
+        error: guestCheck.error.message,
+        statusCode: 400,
+        code: guestCheck.error.code,
+        details: { field: guestCheck.error.field },
       };
     }
 
@@ -965,6 +1239,8 @@ export class BookingService {
       checkOut:   check_out,
       clientTotal: total_price,
       quoteToken:  input.quote_token,
+      quoteId:     input.quote_id,
+      quoteAcceptedAt: input.quote_accepted_at,
       guestCount:  guest_count,
     });
     if (!priceCheck.success || !priceCheck.data) {
@@ -1060,7 +1336,10 @@ export class BookingService {
         listing_terms_snapshot: termsSnapshot.data.terms,
         listing_revision: termsSnapshot.data.revision,
         pricing_version: priceCheck.data.quote.pricing_version ?? null,
-        pricing_snapshot: pricingSnapshotFromQuote(priceCheck.data.quote),
+        pricing_snapshot: {
+          ...pricingSnapshotFromQuote(priceCheck.data.quote),
+          quote_accepted_at: input.quote_accepted_at ?? null,
+        },
       })
       .eq('id', bookingId);
 
@@ -1187,7 +1466,8 @@ export class BookingService {
     createNotification(tenant_id, 'booking_created', { booking_id: booking.id, property_id }).catch(
       () => {},
     );
-    incCounter(bookingsCreatedTotal, { property_id });
+    // Bounded label only — never the property/booking id (unbounded cardinality).
+    incCounter(bookingsCreatedTotal, { source: 'api' });
 
     // 8. Create on-chain booking record (non-fatal on failure).
     if (prop.on_chain_id !== undefined && prop.on_chain_id !== null) {
@@ -1269,6 +1549,24 @@ export class BookingService {
     bookingId: string,
     userId: string,
     now: Date = new Date(),
+    userRole?: string,
+  ): Promise<ServiceResponse<Booking>> {
+    const startedAt = process.hrtime.bigint();
+    const result = await this.cancelBookingInner(bookingId, userId, now, userRole);
+    observeHistogram(bookingWorkflowDurationSeconds, Number(process.hrtime.bigint() - startedAt) / 1e9, {
+      stage: 'cancel',
+    });
+    incCounter(bookingWorkflowTotal, {
+      stage: 'cancel',
+      outcome: result.success ? 'success' : 'failure',
+    });
+    return result;
+  }
+
+  private async cancelBookingInner(
+    bookingId: string,
+    userId: string,
+    now: Date,
     userRole?: string,
   ): Promise<ServiceResponse<Booking>> {
     if (!bookingId) {
@@ -1577,6 +1875,23 @@ export class BookingService {
    * DB and on-chain status to Confirmed.
    */
   async confirmBooking(bookingId: string, userId: string, userRole?: string): Promise<ServiceResponse<Booking>> {
+    const startedAt = process.hrtime.bigint();
+    const result = await this.confirmBookingInner(bookingId, userId, userRole);
+    observeHistogram(bookingWorkflowDurationSeconds, Number(process.hrtime.bigint() - startedAt) / 1e9, {
+      stage: 'confirm',
+    });
+    incCounter(bookingWorkflowTotal, {
+      stage: 'confirm',
+      outcome: result.success ? 'success' : 'failure',
+    });
+    return result;
+  }
+
+  private async confirmBookingInner(
+    bookingId: string,
+    userId: string,
+    userRole?: string,
+  ): Promise<ServiceResponse<Booking>> {
     if (!bookingId) {
       return { success: false, error: 'Booking ID is required' };
     }
@@ -1682,6 +1997,23 @@ export class BookingService {
    * @param userId    - ID of the caller (must be the tenant)
    */
   async completeBooking(bookingId: string, userId: string, userRole?: string): Promise<ServiceResponse<Booking>> {
+    const startedAt = process.hrtime.bigint();
+    const result = await this.completeBookingInner(bookingId, userId, userRole);
+    observeHistogram(bookingWorkflowDurationSeconds, Number(process.hrtime.bigint() - startedAt) / 1e9, {
+      stage: 'complete',
+    });
+    incCounter(bookingWorkflowTotal, {
+      stage: 'complete',
+      outcome: result.success ? 'success' : 'failure',
+    });
+    return result;
+  }
+
+  private async completeBookingInner(
+    bookingId: string,
+    userId: string,
+    userRole?: string,
+  ): Promise<ServiceResponse<Booking>> {
     if (!bookingId) {
       return { success: false, error: 'Booking ID is required' };
     }
@@ -1899,6 +2231,28 @@ export class BookingService {
       return { success: false, error: 'No fields provided for update' };
     }
 
+    // Status is never a generic mutable field: every change must go through the
+    // validated state machine so a matching history row is written atomically.
+    if (payload.status) {
+      const { data: current, error: currentError } = await supabase
+        .from('bookings')
+        .select('status')
+        .eq('id', id)
+        .maybeSingle();
+      if (currentError) return { success: false, error: currentError.message };
+      if (!current) return { success: false, error: 'Booking not found', statusCode: 404 };
+
+      const { status, ...extra } = payload;
+      return this.transitionStatus(
+        id,
+        (current as { status: string }).status,
+        status as string,
+        actor.id,
+        `Status updated by ${actor.role ?? 'admin'}`,
+        extra,
+      );
+    }
+
     const { data, error } = await supabase
       .from('bookings')
       .update(payload)
@@ -2002,6 +2356,23 @@ export class BookingService {
       error,
       meta: { actor_role: actor.role ?? null },
     });
+  }
+
+  /**
+   * Apply the booking-side effects of suspending a user (issue #978 / #083).
+   *
+   * Called by the admin moderation flow after the suspension itself has been
+   * recorded. This does NOT cancel bookings or move funds — it only flags the
+   * user's active bookings for admin review so an operator can decide what to
+   * do with each one. Restoration deliberately does not call this in reverse:
+   * see the SUSPENDED_BOOKING_REVIEW_REASON policy comment above.
+   */
+  async flagBookingsForSuspendedUser(userId: string): Promise<ServiceResponse<{ flagged: true }>> {
+    if (!userId) {
+      return { success: false, error: 'User ID is required' };
+    }
+    await flagActiveBookingsForSuspension(userId);
+    return { success: true, data: { flagged: true } };
   }
 
   // ── Dispute ────────────────────────────────────────────────────────────────
@@ -2619,6 +2990,230 @@ export class BookingService {
     return { success: true, data: transitionResult.data! };
   }
 
+  /**
+   * Build a participant-safe dispute timeline for a booking.
+   *
+   * A dispute decision and the financial action it triggers (refund or release)
+   * are separate events that can complete at different times. This read model
+   * joins the booking status history, the recorded dispute decision, and the
+   * verified payment/refund state so participants can tell a *recorded decision*
+   * apart from *completed settlement*.
+   *
+   * Access control: only the booking's tenant, the property's host, or an
+   * admin/moderator may read the timeline. Everyone else gets 403.
+   *
+   * Privacy: internal evidence, reviewer notes, and admin identities are never
+   * included — only participant-safe summaries and verified financial states.
+   *
+   * @param bookingId - UUID of the booking
+   * @param actor - Authenticated caller (id + role)
+   */
+  async getDisputeTimeline(
+    bookingId: string,
+    actor: { id: string; role?: string | null },
+  ): Promise<ServiceResponse<DisputeTimeline>> {
+    if (!bookingId) {
+      return { success: false, error: 'Booking ID is required' };
+    }
+    if (!actor?.id) {
+      return { success: false, error: 'User ID is required', statusCode: 401 };
+    }
+
+    const { data: bookingData, error: fetchError } = await supabase
+      .from('bookings')
+      .select('id, tenant_id, status, escrow_id, dispute_status, properties!inner(owner_id)')
+      .eq('id', bookingId)
+      .single();
+
+    if (fetchError || !bookingData) {
+      return { success: false, error: 'Booking not found', statusCode: 404 };
+    }
+
+    const booking = bookingData as {
+      id: string;
+      tenant_id?: string | null;
+      status?: string | null;
+      escrow_id?: string | null;
+      dispute_status?: string | null;
+      properties?: { owner_id?: string | null } | null;
+    };
+    const hostId = booking.properties?.owner_id ?? null;
+
+    const isParticipant = actor.id === booking.tenant_id || actor.id === hostId;
+    const isAdmin = ['admin', 'moderator'].includes(actor.role ?? '');
+    if (!isParticipant && !isAdmin) {
+      return {
+        success: false,
+        error: 'Forbidden: only booking participants may view the dispute timeline',
+        statusCode: 403,
+      };
+    }
+
+    // Status history drives the opened / under-review / decision events.
+    const { data: history, error: historyError } = await supabase
+      .from('booking_status_history')
+      .select('from_status, status, reason, created_at')
+      .eq('booking_id', bookingId)
+      .order('created_at', { ascending: true });
+
+    if (historyError) {
+      return { success: false, error: historyError.message };
+    }
+
+    const events: DisputeTimelineEvent[] = [];
+    let decisionRecordedAt: string | null = null;
+    let decisionAction: 'refund_tenant' | 'release_to_host' | null = null;
+
+    for (const row of (history ?? []) as Array<{
+      from_status?: string | null;
+      status: string;
+      reason?: string | null;
+      created_at: string;
+    }>) {
+      if (row.status === 'Disputed' && row.from_status !== 'Disputed') {
+        events.push({
+          kind: 'dispute_opened',
+          at: row.created_at,
+          message: 'A dispute was opened on this booking',
+        });
+      }
+      if (row.from_status === 'Disputed' && (row.status === 'Completed' || row.status === 'Cancelled')) {
+        decisionRecordedAt = row.created_at;
+        decisionAction = row.status === 'Completed' ? 'release_to_host' : 'refund_tenant';
+        events.push({
+          kind: 'decision_recorded',
+          at: row.created_at,
+          message:
+            decisionAction === 'release_to_host'
+              ? 'A decision was recorded in favor of the host'
+              : 'A decision was recorded in favor of the tenant',
+          financial_action: decisionAction,
+        });
+      }
+    }
+
+    // Under review: a dispute is open and no decision has been recorded yet.
+    if (booking.dispute_status === 'raised' && !decisionRecordedAt) {
+      const openedAt = events.find((e) => e.kind === 'dispute_opened')?.at ?? new Date().toISOString();
+      events.push({
+        kind: 'under_review',
+        at: openedAt,
+        message: 'The dispute is under review',
+      });
+    }
+
+    // Financial action state — verified against the refund ledger, not assumed
+    // from the decision. A decision alone never marks settlement complete.
+    let settlementCompleted = false;
+    let settlementPending = false;
+    let settlementFailed = false;
+
+    if (decisionRecordedAt && decisionAction) {
+      const { data: refunds, error: refundError } = await supabase
+        .from('refund_requests')
+        .select('status, created_at, updated_at')
+        .eq('booking_id', bookingId)
+        .order('created_at', { ascending: false })
+        .limit(1);
+
+      if (refundError) {
+        return { success: false, error: refundError.message };
+      }
+
+      const refund = (refunds ?? [])[0] as
+        | { status?: string | null; created_at?: string; updated_at?: string }
+        | undefined;
+      const refundStatus = refund?.status ?? null;
+
+      if (decisionAction === 'refund_tenant') {
+        if (refundStatus === 'confirmed') {
+          settlementCompleted = true;
+          events.push({
+            kind: 'financial_action_completed',
+            at: refund?.updated_at ?? decisionRecordedAt,
+            message: 'The refund to the tenant has been completed',
+            financial_action: decisionAction,
+            financial_state: 'completed',
+          });
+        } else if (refundStatus === 'failed') {
+          settlementFailed = true;
+          events.push({
+            kind: 'financial_action_failed',
+            at: refund?.updated_at ?? decisionRecordedAt,
+            message: 'The refund to the tenant failed and requires operator attention',
+            financial_action: decisionAction,
+            financial_state: 'failed',
+          });
+        } else {
+          settlementPending = true;
+          events.push({
+            kind: 'financial_action_pending',
+            at: refund?.updated_at ?? decisionRecordedAt,
+            message: 'The refund to the tenant is pending settlement',
+            financial_action: decisionAction,
+            financial_state: 'pending',
+          });
+        }
+      } else {
+        // release_to_host: verify the escrow actually released before claiming
+        // settlement. A provider error leaves the action pending, never complete.
+        let released = false;
+        if (booking.escrow_id) {
+          try {
+            const escrow = await trustlessWorkClient.getEscrowStatus(booking.escrow_id);
+            released = escrow.status === 'released';
+          } catch {
+            released = false;
+          }
+        }
+
+        if (released) {
+          settlementCompleted = true;
+          events.push({
+            kind: 'financial_action_completed',
+            at: decisionRecordedAt,
+            message: 'The release to the host has been completed',
+            financial_action: decisionAction,
+            financial_state: 'completed',
+          });
+        } else {
+          settlementPending = true;
+          events.push({
+            kind: 'financial_action_pending',
+            at: decisionRecordedAt,
+            message: 'The release to the host is pending settlement',
+            financial_action: decisionAction,
+            financial_state: 'pending',
+          });
+        }
+      }
+    }
+
+    let status: DisputeTimeline['status'];
+    if (settlementCompleted) status = 'settled';
+    else if (settlementFailed) status = 'settlement_failed';
+    else if (decisionRecordedAt) status = 'decision_recorded';
+    else if (booking.dispute_status === 'raised' || events.some((e) => e.kind === 'dispute_opened')) {
+      status = 'under_review';
+    } else {
+      status = 'opened';
+    }
+
+    events.sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
+
+    return {
+      success: true,
+      data: {
+        booking_id: bookingId,
+        status,
+        settlement_completed: settlementCompleted,
+        settlement_pending: settlementPending,
+        settlement_failed: settlementFailed,
+        events,
+      },
+    };
+  }
+
   // ── Modification Request ────────────────────────────────────────────────────
 
   /**
@@ -2686,6 +3281,16 @@ export class BookingService {
       return { success: false, error: 'Forbidden: only the tenant can request a modification' };
     }
 
+    // Suspended tenants may not request booking modifications.
+    if (await isUserSuspended(tenantId)) {
+      return {
+        success: false,
+        error: 'Your account is suspended and cannot request booking modifications',
+        statusCode: 403,
+        code: 'ACCOUNT_SUSPENDED',
+      };
+    }
+
     if (booking.status === 'Cancelled' || booking.status === 'Completed' || booking.status === 'Disputed') {
       return {
         success: false,
@@ -2717,16 +3322,18 @@ export class BookingService {
       };
     }
 
-    // Guest-count validation (only when the caller requests an occupancy change)
+    // Guest-count validation (only when the caller requests an occupancy change).
+    // Uses the shared validator so modification requests enforce exactly the same
+    // range as booking creation, quote, and search.
     if (guestCount !== undefined && guestCount !== null) {
-      if (!Number.isFinite(guestCount) || !Number.isInteger(guestCount) || guestCount < 1) {
-        return { success: false, error: 'guest_count must be a positive integer' };
-      }
-      const maxGuests = booking.properties?.max_guests;
-      if (maxGuests !== undefined && maxGuests !== null && guestCount > maxGuests) {
+      const guestCheck = validateGuestCount(guestCount, booking.properties?.max_guests);
+      if (!guestCheck.ok) {
         return {
           success: false,
-          error: `Guest count (${guestCount}) exceeds property capacity (${maxGuests})`,
+          error: guestCheck.error.message,
+          statusCode: 400,
+          code: guestCheck.error.code,
+          details: { field: guestCheck.error.field },
         };
       }
     }
@@ -2773,6 +3380,8 @@ export class BookingService {
         status: 'pending',
         requested_by: tenantId,
         reason: reason ?? null,
+        original_guest_count: booking.guest_count ?? null,
+        requested_guest_count: guestCount ?? null,
         original_total_price: booking.total_price ?? null,
         booking_snapshot: bookingSnapshot as Record<string, unknown>,
         // Proposals the host never acts on must not linger indefinitely —
@@ -2840,6 +3449,16 @@ export class BookingService {
 
     if (booking.properties.owner_id !== hostId) {
       return { success: false, error: 'Forbidden: only the host can accept a modification' };
+    }
+
+    // Suspended hosts may not accept booking modifications.
+    if (await isUserSuspended(hostId)) {
+      return {
+        success: false,
+        error: 'Your account is suspended and cannot accept booking modifications',
+        statusCode: 403,
+        code: 'ACCOUNT_SUSPENDED',
+      };
     }
 
     const { data: modificationData, error: modError } = await supabase
@@ -3016,6 +3635,16 @@ export class BookingService {
 
     if (booking.properties.owner_id !== hostId) {
       return { success: false, error: 'Forbidden: only the host can decline a modification' };
+    }
+
+    // Suspended hosts may not decline booking modifications.
+    if (await isUserSuspended(hostId)) {
+      return {
+        success: false,
+        error: 'Your account is suspended and cannot decline booking modifications',
+        statusCode: 403,
+        code: 'ACCOUNT_SUSPENDED',
+      };
     }
 
     const { data: modificationData, error: modError } = await supabase

@@ -116,11 +116,17 @@ export async function rotateToken(
  * Returns the token row when valid, or null when the token is not found,
  * revoked, or expired. Updates `last_used_at` on a successful validation
  * so stale-token detection can flag feeds that haven't been used recently.
+ *
+ * Callers MUST treat a `null` result (or a failed response) as "no events":
+ * revoked, expired, malformed, or unknown tokens never resolve to data.
  */
 export async function validateToken(
   token: string,
 ): Promise<ServiceResponse<CalendarFeedToken | null>> {
-  if (!token || token.length !== 64) {
+  // Reject anything that is not exactly 64 lowercase hex chars. This matches
+  // the format produced by generateToken() and short-circuits DB lookups for
+  // obviously invalid input (including injection attempts).
+  if (typeof token !== 'string' || !/^[0-9a-f]{64}$/.test(token)) {
     return { success: true, data: null };
   }
 
@@ -161,6 +167,42 @@ export async function revokeToken(
     .update({ revoked: true })
     .eq('token', token)
     .eq('user_id', userId); // scope to owner so users can't revoke others' tokens
+
+  if (error) return { success: false, error: error.message };
+  return { success: true };
+}
+
+/**
+ * Resolve a raw feed token to its owning user id.
+ *
+ * This is the single entry point the calendar feed route should use. It
+ * returns the owner id only when the token exists, is not revoked, and has
+ * not expired. Any other outcome (invalid format, unknown, revoked, expired,
+ * or a DB error) resolves to `null` so the route can respond 403/404 without
+ * leaking events.
+ */
+export async function resolveFeedOwner(
+  token: string,
+): Promise<ServiceResponse<string | null>> {
+  const result = await validateToken(token);
+  if (!result.success) return { success: false, error: result.error };
+  if (!result.data) return { success: true, data: null };
+  return { success: true, data: result.data.user_id };
+}
+
+/**
+ * Revoke every active token for a user.
+ * Used when a user wants to invalidate all existing calendar subscriptions
+ * at once (e.g. after a suspected leak).
+ */
+export async function revokeAllTokens(
+  userId: string,
+): Promise<ServiceResponse<void>> {
+  const { error } = await supabase
+    .from('calendar_feed_tokens')
+    .update({ revoked: true })
+    .eq('user_id', userId)
+    .eq('revoked', false);
 
   if (error) return { success: false, error: error.message };
   return { success: true };

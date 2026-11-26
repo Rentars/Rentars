@@ -42,6 +42,10 @@ import { ReviewClient } from '@/blockchain/reviewClient.js';
 import { supabase } from '@/config/supabase.js';
 import type { ServiceResponse } from './index.js';
 import type { Review as ChainReview } from '@/blockchain/types.js';
+import {
+  syncWorkflowTotal,
+  syncWorkflowDurationSeconds,
+} from '@/metrics/index.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -52,6 +56,18 @@ export type ReconciliationStatus =
   | 'mismatched'
   | 'missing'
   | 'orphaned';
+
+/**
+ * Lifecycle of an on-chain submission, tracked independently of off-chain
+ * moderation state and of review eligibility.
+ *
+ *   none      → no on-chain submission attempted
+ *   pending   → transaction broadcast, awaiting confirmation
+ *   submitted → transaction seen in a ledger, awaiting finality
+ *   confirmed → transaction confirmed; on-chain reference is authoritative
+ *   failed    → transaction failed/rejected; safe to retry
+ */
+export type OnChainStatus = 'none' | 'pending' | 'submitted' | 'confirmed' | 'failed';
 
 export type RepairIssueType = 'mismatched' | 'missing' | 'orphaned' | 'duplicate';
 export type RepairStatus = 'open' | 'in_progress' | 'resolved' | 'wont_fix';
@@ -84,12 +100,58 @@ interface DBReview {
   on_chain_timestamp: number | null;
   on_chain_tx_hash: string | null;
   on_chain_ledger: number | null;
+  on_chain_status: OnChainStatus | null;
+  on_chain_commitment: string | null;
+  on_chain_network: string | null;
+  booking_id: string | null;
+}
+
+/** Minimal shape of a pending-submission row used by the sweep. */
+interface PendingSubmissionRow {
+  id: string;
+  on_chain_id: number | null;
+  on_chain_status: OnChainStatus | null;
+  on_chain_commitment: string | null;
+  on_chain_tx_hash: string | null;
+  on_chain_network: string | null;
+  booking_id: string | null;
 }
 
 // ─── Client builder ──────────────────────────────────────────────────────────
 
 function buildReviewClient(): ReviewClient {
   return new ReviewClient(REVIEW_CONTRACT_ID, STELLAR_RPC_URL, NETWORK_PASSPHRASE);
+}
+
+// ─── Commitment helpers ──────────────────────────────────────────────────────
+
+/**
+ * Derive the privacy-safe on-chain commitment for a review.
+ *
+ * The commitment is a deterministic hash over the immutable review content
+ * (rating + comment) plus the booking id, so that:
+ *   - the raw comment is never published on-chain,
+ *   - the same review always maps to the same commitment (duplicate detection),
+ *   - a divergent commitment indicates the on-chain record does not belong to
+ *     this off-chain review.
+ *
+ * Uses Web Crypto (available in Node 18+) so no extra dependency is required.
+ */
+export async function computeReviewCommitment(params: {
+  rating: number;
+  comment: string | null;
+  bookingId: string | null;
+}): Promise<string> {
+  const payload = JSON.stringify({
+    r: params.rating,
+    c: params.comment ?? '',
+    b: params.bookingId ?? '',
+  });
+  const bytes = new TextEncoder().encode(payload);
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
 }
 
 // ─── Core reconciliation ─────────────────────────────────────────────────────
@@ -108,6 +170,17 @@ function buildReviewClient(): ReviewClient {
  * @param reviewId - UUID of the off-chain review row
  */
 export async function reconcileReview(
+  reviewId: string,
+): Promise<ServiceResponse<{ status: ReconciliationStatus }>> {
+  const endTimer = syncWorkflowDurationSeconds.startTimer({ workflow: 'review_reconcile' });
+  try {
+    return await reconcileReviewInner(reviewId);
+  } finally {
+    endTimer();
+  }
+}
+
+async function reconcileReviewInner(
   reviewId: string,
 ): Promise<ServiceResponse<{ status: ReconciliationStatus }>> {
   if (!REVIEW_CONTRACT_ID) {
@@ -152,6 +225,7 @@ export async function reconcileReview(
           onChainId: review.on_chain_id,
         },
       });
+      syncWorkflowTotal.inc({ workflow: 'review_reconcile', outcome: 'missing' });
       return { success: true, data: { status: 'missing' } };
     }
     // Transient error — leave status as-is for retry.
@@ -180,6 +254,7 @@ export async function reconcileReview(
     }
 
     await supabase.from('reviews').update(updatePayload).eq('id', reviewId);
+    syncWorkflowTotal.inc({ workflow: 'review_reconcile', outcome: 'matched' });
     return { success: true, data: { status: 'matched' } };
   }
 
@@ -207,6 +282,7 @@ export async function reconcileReview(
     mismatchDetails,
   );
 
+  syncWorkflowTotal.inc({ workflow: 'review_reconcile', outcome: 'mismatched' });
   return { success: true, data: { status: 'mismatched' } };
 }
 
@@ -274,6 +350,7 @@ export async function detectOrphanedReviews(): Promise<ServiceResponse<{
           issueType: 'orphaned',
           details: { message: 'On-chain review has no off-chain counterpart', onChainId },
         });
+        syncWorkflowTotal.inc({ workflow: 'review_reconcile', outcome: 'orphaned' });
       }
       orphaned++;
     } else {
@@ -315,6 +392,7 @@ export async function detectDuplicateOnChainIds(): Promise<ServiceResponse<{
         issueType: 'duplicate',
         details: { message: `${count} DB reviews point to the same on_chain_id`, onChainId, count },
       });
+      syncWorkflowTotal.inc({ workflow: 'review_reconcile', outcome: 'duplicate' });
     }
   }
 
@@ -559,6 +637,7 @@ export async function recordOnChainSubmission(
   const updatePayload: Record<string, unknown> = {
     on_chain_id: onChainId,
     reconciliation_status: 'pending',
+    on_chain_status: 'pending',
   };
 
   // Immutable chain references — only set if provided and not already set.
@@ -573,4 +652,215 @@ export async function recordOnChainSubmission(
 
   if (error) return { success: false, error: error.message };
   return { success: true };
+}
+
+/**
+ * Record that an on-chain submission has been *broadcast* but is not yet
+ * confirmed.  Persists the transaction hash, network and commitment so the
+ * sweep can later reconcile the outcome.  Does NOT touch moderation state.
+ *
+ * Duplicate submissions are rejected: if the review already has a
+ * pending/submitted/confirmed submission, the call is a no-op.
+ *
+ * @param reviewId   - UUID of the off-chain review
+ * @param txHash     - Transaction hash returned by the RPC submit call
+ * @param commitment - Privacy-safe commitment derived from review content
+ * @param network    - Network identifier (e.g. 'testnet', 'mainnet')
+ */
+export async function recordOnChainPending(
+  reviewId: string,
+  txHash: string,
+  commitment: string,
+  network: string = NETWORK_PASSPHRASE,
+): Promise<ServiceResponse<{ status: OnChainStatus }>> {
+  const { data: existing, error: fetchError } = await supabase
+    .from('reviews')
+    .select('id, on_chain_status, on_chain_commitment, on_chain_tx_hash')
+    .eq('id', reviewId)
+    .single();
+
+  if (fetchError || !existing) {
+    return { success: false, error: 'Review not found' };
+  }
+
+  const row = existing as Pick<
+    DBReview,
+    'id' | 'on_chain_status' | 'on_chain_commitment' | 'on_chain_tx_hash'
+  >;
+
+  // Duplicate submission guard — never overwrite an in-flight or confirmed tx.
+  if (
+    row.on_chain_status === 'pending' ||
+    row.on_chain_status === 'submitted' ||
+    row.on_chain_status === 'confirmed'
+  ) {
+    return { success: true, data: { status: row.on_chain_status } };
+  }
+
+  const { error } = await supabase
+    .from('reviews')
+    .update({
+      on_chain_status: 'pending',
+      on_chain_tx_hash: txHash,
+      on_chain_commitment: commitment,
+      on_chain_network: network,
+    })
+    .eq('id', reviewId);
+
+  if (error) return { success: false, error: error.message };
+  return { success: true, data: { status: 'pending' } };
+}
+
+/**
+ * Mark an on-chain submission as failed.  Off-chain moderation state is left
+ * untouched so the review remains moderated normally and can be retried.
+ */
+export async function recordOnChainFailure(
+  reviewId: string,
+  reason: string,
+): Promise<ServiceResponse<void>> {
+  const { error } = await supabase
+    .from('reviews')
+    .update({
+      on_chain_status: 'failed',
+      reconciliation_status: 'none',
+    })
+    .eq('id', reviewId);
+
+  if (error) return { success: false, error: error.message };
+
+  // Surface the failure for admin visibility without blocking retries.
+  await queueRepair({
+    reviewId,
+    onChainId: null,
+    issueType: 'mismatched',
+    details: { message: 'On-chain submission failed', reason },
+  });
+
+  return { success: true };
+}
+
+/**
+ * Sweep reviews whose on-chain submission is still in flight and reconcile
+ * their `on_chain_status` against the contract.
+ *
+ * For each review with `on_chain_status IN ('pending','submitted')`:
+ *   - If the contract has no record yet → leave as pending (delayed confirmation).
+ *   - If the contract record exists but its commitment differs from the stored
+ *     commitment → mark 'failed' and enqueue a repair task (mismatch).
+ *   - If the contract record exists and the commitment matches → mark
+ *     'confirmed' and persist the immutable chain references.
+ *
+ * Failed transactions never alter off-chain moderation state and are
+ * retry-safe: a subsequent successful submission simply overwrites the
+ * failed status via `recordOnChainPending`.
+ */
+export async function reconcilePendingSubmissions(): Promise<ServiceResponse<{
+  confirmed: number;
+  pending: number;
+  failed: number;
+  mismatched: number;
+}>> {
+  if (!REVIEW_CONTRACT_ID) {
+    return { success: false, error: 'REVIEW_CONTRACT_ID is not configured' };
+  }
+
+  const { data, error } = await supabase
+    .from('reviews')
+    .select('id, on_chain_id, on_chain_status, on_chain_commitment, on_chain_tx_hash, on_chain_network, booking_id')
+    .in('on_chain_status', ['pending', 'submitted']);
+
+  if (error) return { success: false, error: error.message };
+
+  const rows = (data ?? []) as PendingSubmissionRow[];
+  const client = buildReviewClient();
+
+  let confirmed = 0;
+  let pending = 0;
+  let failed = 0;
+  let mismatched = 0;
+
+  for (const row of rows) {
+    // Without an on-chain id we cannot query the contract yet — the tx may
+    // still be unconfirmed.  Leave it pending for the next sweep.
+    if (!row.on_chain_id) {
+      pending++;
+      continue;
+    }
+
+    let chainReview: ChainReview;
+    try {
+      chainReview = await client.getReview(BigInt(row.on_chain_id));
+    } catch (err) {
+      const message = (err as Error).message;
+      if (message.includes('not found') || message.includes('404')) {
+        // Delayed confirmation — the transaction has not landed yet.
+        pending++;
+        continue;
+      }
+      // Transient RPC error — leave status untouched for retry.
+      console.error(
+        `[reviewSync] Error reconciling pending submission ${row.id}:`,
+        message,
+      );
+      continue;
+    }
+
+    // Compare the on-chain commitment against the stored commitment.
+    const onChainCommitment = (chainReview as unknown as { commitment?: string })
+      .commitment;
+    const storedCommitment = row.on_chain_commitment;
+
+    if (
+      onChainCommitment !== undefined &&
+      storedCommitment !== null &&
+      onChainCommitment !== storedCommitment
+    ) {
+      // Commitment mismatch — the on-chain record does not belong to this
+      // review.  Mark failed and queue for repair; moderation is untouched.
+      await supabase
+        .from('reviews')
+        .update({ on_chain_status: 'failed', reconciliation_status: 'mismatched' })
+        .eq('id', row.id);
+
+      await queueRepair({
+        reviewId: row.id,
+        onChainId: row.on_chain_id,
+        issueType: 'mismatched',
+        details: {
+          message: 'On-chain commitment does not match stored commitment',
+          storedCommitment,
+          onChainCommitment,
+          onChainId: row.on_chain_id,
+        },
+      });
+
+      mismatched++;
+      continue;
+    }
+
+    // Confirmed — persist immutable chain references.
+    const updatePayload: Record<string, unknown> = {
+      on_chain_status: 'confirmed',
+      reconciliation_status: 'pending',
+    };
+    if (row.on_chain_tx_hash) updatePayload.on_chain_tx_hash = row.on_chain_tx_hash;
+    if (chainReview.timestamp !== undefined) {
+      updatePayload.on_chain_timestamp = Number(chainReview.timestamp);
+    }
+
+    const { error: updateError } = await supabase
+      .from('reviews')
+      .update(updatePayload)
+      .eq('id', row.id);
+
+    if (updateError) {
+      failed++;
+      continue;
+    }
+
+    confirmed++;
+  }
+
+  return { success: true, data: { confirmed, pending, failed, mismatched } };
 }

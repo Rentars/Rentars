@@ -26,7 +26,8 @@
 export type AdminScope =
   // Dashboard & analytics
   | 'admin:dashboard:read'
-  | 'admin:analytics:read'
+  | 'admin:analytics:read'     // aggregate-only analytics (cohort suppression enforced)
+  | 'admin:analytics:raw'      // ELEVATED: raw event access, documented purpose required (#983)
   // User management
   | 'admin:users:read'
   | 'admin:users:suspend'      // HIGH-RISK: irreversible user impact
@@ -77,6 +78,7 @@ export const ROLE_SCOPES: Record<AdminRole, AdminScope[]> = {
   admin: [
     'admin:dashboard:read',
     'admin:analytics:read',
+    'admin:analytics:raw',
     'admin:users:read',
     'admin:users:suspend',
     'admin:users:activate',
@@ -140,9 +142,23 @@ export const ROLE_SCOPES: Record<AdminRole, AdminScope[]> = {
 
 /**
  * Returns true if the given role has the requested scope.
+ *
+ * Scopes are always matched against the explicit per-role list in
+ * ROLE_SCOPES — there is no wildcard (`admin:*`) fallback. An unknown role
+ * or an unlisted scope is denied.
  */
 export function roleHasScope(role: string, scope: AdminScope): boolean {
   const known = role as AdminRole;
   if (!(known in ROLE_SCOPES)) return false;
   return ROLE_SCOPES[known].includes(scope);
+}
+
+/**
+ * Returns the explicit, least-privilege scope list for a role.
+ * Unknown roles receive an empty list (deny by default).
+ */
+export function getScopesForRole(role: string): AdminScope[] {
+  const known = role as AdminRole;
+  if (!(known in ROLE_SCOPES)) return [];
+  return [...ROLE_SCOPES[known]];
 }

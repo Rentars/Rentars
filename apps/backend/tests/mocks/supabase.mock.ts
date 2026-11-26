@@ -1,6 +1,13 @@
 /**
  * Supabase mock — chainable mock that simulates .from().select().eq() etc.
  * Compatible with bun:test mock API.
+ *
+ * Isolation contract:
+ *  - Call `createMockSupabase()` inside `beforeEach` (not at module scope) so
+ *    each test gets a fresh mock with no prior call history.
+ *  - Alternatively, call `.mockReset()` on `mockFrom` and `mockRpc` in
+ *    `beforeEach` before configuring new implementations.
+ *  - Never share a mock instance between describe blocks.
  */
 
 import { mock } from 'bun:test';

@@ -2,6 +2,7 @@
 
 import { useI18n } from '@/lib/i18n';
 import { ErrorContent } from '@/components/error/ErrorContent';
+import { AsyncStateAnnouncer } from '@/components/state/AsyncStateAnnouncer';
 
 interface PropertyErrorProps {
   error: Error & { digest?: string };

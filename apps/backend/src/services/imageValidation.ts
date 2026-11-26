@@ -21,7 +21,16 @@ export const IMAGE_LIMITS = {
   maxDimension: 8192,
   /** Decoded pixel budget. Blocks decompression bombs before the pixels are allocated. */
   maxPixels: 40_000_000,
+  /** Hard byte cap for callers that bypass Multer (defence in depth). */
+  maxBytes: 5_242_880,
 } as const;
+
+/** Reject animated/multi-frame images before any pixels are processed. */
+export function assertSingleFrame(pages: number | undefined): void {
+  if (typeof pages === 'number' && pages > 1) {
+    throw new ImageValidationError('Animated images are not allowed');
+  }
+}
 
 /**
  * Returns the real format of the image, or null when the bytes are not a supported signature.

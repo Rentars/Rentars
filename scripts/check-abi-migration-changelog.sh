@@ -38,8 +38,13 @@ ABI_CHANGES=$(git diff --name-only "$BASE_SHA" HEAD -- 'apps/contracts/*.json' 2
 # ── Detect new migration files ────────────────────────────────────────────────
 MIGRATION_CHANGES=$(git diff --name-only "$BASE_SHA" HEAD -- 'apps/backend/database/migrations/*.sql' 2>/dev/null || true)
 
-if [[ -z "$ABI_CHANGES" && -z "$MIGRATION_CHANGES" ]]; then
-  echo -e "${GREEN}No ABI or migration changes detected — no changelog check required.${NC}"
+# ── Detect contract source changes ────────────────────────────────────────────
+# Contract source edits can change storage layout, entry points or admin
+# semantics even when the exported ABI JSON is unchanged, so they are gated too.
+CONTRACT_CHANGES=$(git diff --name-only "$BASE_SHA" HEAD -- 'apps/contracts/contracts/*/src/*' 2>/dev/null || true)
+
+if [[ -z "$ABI_CHANGES" && -z "$MIGRATION_CHANGES" && -z "$CONTRACT_CHANGES" ]]; then
+  echo -e "${GREEN}No ABI, contract or migration changes detected — no changelog check required.${NC}"
   exit 0
 fi
 
@@ -47,6 +52,10 @@ echo ""
 if [[ -n "$ABI_CHANGES" ]]; then
   echo -e "${YELLOW}ABI files changed:${NC}"
   echo "$ABI_CHANGES" | sed 's/^/  /'
+fi
+if [[ -n "$CONTRACT_CHANGES" ]]; then
+  echo -e "${YELLOW}Contract source files changed:${NC}"
+  echo "$CONTRACT_CHANGES" | sed 's/^/  /'
 fi
 if [[ -n "$MIGRATION_CHANGES" ]]; then
   echo -e "${YELLOW}Migration files changed:${NC}"
@@ -58,10 +67,10 @@ echo ""
 CHANGELOG_DIFF=$(git diff "$BASE_SHA" HEAD -- CHANGELOG.md 2>/dev/null || true)
 
 if [[ -z "$CHANGELOG_DIFF" ]]; then
-  echo -e "${RED}✗ ABI or migration files changed but CHANGELOG.md was not updated.${NC}" >&2
+  echo -e "${RED}✗ ABI, contract or migration files changed but CHANGELOG.md was not updated.${NC}" >&2
   echo "" >&2
-  echo "  Add an entry under ## [Unreleased] describing the ABI or schema change." >&2
-  echo "  See docs/releases/compatibility.md for required content." >&2
+  echo "  Add an entry under ## [Unreleased] describing the ABI, contract upgrade or schema change." >&2
+  echo "  See docs/releases/compatibility.md and docs/contracts/upgrade-policy.md for required content." >&2
   exit 1
 fi
 
@@ -69,11 +78,41 @@ fi
 ADDED_UNRELEASED=$(echo "$CHANGELOG_DIFF" | grep '^+' | grep -v '^+++' | head -1 || true)
 if [[ -z "$ADDED_UNRELEASED" ]]; then
   echo -e "${RED}✗ CHANGELOG.md changed but no new lines were added.${NC}" >&2
-  echo "  The [Unreleased] section must contain a new entry for this ABI/migration change." >&2
+  echo "  The [Unreleased] section must contain a new entry for this ABI/contract/migration change." >&2
   exit 1
 fi
 
-echo -e "${GREEN}✓ CHANGELOG.md updated to cover ABI/migration changes.${NC}"
+# Contract source changes must describe their upgrade/migration impact.
+if [[ -n "$CONTRACT_CHANGES" ]]; then
+  if ! echo "$ADDED_UNRELEASED" | grep -Eiq 'upgrade|migrat|storage|admin|timelock|immutable'; then
+    echo -e "${RED}✗ Contract source changed but the CHANGELOG entry does not describe upgrade/migration impact.${NC}" >&2
+    echo "  Mention whether the contract is upgradeable, who authorizes it, and how state/clients migrate." >&2
+    echo "  See docs/contracts/upgrade-policy.md." >&2
+    exit 1
+  fi
+fi
+
+echo -e "${GREEN}✓ CHANGELOG.md updated to cover ABI/contract/migration changes.${NC}"
+
+# ── Contract compatibility check ─────────────────────────────────────────────
+# When a WASM manifest is available, verify the built contract is compatible
+# with the deployed version before release (issue 120).
+WASM_MANIFEST="${WASM_MANIFEST:-apps/contracts/wasm-manifest.json}"
+if [[ -f "$WASM_MANIFEST" ]]; then
+  if [[ ! -f scripts/check-contract-compatibility.ts ]]; then
+    echo -e "${RED}✗ $WASM_MANIFEST present but scripts/check-contract-compatibility.ts is missing.${NC}" >&2
+    exit 1
+  fi
+  echo "Running contract compatibility check against $WASM_MANIFEST"
+  if ! npx --yes tsx scripts/check-contract-compatibility.ts --manifest "$WASM_MANIFEST"; then
+    echo -e "${RED}✗ Contract compatibility check failed.${NC}" >&2
+    echo "  Resolve the incompatibility or document an approved migration in the changelog." >&2
+    exit 1
+  fi
+  echo -e "${GREEN}✓ Contract compatibility check passed.${NC}"
+else
+  echo -e "${YELLOW}No WASM manifest at $WASM_MANIFEST — skipping contract compatibility check.${NC}"
+fi
 #!/usr/bin/env bash
 #
 # Backup restore drill (#736).

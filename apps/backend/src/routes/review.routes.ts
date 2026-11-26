@@ -24,6 +24,8 @@ import {
   getRepairQueueHandler,
   reconcileReviewsHandler,
   resolveRepairTaskHandler,
+  getReviewOnChainStatusHandler,
+  retryOnChainSubmissionHandler,
 } from '../controllers/review.controller.js';
 import { validateBody } from '../validators/booking.validator.js';
 import {
@@ -35,6 +37,7 @@ import {
   moderationActionSchema,
   rejectReviewSchema,
   resolveRepairTaskSchema,
+  retryOnChainSubmissionSchema,
 } from '../validators/review.validator.js';
 import { validatePagination } from '../validators/pagination.validator.js';
 
@@ -147,6 +150,25 @@ router.post(
   requireRole('admin', 'moderator'),
   validateBody(moderationActionSchema),
   moderationActionHandler,
+);
+
+// ─── On-chain submission status / retry ──────────────────────────────────────
+//
+// Rules (enforced jointly by route + service):
+//   - Only the review author or an admin/moderator may read the on-chain status.
+//   - Only the review author or an admin may retry a failed/pending submission.
+//   - Responses never include commitment nonces or raw review content; only
+//     the public commitment hash, network, transaction id and status.
+
+// GET /api/v1/reviews/:id/on-chain — on-chain submission status for a review
+router.get('/:id/on-chain', authenticate, getReviewOnChainStatusHandler);
+
+// POST /api/v1/reviews/:id/on-chain/retry — retry a failed/pending submission
+router.post(
+  '/:id/on-chain/retry',
+  authenticate,
+  validateBody(retryOnChainSubmissionSchema),
+  retryOnChainSubmissionHandler,
 );
 
 // ─── Sync / repair queue (admin) ──────────────────────────────────────────────

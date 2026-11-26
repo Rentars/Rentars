@@ -12,6 +12,7 @@ import {
 const router = Router();
 
 // POST /api/v1/messages — send a property inquiry message
+// Messaging has its own dedicated budget, keyed by authenticated user ID.
 router.post('/', authenticate, messageRateLimiter, validateBody(sendMessageSchema), sendMessageHandler);
 
 // GET /api/v1/messages/:otherUserId?propertyId=... — list a conversation

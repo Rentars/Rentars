@@ -198,7 +198,8 @@ yarn format
 ### Backend
 
 The backend uses **Bun's built-in test runner**. Test files live under
-`apps/backend/src/__tests__/` (unit) and `apps/backend/tests/` (integration/e2e/RLS).
+`apps/backend/src/__tests__/` (colocated unit tests) and `apps/backend/tests/`
+(integration, E2E, RLS, contract).
 
 ```bash
 # Run all backend tests
@@ -264,7 +265,7 @@ yarn workspace web e2e:journey
 | `rls-tests` | Row-level security policies against a local Supabase Postgres |
 | `contracts` | Builds and tests the Soroban contracts |
 | `frontend-checks` | Frontend lint and unit tests |
-| `frontend-e2e` | Playwright search → booking journey on Chromium |
+| `frontend-e2e` | Playwright browser matrix — Chromium (PRs), full matrix (push to main) |
 | `docs-link-check` | Fails on broken internal documentation links |
 
 All jobs run on every push or PR to `main`, `master`, or `develop`.

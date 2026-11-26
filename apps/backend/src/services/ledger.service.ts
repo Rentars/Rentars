@@ -641,6 +641,126 @@ export async function getHostLedgerBalance(
   };
 }
 
+// ─── Per-entry-type balance breakdown (#770 / Feature 4) ──────────────────────
+
+export interface LedgerBalanceBreakdown {
+  /** Gross settled booking revenue (Σ booking_payment credits). */
+  gross: number;
+  /** Platform fees withheld (Σ platform_fee debits). */
+  platform_fees: number;
+  /** Refunds returned to tenants (Σ refund_debit debits). */
+  refunds: number;
+  /** Net manual adjustments (Σ adjustment credits − Σ adjustment debits). */
+  adjustments_net: number;
+  /** Funds released to the host wallet / paid out (Σ escrow_release credits). */
+  escrow_released: number;
+  /** Total credits across all entry types (for transparency). */
+  total_credits: number;
+  /** Total debits across all entry types (for transparency). */
+  total_debits: number;
+  /**
+   * Settled net earnings derived from the ledger:
+   *   gross − platform_fees − refunds + adjustments_net
+   * Refunds are subtracted exactly once (as refund_debit debits), so a refund
+   * can never be double-counted against the same booking's gross credit.
+   */
+  net: number;
+  /** Funds already paid out to the host wallet (= escrow_released). */
+  paid_out: number;
+  entry_count: number;
+  currency: LedgerCurrency;
+}
+
+/**
+ * Compute a per-entry-type balance breakdown for a host.
+ *
+ * Unlike {@link getHostLedgerBalance} (which sums all credits/debits and so
+ * conflates fees, refunds, and adjustments into one "debits" figure), this
+ * breaks the balance down by entry type so callers can present gross, fees,
+ * refunds, adjustments, and paid-out amounts separately — and derive an
+ * "available" (withdrawable) balance that excludes reserved/disputed funds.
+ *
+ * @param hostId  - Host user ID.
+ * @param filter  - Optional period + currency. When `from`/`to` are omitted the
+ *                  breakdown is computed all-time (used by the dashboard).
+ */
+export async function getHostLedgerBalanceBreakdown(
+  hostId: string,
+  filter?: PeriodFilter,
+): Promise<ServiceResponse<LedgerBalanceBreakdown>> {
+  if (!hostId) return { success: false, error: 'hostId is required' };
+
+  const currency = filter?.currency ?? 'USDC';
+
+  let query = supabase
+    .from('earnings_ledger_entries')
+    .select('entry_type, direction, amount, currency')
+    .eq('host_id', hostId)
+    .eq('currency', currency);
+
+  if (filter?.from) {
+    const dateError = validateDateRange(filter.from, filter.to ?? filter.from);
+    if (dateError) return { success: false, error: dateError };
+    query = query.gte('created_at', filter.from).lte('created_at', filter.to ?? filter.from);
+  }
+
+  const { data, error } = await query;
+  if (error) return { success: false, error: error.message };
+
+  const rows = (data ?? []) as Array<{
+    entry_type: LedgerEntryType;
+    direction: LedgerDirection;
+    amount: number | string;
+  }>;
+
+  const creditByType: Record<LedgerEntryType, number> = {
+    booking_payment: 0, escrow_release: 0, refund_debit: 0, platform_fee: 0, adjustment: 0,
+  };
+  const debitByType: Record<LedgerEntryType, number> = {
+    booking_payment: 0, escrow_release: 0, refund_debit: 0, platform_fee: 0, adjustment: 0,
+  };
+
+  let totalCredits = 0;
+  let totalDebits = 0;
+
+  for (const row of rows) {
+    const amt = Number(row.amount) || 0;
+    if (row.direction === 'credit') {
+      creditByType[row.entry_type] += amt;
+      totalCredits += amt;
+    } else {
+      debitByType[row.entry_type] += amt;
+      totalDebits += amt;
+    }
+  }
+
+  const round2 = (n: number) => Math.round(n * 100) / 100;
+
+  const gross = creditByType.booking_payment;
+  const platformFees = debitByType.platform_fee;
+  const refunds = debitByType.refund_debit;
+  const adjustmentsNet = creditByType.adjustment - debitByType.adjustment;
+  const escrowReleased = creditByType.escrow_release;
+  const net = gross - platformFees - refunds + adjustmentsNet;
+
+  return {
+    success: true,
+    data: {
+      gross: round2(gross),
+      platform_fees: round2(platformFees),
+      refunds: round2(refunds),
+      adjustments_net: round2(adjustmentsNet),
+      escrow_released: round2(escrowReleased),
+      total_credits: round2(totalCredits),
+      total_debits: round2(totalDebits),
+      net: round2(net),
+      paid_out: round2(escrowReleased),
+      entry_count: rows.length,
+      currency,
+    },
+  };
+}
+
 /**
  * List ledger entries for a host with optional period and currency filters.
  *

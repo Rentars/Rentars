@@ -127,12 +127,14 @@ export type ResourceType =
 
 export interface AuditLogEntry {
   actorId?: string;
+  actorRole?: string;
   action: AuditAction;
   resourceType: ResourceType;
   resourceId?: string;
   targetIds?: string[];
   ip?: string;
   correlationId?: string;
+  requestId?: string;
   success?: boolean;
   error?: string;
   meta?: Record<string, unknown>;
@@ -143,7 +145,7 @@ export interface AuditLogEntry {
  * raw provider or message payloads, and free-text bodies.
  */
 const SENSITIVE_META_KEYS =
-  /token|secret|password|passwd|seed|mnemonic|key|pin|card|ssn|cvv|signature|private|cookie|authorization|payload|raw|body|content|file|blob|buffer|attachment|evidence_text|evidence_body|download_url|signed_url/i;
+  /token|secret|password|passwd|seed|mnemonic|key|pin|card|ssn|cvv|signature|private|cookie|authorization|payload|raw|body|content|header/i;
 
 /**
  * Sanitize metadata to prevent logging of sensitive data.
@@ -178,12 +180,15 @@ class AuditLogger {
    */
   async log(entry: AuditLogEntry): Promise<void> {
     const correlationId = entry.correlationId || crypto.randomUUID();
+    const requestId = entry.requestId || correlationId;
     const timestamp = new Date().toISOString();
 
     const record = {
       timestamp,
       correlation_id: correlationId,
+      request_id: requestId,
       actor_id: entry.actorId ?? null,
+      actor_role: entry.actorRole ?? null,
       action: entry.action,
       resource_type: entry.resourceType,
       resource_id: entry.resourceId ?? null,
@@ -191,6 +196,8 @@ class AuditLogger {
       ip: entry.ip ?? null,
       success: entry.success ?? true,
       error: entry.error ?? null,
+      // Redacted at write time: secrets, tokens, headers and raw bodies are
+      // replaced with '[REDACTED]' before they reach stdout or the database.
       meta: sanitizeAuditMeta(entry.meta),
     };
 

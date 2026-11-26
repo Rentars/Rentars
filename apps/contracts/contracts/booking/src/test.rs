@@ -1324,6 +1324,177 @@ mod tests {
         assert_eq!(bookings.len(), 0);
     }
 
+    // ─── Pagination Tests ─────────────────────────────────────────────────────
+
+    /// Maximum page size the contract will ever return for a bounded read.
+    const MAX_PAGE_SIZE: u32 = 20;
+
+    /// Create `count` bookings for a single property, returning their IDs in
+    /// creation order. Each booking uses a distinct, non-overlapping date range
+    /// so the property stays bookable across the whole run.
+    fn seed_property_bookings(
+        env: &Env,
+        booking_cid: &Address,
+        listing_cid: &Address,
+        count: u32,
+    ) -> (u64, soroban_sdk::Vec<u64>) {
+        let client = BookingContractClient::new(env, booking_cid);
+        let owner = Address::generate(env);
+        let tenant = Address::generate(env);
+        let property_id = create_property(env, listing_cid, &owner);
+
+        let mut ids = soroban_sdk::Vec::new(env);
+        for i in 0..count {
+            let start = 1_000_u64 + (i as u64) * 10;
+            let id = client.create_booking(
+                &tenant,
+                &property_id,
+                &start,
+                &(start + 5),
+                &100_i128,
+            );
+            ids.push_back(id);
+        }
+        (property_id, ids)
+    }
+
+    #[test]
+    fn test_get_property_bookings_page_returns_bounded_slice() {
+        let (env, booking_cid, listing_cid, _admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+
+        // Seed more bookings than a single page can hold.
+        let (property_id, ids) =
+            seed_property_bookings(&env, &booking_cid, &listing_cid, MAX_PAGE_SIZE + 5);
+        assert_eq!(ids.len(), MAX_PAGE_SIZE + 5);
+
+        // First page is capped at MAX_PAGE_SIZE and is a prefix of creation order.
+        let page = client.get_property_bookings_page(&property_id, &0_u32, &MAX_PAGE_SIZE);
+        assert_eq!(page.len(), MAX_PAGE_SIZE);
+        for i in 0..MAX_PAGE_SIZE {
+            assert_eq!(page.get(i).unwrap(), ids.get(i).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_get_property_bookings_page_clamps_oversized_request() {
+        let (env, booking_cid, listing_cid, _admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+
+        let (property_id, _ids) =
+            seed_property_bookings(&env, &booking_cid, &listing_cid, MAX_PAGE_SIZE + 3);
+
+        // Asking for far more than the max page size must not return the whole
+        // unbounded vector — the contract clamps to MAX_PAGE_SIZE.
+        let page =
+            client.get_property_bookings_page(&property_id, &0_u32, &u32::MAX);
+        assert_eq!(page.len(), MAX_PAGE_SIZE);
+    }
+
+    #[test]
+    fn test_get_property_bookings_page_cursor_walks_full_history() {
+        let (env, booking_cid, listing_cid, _admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+
+        let total = MAX_PAGE_SIZE + 7;
+        let (property_id, ids) =
+            seed_property_bookings(&env, &booking_cid, &listing_cid, total);
+
+        // Walk the full history using keyset pagination (cursor = last seen id).
+        let mut collected = soroban_sdk::Vec::new(&env);
+        let mut cursor: u64 = 0;
+        loop {
+            let page = client.get_property_bookings_page(&property_id, &cursor, &MAX_PAGE_SIZE);
+            if page.len() == 0 {
+                break;
+            }
+            for i in 0..page.len() {
+                collected.push_back(page.get(i).unwrap());
+            }
+            cursor = page.get(page.len() - 1).unwrap();
+        }
+
+        // No duplicates, no gaps, deterministic order.
+        assert_eq!(collected.len(), total);
+        for i in 0..total {
+            assert_eq!(collected.get(i).unwrap(), ids.get(i).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_get_property_bookings_page_cursor_is_stable_across_calls() {
+        let (env, booking_cid, listing_cid, _admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+
+        let (property_id, _ids) =
+            seed_property_bookings(&env, &booking_cid, &listing_cid, MAX_PAGE_SIZE + 2);
+
+        let first = client.get_property_bookings_page(&property_id, &0_u32, &5_u32);
+        let second = client.get_property_bookings_page(&property_id, &0_u32, &5_u32);
+        assert_eq!(first.len(), second.len());
+        for i in 0..first.len() {
+            assert_eq!(first.get(i).unwrap(), second.get(i).unwrap());
+        }
+
+        // Resuming from the last id of the first page yields the next slice.
+        let cursor = first.get(first.len() - 1).unwrap();
+        let next = client.get_property_bookings_page(&property_id, &cursor, &5_u32);
+        assert_eq!(next.len(), 5);
+        assert!(next.get(0).unwrap() > cursor);
+    }
+
+    #[test]
+    fn test_get_property_bookings_page_empty_and_past_end() {
+        let (env, booking_cid, listing_cid, _admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+
+        // Unknown property → empty page.
+        let empty = client.get_property_bookings_page(&999_u64, &0_u32, &MAX_PAGE_SIZE);
+        assert_eq!(empty.len(), 0);
+
+        // Cursor past the end → empty page.
+        let (property_id, ids) =
+            seed_property_bookings(&env, &booking_cid, &listing_cid, 3);
+        let last = ids.get(ids.len() - 1).unwrap();
+        let past = client.get_property_bookings_page(&property_id, &last, &MAX_PAGE_SIZE);
+        assert_eq!(past.len(), 0);
+    }
+
+    #[test]
+    fn test_get_property_bookings_page_zero_limit_is_empty() {
+        let (env, booking_cid, listing_cid, _admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+
+        let (property_id, _ids) =
+            seed_property_bookings(&env, &booking_cid, &listing_cid, 3);
+        let page = client.get_property_bookings_page(&property_id, &0_u32, &0_u32);
+        assert_eq!(page.len(), 0);
+    }
+
+    #[test]
+    fn test_get_property_bookings_page_within_resource_limits() {
+        let (env, booking_cid, listing_cid, _admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+
+        // Seed a collection larger than one page.
+        let (property_id, _ids) =
+            seed_property_bookings(&env, &booking_cid, &listing_cid, MAX_PAGE_SIZE + 10);
+
+        // Measure resource consumption of a single bounded page read.
+        env.budget().reset_unlimited();
+        let page = client.get_property_bookings_page(&property_id, &0_u32, &MAX_PAGE_SIZE);
+        assert_eq!(page.len(), MAX_PAGE_SIZE);
+
+        let cpu = env.budget().cpu_instruction_cost();
+        let mem = env.budget().memory_bytes_cost();
+
+        // A bounded page read must stay well under Soroban's per-tx limits.
+        // These ceilings are intentionally generous but far below the cost of
+        // iterating the entire unbounded vector.
+        assert!(cpu < 100_000_000, "cpu cost too high: {}", cpu);
+        assert!(mem < 10_000_000, "memory cost too high: {}", mem);
+    }
+
     #[test]
     #[should_panic(expected = "Booking not found")]
     fn test_booking_not_found() {
@@ -1805,5 +1976,496 @@ mod tests {
         assert_eq!(booking.escrow_status, EscrowStatus::Funded);
         // Event "escrow_funded" should be emitted during fund_escrow
         assert!(true);
+    }
+
+    // ─── Cross-Contract Integration Tests ─────────────────────────────────────
+    //
+    // These tests deploy both the booking and property-listing contracts into a
+    // single `Env`, wire the booking contract to the listing contract, and
+    // exercise the integrated rental flow end-to-end. Assertion messages name
+    // the interface or state invariant that regressed so failures are
+    // actionable in CI.
+    mod cross_contract {
+        use super::*;
+
+        /// Shared harness: deploys both contracts, wires them together, and
+        /// returns the environment plus the relevant addresses.
+        struct Harness {
+            env: Env,
+            booking_cid: Address,
+            listing_cid: Address,
+            admin: Address,
+        }
+
+        impl Harness {
+            fn new() -> Self {
+                let env = Env::default();
+                env.mock_all_auths();
+
+                let listing_cid = env.register_contract(None, PropertyListingContract);
+                let booking_cid = env.register_contract(None, BookingContract);
+                let admin = Address::generate(&env);
+
+                let booking_client = BookingContractClient::new(&env, &booking_cid);
+                booking_client.initialize(&admin, &listing_cid);
+
+                Harness {
+                    env,
+                    booking_cid,
+                    listing_cid,
+                    admin,
+                }
+            }
+
+            fn booking(&self) -> BookingContractClient<'_> {
+                BookingContractClient::new(&self.env, &self.booking_cid)
+            }
+
+            fn listing(&self) -> PropertyListingContractClient<'_> {
+                PropertyListingContractClient::new(&self.env, &self.listing_cid)
+            }
+
+            fn create_listing(&self, owner: &Address) -> u64 {
+                self.listing().create_listing(
+                    owner,
+                    &String::from_str(&self.env, "Integration Property"),
+                    &String::from_str(&self.env, "Cross-contract test listing"),
+                    &100_0000000_i128,
+                )
+            }
+
+            /// Query the listing contract for the eligibility of a property.
+            fn is_eligible(&self, property_id: u64) -> bool {
+                self.listing().get_listing(&property_id).status == ListingStatus::Active
+            }
+        }
+
+        // ─── Positive flow ────────────────────────────────────────────────────
+
+        #[test]
+        fn test_integration_full_rental_flow() {
+            let h = Harness::new();
+            let owner = Address::generate(&h.env);
+            let tenant = Address::generate(&h.env);
+
+            // 1. Listing creation is visible on the listing contract.
+            let property_id = h.create_listing(&owner);
+            let listing = h.listing().get_listing(&property_id);
+            assert_eq!(
+                listing.status,
+                ListingStatus::Active,
+                "property-listing::create_listing must produce an Active listing",
+            );
+            assert_eq!(
+                listing.owner, owner,
+                "property-listing::create_listing must record the owner",
+            );
+
+            // 2. Eligibility check agrees with the listing state.
+            assert!(
+                h.is_eligible(property_id),
+                "property-listing eligibility must report Active listing as eligible",
+            );
+
+            // 3. Booking creation succeeds and flips the listing to Rented.
+            let booking_id = h.booking().create_booking(
+                &tenant,
+                &property_id,
+                &1_000_u64,
+                &1_007_u64,
+                &700_0000000_i128,
+            );
+            assert_eq!(
+                booking_id, 1,
+                "booking::create_booking must return the first booking id",
+            );
+
+            let booking = h.booking().get_booking(&booking_id);
+            assert_eq!(
+                booking.status,
+                BookingStatus::Pending,
+                "booking::create_booking must leave the booking Pending",
+            );
+            assert_eq!(
+                booking.property_owner, owner,
+                "booking::create_booking must copy the owner from the listing contract",
+            );
+            assert_eq!(
+                h.listing().get_listing(&property_id).status,
+                ListingStatus::Rented,
+                "property-listing::set_rented must be called on successful booking",
+            );
+
+            // 4. Status transition is reflected on the booking contract.
+            h.booking()
+                .update_status(&h.admin, &booking_id, &BookingStatus::Confirmed);
+            assert_eq!(
+                h.booking().get_booking(&booking_id).status,
+                BookingStatus::Confirmed,
+                "booking::update_status must transition Pending -> Confirmed",
+            );
+
+            h.booking()
+                .update_status(&h.admin, &booking_id, &BookingStatus::Completed);
+            assert_eq!(
+                h.booking().get_booking(&booking_id).status,
+                BookingStatus::Completed,
+                "booking::update_status must transition Confirmed -> Completed",
+            );
+        }
+
+        #[test]
+        fn test_integration_cancel_restores_availability() {
+            let h = Harness::new();
+            let owner = Address::generate(&h.env);
+            let tenant = Address::generate(&h.env);
+
+            let property_id = h.create_listing(&owner);
+            let booking_id = h.booking().create_booking(
+                &tenant,
+                &property_id,
+                &1_000_u64,
+                &1_005_u64,
+                &100_i128,
+            );
+
+            assert!(
+                !h.booking()
+                    .check_availability(&property_id, &1_000_u64, &1_005_u64),
+                "booking::check_availability must report booked range as unavailable",
+            );
+
+            h.booking().cancel_booking(&tenant, &booking_id);
+
+            assert_eq!(
+                h.booking().get_booking(&booking_id).status,
+                BookingStatus::Cancelled,
+                "booking::cancel_booking must mark the booking Cancelled",
+            );
+            assert!(
+                h.booking()
+                    .check_availability(&property_id, &1_000_u64, &1_005_u64),
+                "booking::check_availability must free the range after cancellation",
+            );
+        }
+
+        // ─── Negative: missing contract reference ─────────────────────────────
+
+        #[test]
+        #[should_panic(expected = "Not initialized")]
+        fn test_integration_missing_contract_reference() {
+            let env = Env::default();
+            env.mock_all_auths();
+
+            // Deploy the booking contract but never initialize it with a
+            // listing contract reference.
+            let booking_cid = env.register_contract(None, BookingContract);
+            let listing_cid = env.register_contract(None, PropertyListingContract);
+            let booking_client = BookingContractClient::new(&env, &booking_cid);
+            let listing_client = PropertyListingContractClient::new(&env, &listing_cid);
+
+            let owner = Address::generate(&env);
+            let tenant = Address::generate(&env);
+            let property_id = listing_client.create_listing(
+                &owner,
+                &String::from_str(&env, "Orphan Property"),
+                &String::from_str(&env, "No booking wiring"),
+                &100_0000000_i128,
+            );
+
+            // booking::create_booking must reject calls when the listing
+            // contract reference was never initialized.
+            booking_client.create_booking(
+                &tenant,
+                &property_id,
+                &1_000_u64,
+                &1_007_u64,
+                &100_i128,
+            );
+        }
+
+        // ─── Negative: inactive listing ───────────────────────────────────────
+
+        #[test]
+        #[should_panic(expected = "Property is not available for booking")]
+        fn test_integration_inactive_listing_rejected() {
+            let h = Harness::new();
+            let owner = Address::generate(&h.env);
+            let tenant = Address::generate(&h.env);
+
+            let property_id = h.create_listing(&owner);
+            h.listing()
+                .update_status(&owner, &property_id, &ListingStatus::Inactive);
+
+            assert!(
+                !h.is_eligible(property_id),
+                "property-listing eligibility must report Inactive listing as ineligible",
+            );
+
+            // booking::create_booking must reject inactive listing.
+            h.booking().create_booking(
+                &tenant,
+                &property_id,
+                &1_000_u64,
+                &1_007_u64,
+                &100_i128,
+            );
+        }
+
+        // ─── Negative: overlapping reservation ────────────────────────────────
+
+        #[test]
+        #[should_panic(expected = "Property is not available for booking")]
+        fn test_integration_overlapping_reservation_rejected() {
+            let h = Harness::new();
+            let owner = Address::generate(&h.env);
+            let tenant_a = Address::generate(&h.env);
+            let tenant_b = Address::generate(&h.env);
+
+            let property_id = h.create_listing(&owner);
+
+            // First reservation succeeds and marks the listing Rented.
+            h.booking().create_booking(
+                &tenant_a,
+                &property_id,
+                &1_000_u64,
+                &1_007_u64,
+                &100_i128,
+            );
+            assert_eq!(
+                h.listing().get_listing(&property_id).status,
+                ListingStatus::Rented,
+                "property-listing::set_rented must be called after first booking",
+            );
+
+            // Second reservation for the same property must be rejected by
+            // the listing contract's eligibility check.
+            h.booking().create_booking(
+                &tenant_b,
+                &property_id,
+                &1_000_u64,
+                &1_007_u64,
+                &100_i128,
+            );
+        }
+
+        // ─── Negative: downstream failure atomicity ───────────────────────────
+
+        #[test]
+        fn test_integration_downstream_failure_atomicity() {
+            let h = Harness::new();
+            let owner = Address::generate(&h.env);
+            let tenant = Address::generate(&h.env);
+
+            let property_id = h.create_listing(&owner);
+            let booking_count_before = h.booking().booking_count();
+            let listing_status_before = h.listing().get_listing(&property_id).status;
+
+            // Force a downstream failure: the listing contract rejects the
+            // booking because the property is Inactive. The booking contract
+            // must not leave any partial writes behind.
+            h.listing()
+                .update_status(&owner, &property_id, &ListingStatus::Inactive);
+
+            let result = h.booking().try_create_booking(
+                &tenant,
+                &property_id,
+                &1_000_u64,
+                &1_007_u64,
+                &100_i128,
+            );
+            assert!(
+                result.is_err(),
+                "booking::create_booking must fail when listing is Inactive",
+            );
+
+            // No partial booking state on the booking contract.
+            assert_eq!(
+                h.booking().booking_count(),
+                booking_count_before,
+                "booking::create_booking must not increment booking_count on failure",
+            );
+            assert_eq!(
+                h.booking().get_property_bookings(&property_id).len(),
+                0,
+                "booking::create_booking must not record a booking on failure",
+            );
+
+            // No partial state on the listing contract: the failed booking
+            // must not have flipped the listing to Rented.
+            assert_eq!(
+                h.listing().get_listing(&property_id).status,
+                ListingStatus::Inactive,
+                "property-listing::set_rented must not be called on failed booking",
+            );
+            assert_ne!(
+                h.listing().get_listing(&property_id).status,
+                ListingStatus::Rented,
+                "property-listing status must not become Rented after a failed booking",
+            );
+
+            // Sanity: the pre-failure status was Active, so the only change is
+            // the explicit Inactive update above.
+            assert_eq!(
+                listing_status_before,
+                ListingStatus::Active,
+                "property-listing::create_listing must produce an Active listing",
+            );
+        }
+    }
+
+    // ─── Resource / Cost Regression Measurements (Issue 119) ──────────────────
+    //
+    // These tests measure Soroban CPU instruction and memory consumption for
+    // representative booking operations and emit the results as stable,
+    // machine-readable `RESOURCE_METRIC` JSON lines. The in-test assertions are
+    // intentionally loose (sanity bounds only); the external CI threshold
+    // script (`scripts/check-resource-budgets.*`) parses the emitted lines and
+    // fails the build on material regressions beyond the agreed tolerance.
+    //
+    // To capture a fresh baseline, run:
+    //   cargo test -p booking resource_ -- --nocapture
+    // and feed the emitted lines into the budget file. Document any intentional
+    // threshold change in the accompanying resource-budget notes.
+
+    /// Representative maximum number of existing bookings per property used to
+    /// exercise the worst-case collection size for booking-related operations.
+    const MAX_BOOKINGS_PER_PROPERTY: u64 = 50;
+
+    /// Emit a single machine-readable resource metric line.
+    fn emit_resource_metric(
+        operation: &str,
+        scenario: &str,
+        cpu_instructions: u64,
+        memory_bytes: u64,
+    ) {
+        // Stable JSON-ish format, one metric per line, prefixed for easy grep.
+        std::println!(
+            "RESOURCE_METRIC {{\"contract\":\"booking\",\"operation\":\"{}\",\"scenario\":\"{}\",\"cpu_instructions\":{},\"memory_bytes\":{}}}",
+            operation, scenario, cpu_instructions, memory_bytes
+        );
+    }
+
+    /// Measure the resources consumed by `f`, returning (cpu, memory).
+    ///
+    /// The budget is reset before measuring so that setup work (property
+    /// creation, minting, etc.) is excluded from the reported numbers.
+    fn measure<F: FnOnce()>(env: &Env, f: F) -> (u64, u64) {
+        env.budget().reset_unlimited();
+        f();
+        let cpu = env.budget().cpu_instruction_cost();
+        let mem = env.budget().memory_bytes_cost();
+        (cpu, mem)
+    }
+
+    #[test]
+    fn resource_create_booking() {
+        let (env, booking_cid, listing_cid, _admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+        let owner = Address::generate(&env);
+        let tenant = Address::generate(&env);
+        let property_id = create_property(&env, &listing_cid, &owner);
+
+        let (cpu, mem) = measure(&env, || {
+            client.create_booking(&tenant, &property_id, &1_000_u64, &1_007_u64, &700_0000000_i128);
+        });
+
+        emit_resource_metric("create_booking", "single", cpu, mem);
+
+        // Loose sanity bounds only — the CI threshold script enforces budgets.
+        assert!(cpu > 0, "create_booking must consume CPU instructions");
+        assert!(mem > 0, "create_booking must consume memory");
+    }
+
+    #[test]
+    fn resource_create_booking_max_collection() {
+        let (env, booking_cid, listing_cid, _admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+        let owner = Address::generate(&env);
+        let tenant = Address::generate(&env);
+
+        // Pre-populate many bookings across distinct properties so that the
+        // global booking counter and per-property index are at a representative
+        // maximum size before the measured call.
+        for i in 0..MAX_BOOKINGS_PER_PROPERTY {
+            let prop = create_property(&env, &listing_cid, &owner);
+            let check_in = 10_000 + i * 10;
+            client.create_booking(
+                &tenant,
+                &prop,
+                &check_in,
+                &(check_in + 5),
+                &100_i128,
+            );
+        }
+
+        // Measure one more create_booking with the collection at max size.
+        let prop = create_property(&env, &listing_cid, &owner);
+        let (cpu, mem) = measure(&env, || {
+            client.create_booking(&tenant, &prop, &1_000_u64, &1_007_u64, &700_0000000_i128);
+        });
+
+        emit_resource_metric("create_booking", "max_collection", cpu, mem);
+
+        assert!(cpu > 0, "create_booking (max) must consume CPU instructions");
+        assert!(mem > 0, "create_booking (max) must consume memory");
+    }
+
+    #[test]
+    fn resource_overlap_rejection() {
+        let (env, booking_cid, listing_cid, _admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+        let owner = Address::generate(&env);
+        let tenant = Address::generate(&env);
+        let property_id = create_property(&env, &listing_cid, &owner);
+
+        // Seed an existing booking so the overlap check has data to scan.
+        client.create_booking(&tenant, &property_id, &1_000_u64, &2_000_u64, &100_i128);
+
+        // Measure the availability check that rejects an overlapping range.
+        let (cpu, mem) = measure(&env, || {
+            let available = client.check_availability(&property_id, &1_500_u64, &2_500_u64);
+            assert!(!available, "overlapping range must be rejected");
+        });
+
+        emit_resource_metric("overlap_rejection", "single", cpu, mem);
+
+        assert!(cpu > 0, "overlap_rejection must consume CPU instructions");
+        assert!(mem > 0, "overlap_rejection must consume memory");
+    }
+
+    #[test]
+    fn resource_overlap_rejection_max_collection() {
+        let (env, booking_cid, listing_cid, _admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+        let owner = Address::generate(&env);
+        let tenant = Address::generate(&env);
+
+        // Seed the maximum number of bookings for a single property so the
+        // overlap scan iterates over the largest representative collection.
+        let mut property_id = 0_u64;
+        for i in 0..MAX_BOOKINGS_PER_PROPERTY {
+            let prop = create_property(&env, &listing_cid, &owner);
+            let check_in = 10_000 + i * 10;
+            client.create_booking(
+                &tenant,
+                &prop,
+                &check_in,
+                &(check_in + 5),
+                &100_i128,
+            );
+            property_id = prop;
+        }
+
+        // Measure the availability check over the largest collection.
+        let (cpu, mem) = measure(&env, || {
+            let available = client.check_availability(&property_id, &10_000_u64, &10_005_u64);
+            assert!(!available, "overlapping range must be rejected");
+        });
+
+        emit_resource_metric("overlap_rejection", "max_collection", cpu, mem);
+
+        assert!(cpu > 0, "overlap_rejection (max) must consume CPU instructions");
+        assert!(mem > 0, "overlap_rejection (max) must consume memory");
     }
 }

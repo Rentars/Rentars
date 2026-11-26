@@ -7,8 +7,13 @@ import { useMediaQuery } from '@/hooks/useMediaQuery';
 
 interface Props {
   properties: HostProperty[];
+  total: number;
+  page: number;
+  totalPages: number;
   onEdit?: (property: HostProperty) => void;
   onStatusChange?: (propertyId: string, status: 'draft' | 'published' | 'unpublished') => Promise<boolean>;
+  onFilterChange?: (status: string, search: string) => void;
+  onPageChange?: (page: number) => void;
 }
 
 const STATUS_BADGE: Record<string, string> = {
@@ -17,8 +22,19 @@ const STATUS_BADGE: Record<string, string> = {
   unpublished: 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400',
 };
 
-export default function HostPropertiesTable({ properties, onEdit, onStatusChange }: Props) {
+export default function HostPropertiesTable({
+  properties,
+  total,
+  page,
+  totalPages,
+  onEdit,
+  onStatusChange,
+  onFilterChange,
+  onPageChange,
+}: Props) {
   const [toggling, setToggling] = useState<string | null>(null);
+  const [searchInput, setSearchInput] = useState('');
+  const [statusInput, setStatusInput] = useState('');
   const isMobile = useMediaQuery('(max-width: 768px)');
 
   const handleTogglePublish = async (property: HostProperty) => {
@@ -29,27 +45,60 @@ export default function HostPropertiesTable({ properties, onEdit, onStatusChange
     setToggling(null);
   };
 
-  if (properties.length === 0) {
-    return (
-      <div className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-700 p-8 text-center">
-        <FileText size={40} className="mx-auto mb-3 text-gray-300 dark:text-gray-600" />
-        <p className="text-gray-500 dark:text-gray-400 font-medium">No properties yet</p>
-        <p className="text-sm text-gray-400 dark:text-gray-500 mt-1">
-          Add your first property to start accepting bookings.
-        </p>
-      </div>
-    );
-  }
+  const handleFilterSubmit = () => {
+    onFilterChange?.(statusInput, searchInput);
+  };
 
   return (
     <div className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-700 overflow-hidden">
+      {/* Header */}
       <div className="px-4 sm:px-6 py-4 border-b border-gray-100 dark:border-gray-800">
         <h3 className="text-base font-semibold text-gray-900 dark:text-white">
-          Your Properties ({properties.length})
+          Your Properties ({total})
         </h3>
       </div>
 
-      {isMobile ? (
+      {/* Filter bar */}
+      <div className="px-4 sm:px-6 py-3 border-b border-gray-100 dark:border-gray-800 flex flex-wrap gap-3">
+        <input
+          type="search"
+          placeholder="Search properties…"
+          value={searchInput}
+          onChange={(e) => setSearchInput(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') handleFilterSubmit(); }}
+          className="flex-1 min-w-[180px] border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-1.5 text-sm
+            bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100
+            focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+          aria-label="Search properties by title"
+        />
+        <select
+          value={statusInput}
+          onChange={(e) => {
+            setStatusInput(e.target.value);
+            onFilterChange?.(e.target.value, searchInput);
+          }}
+          className="border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-1.5 text-sm
+            bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100
+            focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+          aria-label="Filter by status"
+        >
+          <option value="">All statuses</option>
+          <option value="published">Published</option>
+          <option value="draft">Draft</option>
+          <option value="unpublished">Unpublished</option>
+        </select>
+      </div>
+
+      {/* Empty state */}
+      {properties.length === 0 ? (
+        <div className="p-8 text-center">
+          <FileText size={40} className="mx-auto mb-3 text-gray-300 dark:text-gray-600" />
+          <p className="text-gray-500 dark:text-gray-400 font-medium">No properties yet</p>
+          <p className="text-sm text-gray-400 dark:text-gray-500 mt-1">
+            Add your first property to start accepting bookings.
+          </p>
+        </div>
+      ) : isMobile ? (
         <div className="divide-y divide-gray-100 dark:divide-gray-800">
           {properties.map((prop) => (
             <div key={prop.id} className="p-4 space-y-3">
@@ -261,6 +310,35 @@ export default function HostPropertiesTable({ properties, onEdit, onStatusChange
               ))}
             </tbody>
           </table>
+        </div>
+      )}
+
+      {/* Pagination */}
+      {totalPages > 1 && (
+        <div className="px-4 sm:px-6 py-3 border-t border-gray-100 dark:border-gray-800 flex items-center justify-between">
+          <p className="text-sm text-gray-500 dark:text-gray-400">
+            Page {page} of {totalPages}
+          </p>
+          <div className="flex gap-2">
+            <button
+              onClick={() => onPageChange?.(page - 1)}
+              disabled={page <= 1}
+              className="px-3 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded-lg disabled:opacity-40
+                hover:bg-gray-50 dark:hover:bg-gray-800 transition focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+              aria-label="Previous page"
+            >
+              Previous
+            </button>
+            <button
+              onClick={() => onPageChange?.(page + 1)}
+              disabled={page >= totalPages}
+              className="px-3 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded-lg disabled:opacity-40
+                hover:bg-gray-50 dark:hover:bg-gray-800 transition focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+              aria-label="Next page"
+            >
+              Next
+            </button>
+          </div>
         </div>
       )}
     </div>

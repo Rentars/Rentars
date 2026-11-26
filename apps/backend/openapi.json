@@ -193,6 +193,242 @@
           "latitude": { "type": "number" },
           "longitude": { "type": "number" }
         }
+      },
+      "PropertyImage": {
+        "type": "object",
+        "required": ["id", "url"],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "url": { "type": "string", "format": "uri" },
+          "is_primary": { "type": "boolean" },
+          "display_order": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "PropertySearchResult": {
+        "type": "object",
+        "required": ["id", "title", "price_per_night", "status"],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "title": { "type": "string" },
+          "description": { "type": "string" },
+          "price_per_night": { "type": "number", "minimum": 0 },
+          "city": { "type": "string" },
+          "country": { "type": "string" },
+          "address": { "type": "string" },
+          "latitude": { "type": "number" },
+          "longitude": { "type": "number" },
+          "bedrooms": { "type": "integer", "minimum": 0 },
+          "bathrooms": { "type": "integer", "minimum": 0 },
+          "max_guests": { "type": "integer", "minimum": 1 },
+          "amenities": { "type": "array", "items": { "type": "string" } },
+          "images": { "type": "array", "items": { "$ref": "#/components/schemas/PropertyImage" } },
+          "owner_id": { "type": "string", "format": "uuid" },
+          "slug": { "type": "string" },
+          "status": { "type": "string", "enum": ["available", "unavailable", "draft", "pending"] },
+          "is_featured": { "type": "boolean" },
+          "featured_until": { "type": ["string", "null"], "format": "date-time" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "PriceHistogramBucket": {
+        "type": "object",
+        "required": ["min", "max", "count"],
+        "properties": {
+          "min": { "type": "number" },
+          "max": { "type": "number" },
+          "count": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "ZeroResultSuggestion": {
+        "type": "object",
+        "required": ["type", "description", "estimated_results"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["no_amenities", "wider_price", "expand_radius", "any_location"]
+          },
+          "description": { "type": "string" },
+          "estimated_results": { "type": "integer", "minimum": 0 },
+          "relaxed_filters": { "type": "object" }
+        }
+      },
+      "AdvancedSearchResponse": {
+        "type": "object",
+        "required": ["data"],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/PropertySearchResult" }
+          },
+          "total": { "type": "integer", "minimum": 0 },
+          "page": { "type": "integer", "minimum": 1 },
+          "limit": { "type": "integer", "minimum": 1 },
+          "price_histogram": {
+            "type": "object",
+            "properties": {
+              "buckets": {
+                "type": "array",
+                "items": { "$ref": "#/components/schemas/PriceHistogramBucket" }
+              },
+              "global_min": { "type": "number" },
+              "global_max": { "type": "number" }
+            }
+          },
+          "_suggestions": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/ZeroResultSuggestion" }
+          }
+        }
+      },
+      "BookingDetail": {
+        "type": "object",
+        "required": ["id", "property_id", "tenant_id", "check_in", "check_out", "total_price", "status", "created_at"],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "property_id": { "type": "string", "format": "uuid" },
+          "tenant_id": { "type": "string", "format": "uuid" },
+          "check_in": { "type": "string", "format": "date" },
+          "check_out": { "type": "string", "format": "date" },
+          "guest_count": { "type": "integer", "minimum": 1 },
+          "total_price": { "type": "number", "minimum": 0 },
+          "status": {
+            "type": "string",
+            "enum": ["pending", "confirmed", "completed", "cancelled", "disputed"]
+          },
+          "escrow_id": { "type": ["string", "null"] },
+          "escrow_status": {
+            "type": ["string", "null"],
+            "enum": ["locked", "released", "refunded", "pending", "manual_review", null]
+          },
+          "on_chain_id": { "type": ["integer", "null"] },
+          "rules_acknowledged_at": { "type": ["string", "null"], "format": "date-time" },
+          "dispute_reason": { "type": ["string", "null"] },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": ["string", "null"], "format": "date-time" }
+        }
+      },
+      "BookingListResponse": {
+        "type": "object",
+        "required": ["data"],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/BookingDetail" }
+          },
+          "cursor": { "type": ["string", "null"] },
+          "has_more": { "type": "boolean" }
+        }
+      },
+      "AuthMeResponse": {
+        "type": "object",
+        "required": ["id", "email"],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "email": { "type": "string", "format": "email" },
+          "role": { "type": "string", "enum": ["owner", "tenant", "admin"] },
+          "email_verified": { "type": "boolean" },
+          "stellar_address": { "type": ["string", "null"] },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "TokenPair": {
+        "type": "object",
+        "required": ["accessToken", "refreshToken"],
+        "properties": {
+          "accessToken": { "type": "string" },
+          "refreshToken": { "type": "string" },
+          "expiresIn": { "type": "integer" }
+        }
+      },
+      "AuthSuccessResponse": {
+        "type": "object",
+        "required": ["user", "accessToken", "refreshToken"],
+        "properties": {
+          "user": { "$ref": "#/components/schemas/AuthMeResponse" },
+          "accessToken": { "type": "string" },
+          "refreshToken": { "type": "string" },
+          "expiresIn": { "type": "integer" }
+        }
+      },
+      "PaymentStatus": {
+        "type": "string",
+        "enum": ["pending", "submitted", "confirmed", "failed", "timeout", "expired"]
+      },
+      "PaymentStatusResponse": {
+        "type": "object",
+        "required": ["bookingId", "status"],
+        "properties": {
+          "bookingId": { "type": "string", "format": "uuid" },
+          "status": { "$ref": "#/components/schemas/PaymentStatus" },
+          "txHash": { "type": ["string", "null"] },
+          "escrowId": { "type": ["string", "null"] },
+          "errorMessage": { "type": ["string", "null"] },
+          "updatedAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "NotificationType": {
+        "type": "string",
+        "enum": [
+          "booking_created",
+          "booking_confirmed",
+          "booking_cancelled",
+          "booking_completed",
+          "booking_disputed",
+          "payment_received",
+          "payment_failed",
+          "review_received",
+          "review_response",
+          "system"
+        ]
+      },
+      "Notification": {
+        "type": "object",
+        "required": ["id", "user_id", "type", "read", "created_at"],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "user_id": { "type": "string", "format": "uuid" },
+          "type": { "$ref": "#/components/schemas/NotificationType" },
+          "data": { "type": "object" },
+          "read": { "type": "boolean" },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "NotificationListResponse": {
+        "type": "object",
+        "required": ["data"],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Notification" }
+          },
+          "unread_count": { "type": "integer", "minimum": 0 },
+          "cursor": { "type": ["string", "null"] }
+        }
+      },
+      "UserProfile": {
+        "type": "object",
+        "required": ["user_id"],
+        "properties": {
+          "user_id": { "type": "string", "format": "uuid" },
+          "name": { "type": ["string", "null"] },
+          "avatar_url": { "type": ["string", "null"] },
+          "phone": { "type": ["string", "null"] },
+          "bio": { "type": ["string", "null"] },
+          "stellar_address": { "type": ["string", "null"] },
+          "verification_status": { "type": "string", "enum": ["unverified", "verified"] },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" },
+          "completeness": {
+            "type": "object",
+            "required": ["score", "maxScore", "missingFields"],
+            "properties": {
+              "score": { "type": "integer", "minimum": 0 },
+              "maxScore": { "type": "integer", "minimum": 0 },
+              "missingFields": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        }
       }
     },
     "responses": {
@@ -632,6 +868,167 @@
               }
             }
           }
+        }
+      }
+    },
+    "/api/v1/properties/search/advanced": {
+      "get": {
+        "summary": "Advanced property search",
+        "description": "Full-text, geospatial, amenity, and price filter search",
+        "tags": ["Properties"],
+        "parameters": [
+          { "name": "q", "in": "query", "schema": { "type": "string" } },
+          { "name": "city", "in": "query", "schema": { "type": "string" } },
+          { "name": "country", "in": "query", "schema": { "type": "string" } },
+          { "name": "min_price", "in": "query", "schema": { "type": "number", "minimum": 0 } },
+          { "name": "max_price", "in": "query", "schema": { "type": "number", "minimum": 0 } },
+          { "name": "bedrooms", "in": "query", "schema": { "type": "integer", "minimum": 0 } },
+          { "name": "min_bathrooms", "in": "query", "schema": { "type": "integer", "minimum": 0 } },
+          { "name": "guests", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
+          { "name": "property_types", "in": "query", "schema": { "type": "array", "items": { "type": "string" } } },
+          { "name": "amenities", "in": "query", "schema": { "type": "array", "items": { "type": "string" } } },
+          { "name": "latitude", "in": "query", "schema": { "type": "number" } },
+          { "name": "longitude", "in": "query", "schema": { "type": "number" } },
+          { "name": "radius_km", "in": "query", "schema": { "type": "number", "minimum": 0 } },
+          { "name": "checkIn", "in": "query", "schema": { "type": "string", "format": "date" } },
+          { "name": "checkOut", "in": "query", "schema": { "type": "string", "format": "date" } },
+          { "name": "sortBy", "in": "query", "schema": { "type": "string", "enum": ["price_asc", "price_desc", "newest", "distance", "relevance"] } },
+          { "name": "page", "in": "query", "schema": { "type": "integer", "minimum": 1, "default": 1 } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Search results with optional histogram and zero-result suggestions",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AdvancedSearchResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" }
+        }
+      }
+    },
+    "/api/v1/auth/me": {
+      "get": {
+        "summary": "Get current user",
+        "description": "Return the authenticated user identity and role",
+        "tags": ["Authentication"],
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Current user",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AuthMeResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/auth/refresh": {
+      "post": {
+        "summary": "Refresh access token",
+        "description": "Rotate the refresh token and return a new token pair",
+        "tags": ["Authentication"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["refreshToken"],
+                "properties": {
+                  "refreshToken": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "New token pair",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TokenPair" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/payments/{id}/status": {
+      "get": {
+        "summary": "Get payment status",
+        "description": "Poll the current payment/escrow status for a booking",
+        "tags": ["Payments"],
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Booking UUID",
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Payment status",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PaymentStatusResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/v1/notifications": {
+      "get": {
+        "summary": "List notifications",
+        "description": "Get paginated notifications for the authenticated user",
+        "tags": ["Notifications"],
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "cursor", "in": "query", "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Notification list",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/NotificationListResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/host/profile": {
+      "get": {
+        "summary": "Get user profile",
+        "description": "Return the authenticated user's full profile",
+        "tags": ["Profile"],
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "User profile",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/UserProfile" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
         }
       }
     }

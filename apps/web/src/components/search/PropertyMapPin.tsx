@@ -40,25 +40,14 @@ export function pinAccessibleLabel(
 ): string {
   const parts: string[] = [pinAccessibleName(property)];
 
-  const price = (property as any).price;
+  const price = property.price_per_night;
   if (typeof price === 'number' && Number.isFinite(price)) {
-    parts.push(`$${price.toLocaleString('en-US')} per month`);
+    parts.push(`$${price.toLocaleString('en-US')} per night`);
   }
 
-  const bedrooms = (property as any).bedrooms;
-  if (typeof bedrooms === 'number' && bedrooms > 0) {
-    parts.push(`${bedrooms} ${bedrooms === 1 ? 'bedroom' : 'bedrooms'}`);
+  if (typeof property.location === 'string' && property.location.trim().length > 0) {
+    parts.push(property.location.trim());
   }
-
-  const city = (property as any).city;
-  const location =
-    typeof city === 'string' && city.trim().length > 0
-      ? city.trim()
-      : typeof (property as any).address === 'string' &&
-          (property as any).address.trim().length > 0
-        ? (property as any).address.trim()
-        : '';
-  if (location) parts.push(location);
 
   return parts.join(', ');
 }
@@ -118,7 +107,7 @@ export default function PropertyMapPin({
       eventHandlers={onClick ? { click: () => onClick() } : undefined}
     >
       {/* Click opens popup; also allow explicit callback */}
-      <PropertyMapPopup property={property} onClick={onClick} onClose={onClose} />
+      <PropertyMapPopup property={property} onClick={onClick} />
     </AccessibleMarker>
   );
 }

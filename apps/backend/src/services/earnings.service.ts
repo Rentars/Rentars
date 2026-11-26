@@ -1,9 +1,10 @@
 import { supabase } from '@/config/supabase.js';
 import type { ServiceResponse } from './index.js';
 import {
-  getHostLedgerBalance,
+  getHostLedgerBalanceBreakdown,
   recordBookingSettlement,
   type PeriodFilter,
+  type LedgerBalanceBreakdown,
 } from './ledger.service.js';
 import {
   parseDateRange,
@@ -22,10 +23,19 @@ export interface EarningsSummary {
   net: number;
   pending: number;
   released: number;
-  /** ISO 4217 currency code the amounts are expressed in. */
-  currency: string;
-  /** Explicit window / inclusion metadata shared with dashboard widgets and exports. */
-  metadata: MetricMetadata;
+  /** Refunds returned to tenants (Σ refund_debit). Subtracted once from net. */
+  refunds?: number;
+  /** Net manual adjustments (Σ adjustment credits − debits). */
+  adjustments?: number;
+  /** Funds already paid out to the host wallet (Σ escrow_release). */
+  paid_out?: number;
+  /** Disputed-booking funds on hold — NOT withdrawable. */
+  disputed?: number;
+  /**
+   * Available (withdrawable) balance = net − paid_out − disputed.
+   * Includes only funds eligible for payout under policy.
+   */
+  available?: number;
 }
 
 export class EarningsService {
@@ -95,9 +105,27 @@ export class EarningsService {
   }
 
   /**
-   * Reconciled earnings — derives the host's balance from the append-only ledger
-   * (#770).  This is the auditable view: every credit and debit is sourced from
-   * a settlement event, not a mutable summary row.
+   * Reconciled earnings — derives the host's balances from the append-only
+   * ledger (Feature 4 / #770). This is the auditable view: every credit and
+   * debit is sourced from a settlement event, not a mutable summary row.
+   *
+   * Balance model (all ledger-derived unless noted):
+   *   gross         Σ booking_payment credits (settled booking revenue)
+   *   platform_fees Σ platform_fee debits
+   *   refunds       Σ refund_debit debits (subtracted exactly once from net)
+   *   adjustments   Σ adjustment credits − Σ adjustment debits
+   *   net           gross − platform_fees − refunds + adjustments  (settled net)
+   *   paid_out      Σ escrow_release credits (funds sent to the host wallet)
+   *   pending       Reserved funds from Pending bookings NOT yet in the ledger
+   *                 (in escrow, NOT withdrawable)
+   *   disputed      Disputed-booking funds on hold (NOT withdrawable)
+   *   available     net − paid_out − disputed  (only funds eligible for payout)
+   *   released      Alias of `available`, kept for API/UI backward compatibility.
+   *
+   * Refunds cannot double-count: a refund_debit is subtracted once from net,
+   * and reserved (pending) bookings are computed separately and never include
+   * cancelled/refunded bookings. Disputed funds are removed from `available`
+   * so they are never presented as withdrawable.
    */
   async getReconciledEarnings(
     hostId: string,
@@ -112,61 +140,68 @@ export class EarningsService {
     }
     const window = range.data;
 
-    // Derive balance from the ledger (credits − debits)
-    const balanceResult = await getHostLedgerBalance(hostId, {
-      ...filter,
-      from: window.from,
-      to: window.to,
-    });
-    if (!balanceResult.success || !balanceResult.data) {
-      return { success: false, error: balanceResult.error };
+    // 1. Per-entry-type ledger breakdown (gross, fees, refunds, adjustments, paid_out, net).
+    const breakdownResult = await getHostLedgerBalanceBreakdown(hostId, filter);
+    if (!breakdownResult.success || !breakdownResult.data) {
+      return { success: false, error: breakdownResult.error };
     }
+    const b: LedgerBalanceBreakdown = breakdownResult.data;
 
-    const balance = balanceResult.data;
+    // 2. Reserved (pending) and disputed funds from bookings NOT yet settled /
+    //    on hold. These are NOT in the ledger and must NOT be presented as
+    //    withdrawable. Pending = reserved in escrow; Disputed = held.
+    const pendingAndDisputed = await this.reservedAndDisputed(hostId, filter);
 
-    // Fetch pending vs released from bookings table (for the pending/released split)
-    const { data, error } = await supabase
-      .from('bookings')
-      .select('total_price, status, properties!inner(owner_id)')
-      .eq('properties.owner_id', hostId)
-      .in('status', ['Confirmed', 'Completed', 'Pending'])
-      .gte('created_at', window.from)
-      .lte('created_at', window.to);
-
-    if (error) return { success: false, error: error.message };
-
-    let pending = 0;
-    let released = 0;
-
-    for (const row of (data ?? []) as Array<{ total_price: number; status: string }>) {
-      if (!isCountedBookingStatus(row.status)) continue;
-      const price = Number(row.total_price) || 0;
-      if (isReleasedBookingStatus(row.status)) {
-        released += price;
-      } else {
-        pending += price;
-      }
-    }
+    const round2 = (n: number) => Math.round(n * 100) / 100;
+    const available = round2(b.net - b.paid_out - pendingAndDisputed.disputed);
 
     return {
       success: true,
       data: {
-        gross: roundMoney(balance.total_credits),
-        platform_fees: roundMoney(balance.total_debits),
-        net: roundMoney(balance.net),
-        pending: roundMoney(pending * (1 - PLATFORM_FEE_RATE)),
-        released: roundMoney(released * (1 - PLATFORM_FEE_RATE)),
-        currency,
-        metadata: {
-          metric: 'earnings',
-          window,
-          currency,
-          gross_or_net: 'net',
-          includes_cancelled: false,
-          booked_or_completed: 'booked',
-        },
+        gross: b.gross,
+        platform_fees: b.platform_fees,
+        refunds: b.refunds,
+        adjustments: b.adjustments_net,
+        net: b.net,
+        paid_out: b.paid_out,
+        pending: round2(pendingAndDisputed.pending),
+        disputed: round2(pendingAndDisputed.disputed),
+        available,
+        // Backward-compatible alias: "Released" = the withdrawable settled balance.
+        released: available,
       },
     };
+  }
+
+  /**
+   * Compute reserved (Pending) and held (Disputed) booking nets for a period.
+   * Pending bookings are not yet in the ledger (funds in escrow); Disputed
+   * bookings are settled but held. Neither is withdrawable. Cancelled bookings
+   * are excluded so refunded bookings never reappear as "pending".
+   */
+  private async reservedAndDisputed(
+    hostId: string,
+    filter: PeriodFilter,
+  ): Promise<{ pending: number; disputed: number }> {
+    const { data, error } = await supabase
+      .from('bookings')
+      .select('total_price, status, properties!inner(owner_id)')
+      .eq('properties.owner_id', hostId)
+      .in('status', ['Pending', 'Disputed'])
+      .gte('created_at', filter.from)
+      .lte('created_at', filter.to);
+
+    if (error || !data) return { pending: 0, disputed: 0 };
+
+    let pending = 0;
+    let disputed = 0;
+    for (const row of data as Array<{ total_price: number | string; status: string }>) {
+      const price = Number(row.total_price) || 0;
+      const net = price * (1 - PLATFORM_FEE_RATE);
+      if (row.status === 'Pending') pending += net;
+      else if (row.status === 'Disputed') disputed += net;
+    }
+    return { pending, disputed };
   }
 }
 

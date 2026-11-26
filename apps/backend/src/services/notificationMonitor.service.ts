@@ -17,6 +17,11 @@
 
 import { supabase } from '../config/supabase.js';
 import type { ServiceResponse } from './index.js';
+import {
+  notificationWorkflowTotal,
+  notificationWorkflowDuration,
+  notificationBacklogSize,
+} from '../observability/metrics.js';
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
 
@@ -130,6 +135,10 @@ export async function recordDeliveryAttempt(
     .single();
 
   if (error) return { success: false, error: error.message };
+
+  // Privacy-safe: only bounded channel/outcome labels, never IDs.
+  notificationWorkflowTotal.inc({ channel: input.channel, outcome: 'queued' });
+
   return { success: true, data: (data as { id: string }).id };
 }
 
@@ -152,7 +161,7 @@ export async function updateDeliveryOutcome(input: UpdateOutcomeInput): Promise<
   // Fetch enqueued_at so we can compute latencies
   const { data: existing, error: fetchError } = await supabase
     .from('notification_delivery_log')
-    .select('enqueued_at, sent_at')
+    .select('enqueued_at, sent_at, channel')
     .eq('id', input.logId)
     .single();
 
@@ -160,7 +169,7 @@ export async function updateDeliveryOutcome(input: UpdateOutcomeInput): Promise<
     return { success: false, error: fetchError?.message ?? 'Record not found' };
   }
 
-  const row = existing as { enqueued_at: string; sent_at: string | null };
+  const row = existing as { enqueued_at: string; sent_at: string | null; channel: NotificationChannel };
   const now = new Date();
   const sentAt = input.sentAt ? new Date(input.sentAt) : (input.status !== 'queued' ? now : null);
 
@@ -189,6 +198,18 @@ export async function updateDeliveryOutcome(input: UpdateOutcomeInput): Promise<
     .eq('id', input.logId);
 
   if (error) return { success: false, error: error.message };
+
+  // Emit exactly one outcome counter per logical event, with bounded labels.
+  notificationWorkflowTotal.inc({ channel: row.channel, outcome: input.status });
+
+  // Observe stored latencies (seconds) rather than recomputing from wall clock.
+  if (queueLatencyMs !== null && queueLatencyMs >= 0) {
+    notificationWorkflowDuration.observe({ channel: row.channel }, queueLatencyMs / 1000);
+  }
+  if (deliveryLatencyMs !== null && deliveryLatencyMs >= 0) {
+    notificationWorkflowDuration.observe({ channel: row.channel }, deliveryLatencyMs / 1000);
+  }
+
   return { success: true };
 }
 
@@ -452,5 +473,9 @@ export async function getRetryBacklog(limit = 50): Promise<ServiceResponse<Retry
     .limit(Math.min(limit, 200));
 
   if (error) return { success: false, error: error.message };
-  return { success: true, data: (data ?? []) as RetryBacklogRow[] };
+
+  const backlog = (data ?? []) as RetryBacklogRow[];
+  notificationBacklogSize.set(backlog.length);
+
+  return { success: true, data: backlog };
 }

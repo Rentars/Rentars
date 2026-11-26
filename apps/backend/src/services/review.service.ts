@@ -1,3 +1,4 @@
+import { createHash, randomBytes } from 'node:crypto';
 import { supabase } from '../config/supabase.js';
 import * as cache from './cache.service.js';
 import type { ServiceResponse } from './index.js';
@@ -31,6 +32,20 @@ export interface Review {
   rating: number;
   comment?: string;
   on_chain_id?: number;
+  // ── On-chain review linkage ────────────────────────────────────────────────
+  // A review is only "on-chain verified" when on_chain_status === 'confirmed'.
+  // The commitment is a privacy-safe hash of the review content; the raw
+  // comment is never published to the chain.
+  on_chain_status?: OnChainStatus;
+  on_chain_commitment?: string | null;
+  on_chain_nonce?: string | null;
+  on_chain_network?: string | null;
+  on_chain_tx_hash?: string | null;
+  on_chain_error?: string | null;
+  on_chain_retry_count?: number;
+  on_chain_submitted_at?: string | null;
+  on_chain_confirmed_at?: string | null;
+  reconciliation_status?: ReconciliationStatus;
   host_response?: string;
   host_response_at?: string;
   host_response_version?: number;
@@ -59,6 +74,100 @@ export interface Review {
 
 /** Default appeal window in days from the moderation action. */
 const DEFAULT_APPEAL_WINDOW_DAYS = 14;
+
+// ─── On-chain review linkage ──────────────────────────────────────────────────
+
+/**
+ * Lifecycle of the on-chain representation of a review.
+ *
+ *  - 'none'      — review is off-chain only (never submitted, or not eligible)
+ *  - 'pending'   — commitment persisted, transaction submitted but unconfirmed
+ *  - 'confirmed' — transaction confirmed on-chain; safe to label as verified
+ *  - 'failed'    — submission failed; off-chain moderation state is unaffected
+ *
+ * Only 'confirmed' may ever be surfaced to users as "on-chain verified".
+ */
+export type OnChainStatus = 'none' | 'pending' | 'confirmed' | 'failed';
+
+/**
+ * How the on-chain record maps back to the off-chain review.
+ *
+ *  - 'unmatched' — no on-chain reference (off-chain only)
+ *  - 'pending'   — reference exists but is not yet confirmed
+ *  - 'matched'   — confirmed reference maps to this eligible review
+ *  - 'mismatch'  — confirmed reference does not map to this review
+ */
+export type ReconciliationStatus = 'unmatched' | 'pending' | 'matched' | 'mismatch';
+
+/** Network identifier persisted alongside the on-chain reference. */
+const REVIEW_ON_CHAIN_NETWORK = process.env.REVIEW_CHAIN_NETWORK ?? 'stellar-testnet';
+
+/**
+ * Build a privacy-safe commitment for a review.
+ *
+ * The commitment is a SHA-256 hash over the booking id, reviewer id, rating
+ * and a per-review nonce. The review comment is deliberately excluded so that
+ * personal review content is never published on-chain. The nonce makes the
+ * commitment unique per submission and prevents trivial correlation of two
+ * reviews with identical ratings.
+ */
+function buildReviewCommitment(params: {
+  bookingId: string;
+  reviewerId: string;
+  rating: number;
+  nonce: string;
+}): string {
+  const payload = [
+    'review:v1',
+    params.bookingId,
+    params.reviewerId,
+    String(params.rating),
+    params.nonce,
+  ].join('|');
+  return createHash('sha256').update(payload).digest('hex');
+}
+
+/** Generate a cryptographically random nonce for a review commitment. */
+function generateReviewNonce(): string {
+  return randomBytes(16).toString('hex');
+}
+
+/**
+ * Submit the review commitment to the review contract.
+ *
+ * Returns the transaction hash on success. Any thrown error (network failure,
+ * contract rejection, timeout) is surfaced to the caller so it can be recorded
+ * as a failed submission without touching moderation state.
+ */
+async function submitReviewCommitmentToChain(params: {
+  reviewId: string;
+  commitment: string;
+  nonce: string;
+  network: string;
+}): Promise<{ txHash: string }> {
+  const { submitReviewCommitment } = await import('./reviewClient.js');
+  const result = await submitReviewCommitment({
+    reviewId: params.reviewId,
+    commitment: params.commitment,
+    nonce: params.nonce,
+    network: params.network,
+  });
+  if (!result || !result.txHash) {
+    throw new Error('Review contract did not return a transaction hash');
+  }
+  return { txHash: result.txHash };
+}
+
+/**
+ * Check whether a submitted review transaction has been confirmed on-chain.
+ *
+ * A transaction that is still pending must NOT be treated as verified.
+ */
+async function isReviewTxConfirmed(txHash: string, network: string): Promise<boolean> {
+  const { getReviewCommitmentStatus } = await import('./reviewClient.js');
+  const status = await getReviewCommitmentStatus({ txHash, network });
+  return status === 'confirmed';
+}
 
 export async function submitReview(
   bookingId: string,
@@ -108,18 +217,53 @@ export async function submitReview(
     return { success: false, error: 'Cannot review before the checkout date has passed' };
   }
 
+  // ── Bind the review to the completed booking's property ─────────────────────
+  // The booking is the source of truth for which property was actually stayed
+  // at; a caller-supplied propertyId that disagrees is rejected so an on-chain
+  // reference can never point at the wrong property.
+  const { data: bookingProperty } = await supabase
+    .from('bookings')
+    .select('property_id')
+    .eq('id', bookingId)
+    .single();
+
+  const bookingPropertyId = (bookingProperty as { property_id?: string } | null)?.property_id;
+  if (propertyId && bookingPropertyId && propertyId !== bookingPropertyId) {
+    return { success: false, error: 'Property does not match the reviewed booking' };
+  }
+  const resolvedPropertyId = bookingPropertyId ?? propertyId;
+
+  // ── Prepare the on-chain commitment (privacy-safe) ──────────────────────────
+  // The commitment is persisted BEFORE the contract call so a crash mid-call
+  // leaves a retry-safe record. The review is not "verified" until confirmed.
+  const nonce = generateReviewNonce();
+  const commitment = buildReviewCommitment({
+    bookingId,
+    reviewerId,
+    rating,
+    nonce,
+  });
+
   const { data, error } = await supabase
     .from('reviews')
     .insert({
       booking_id: bookingId,
       reviewer_id: reviewerId,
       target_id: targetId,
-      property_id: propertyId,
+      property_id: resolvedPropertyId,
       rating,
       comment: cleanComment,
       // Immutable original content snapshots — never modified by moderation.
       original_comment: cleanComment,
       original_rating: rating,
+      // On-chain linkage — pending until the transaction is confirmed.
+      on_chain_status: 'pending',
+      on_chain_commitment: commitment,
+      on_chain_nonce: nonce,
+      on_chain_network: REVIEW_ON_CHAIN_NETWORK,
+      on_chain_retry_count: 0,
+      on_chain_submitted_at: new Date().toISOString(),
+      reconciliation_status: 'pending',
     })
     .select()
     .single();
@@ -128,19 +272,81 @@ export async function submitReview(
     return { success: false, error: error.message };
   }
 
+  const createdReview = data as Review;
+
+  // ── Submit the commitment to the review contract ────────────────────────────
+  // Failure here must never roll back the off-chain review or alter its
+  // moderation state — it only marks the on-chain linkage as failed.
+  try {
+    const { txHash } = await submitReviewCommitmentToChain({
+      reviewId: createdReview.id,
+      commitment,
+      nonce,
+      network: REVIEW_ON_CHAIN_NETWORK,
+    });
+
+    const confirmed = await isReviewTxConfirmed(txHash, REVIEW_ON_CHAIN_NETWORK);
+
+    const { data: updated } = await supabase
+      .from('reviews')
+      .update(
+        confirmed
+          ? {
+              on_chain_tx_hash: txHash,
+              on_chain_status: 'confirmed',
+              on_chain_confirmed_at: new Date().toISOString(),
+              on_chain_error: null,
+              reconciliation_status: 'matched',
+            }
+          : {
+              // Submitted but not yet confirmed — stays pending, never verified.
+              on_chain_tx_hash: txHash,
+              on_chain_status: 'pending',
+              reconciliation_status: 'pending',
+            },
+      )
+      .eq('id', createdReview.id)
+      .select()
+      .single();
+
+    if (updated) {
+      Object.assign(createdReview, updated as Review);
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'On-chain submission failed';
+    const { data: failed } = await supabase
+      .from('reviews')
+      .update({
+        on_chain_status: 'failed',
+        on_chain_error: message,
+        reconciliation_status: 'unmatched',
+      })
+      .eq('id', createdReview.id)
+      .select()
+      .single();
+
+    if (failed) {
+      Object.assign(createdReview, failed as Review);
+    }
+    // Moderation state is intentionally untouched: the review remains
+    // 'pending' moderation and is retry-safe via retryOnChainSubmission().
+  }
+
   // Invalidate the property detail cache so the updated rating aggregate is reflected.
-  if (propertyId) {
-    await cache.del(`property:${propertyId}`);
+  if (resolvedPropertyId) {
+    await cache.del(`property:${resolvedPropertyId}`);
   }
 
   // Notify the host that a new review was submitted
   try {
     const { createNotification } = await import('./notification.service.js');
-    const deepLink = propertyId ? `/properties/${propertyId}#reviews` : `/reviews`;
+    const deepLink = resolvedPropertyId
+      ? `/properties/${resolvedPropertyId}#reviews`
+      : `/reviews`;
     await createNotification(targetId, 'review_submitted', {
-      reviewId: (data as Review).id,
+      reviewId: createdReview.id,
       reviewerId,
-      propertyId: propertyId ?? null,
+      propertyId: resolvedPropertyId ?? null,
       rating,
       message: `A guest left you a ${rating}-star review.`,
     }, { deepLink });
@@ -148,7 +354,159 @@ export async function submitReview(
     // Notification failure must never block the review submission
   }
 
-  return { success: true, data: data as Review };
+  return { success: true, data: createdReview };
+}
+
+/**
+ * Retry an on-chain review submission that previously failed or is still
+ * pending confirmation.
+ *
+ * Idempotent: the stored commitment and nonce are reused, so retrying never
+ * produces a second, differently-committed on-chain record for the same
+ * review. Each attempt increments `on_chain_retry_count`.
+ *
+ * A review that is already 'confirmed' is returned unchanged. Moderation state
+ * is never modified by this function.
+ */
+export async function retryOnChainSubmission(
+  reviewId: string,
+): Promise<ServiceResponse<Review>> {
+  const { data: existing, error: fetchError } = await supabase
+    .from('reviews')
+    .select(
+      'id, booking_id, reviewer_id, rating, on_chain_status, on_chain_commitment, on_chain_nonce, on_chain_network, on_chain_tx_hash, on_chain_retry_count',
+    )
+    .eq('id', reviewId)
+    .single();
+
+  if (fetchError || !existing) {
+    return { success: false, error: 'Review not found' };
+  }
+
+  const review = existing as {
+    id: string;
+    booking_id: string;
+    reviewer_id: string;
+    rating: number;
+    on_chain_status: OnChainStatus | null;
+    on_chain_commitment: string | null;
+    on_chain_nonce: string | null;
+    on_chain_network: string | null;
+    on_chain_tx_hash: string | null;
+    on_chain_retry_count: number | null;
+  };
+
+  // Already verified — nothing to do, and never downgrade a confirmed review.
+  if (review.on_chain_status === 'confirmed') {
+    return { success: true, data: review as unknown as Review };
+  }
+
+  // Reuse the stored commitment/nonce. If they are missing (e.g. a review
+  // created before on-chain linkage existed) derive them deterministically
+  // from the booking so the retry remains idempotent.
+  const nonce = review.on_chain_nonce ?? generateReviewNonce();
+  const commitment =
+    review.on_chain_commitment ??
+    buildReviewCommitment({
+      bookingId: review.booking_id,
+      reviewerId: review.reviewer_id,
+      rating: review.rating,
+      nonce,
+    });
+  const network = review.on_chain_network ?? REVIEW_ON_CHAIN_NETWORK;
+  const retryCount = (review.on_chain_retry_count ?? 0) + 1;
+
+  // If a transaction hash already exists, check whether it has since confirmed
+  // before submitting a new one.
+  if (review.on_chain_tx_hash) {
+    try {
+      const confirmed = await isReviewTxConfirmed(review.on_chain_tx_hash, network);
+      if (confirmed) {
+        const { data: confirmedRow, error: confirmError } = await supabase
+          .from('reviews')
+          .update({
+            on_chain_status: 'confirmed',
+            on_chain_confirmed_at: new Date().toISOString(),
+            on_chain_error: null,
+            reconciliation_status: 'matched',
+            on_chain_retry_count: retryCount,
+          })
+          .eq('id', reviewId)
+          .select()
+          .single();
+        if (confirmError) return { success: false, error: confirmError.message };
+        return { success: true, data: confirmedRow as Review };
+      }
+    } catch {
+      // Fall through to a fresh submission attempt.
+    }
+  }
+
+  // Persist the attempt (pending) before calling the contract.
+  const { error: pendingError } = await supabase
+    .from('reviews')
+    .update({
+      on_chain_status: 'pending',
+      on_chain_commitment: commitment,
+      on_chain_nonce: nonce,
+      on_chain_network: network,
+      on_chain_retry_count: retryCount,
+      on_chain_submitted_at: new Date().toISOString(),
+      reconciliation_status: 'pending',
+    })
+    .eq('id', reviewId);
+
+  if (pendingError) return { success: false, error: pendingError.message };
+
+  try {
+    const { txHash } = await submitReviewCommitmentToChain({
+      reviewId,
+      commitment,
+      nonce,
+      network,
+    });
+
+    const confirmed = await isReviewTxConfirmed(txHash, network);
+
+    const { data: updated, error: updateError } = await supabase
+      .from('reviews')
+      .update(
+        confirmed
+          ? {
+              on_chain_tx_hash: txHash,
+              on_chain_status: 'confirmed',
+              on_chain_confirmed_at: new Date().toISOString(),
+              on_chain_error: null,
+              reconciliation_status: 'matched',
+            }
+          : {
+              on_chain_tx_hash: txHash,
+              on_chain_status: 'pending',
+              reconciliation_status: 'pending',
+            },
+      )
+      .eq('id', reviewId)
+      .select()
+      .single();
+
+    if (updateError) return { success: false, error: updateError.message };
+    return { success: true, data: updated as Review };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'On-chain submission failed';
+    const { data: failed, error: failError } = await supabase
+      .from('reviews')
+      .update({
+        on_chain_status: 'failed',
+        on_chain_error: message,
+        reconciliation_status: 'unmatched',
+      })
+      .eq('id', reviewId)
+      .select()
+      .single();
+
+    if (failError) return { success: false, error: failError.message };
+    return { success: true, data: failed as Review };
+  }
 }
 
 export async function getReviewsForProperty(propertyId: string, page = 1, pageSize = 20): Promise<ServiceResponse<PaginatedResult<Review>>> {

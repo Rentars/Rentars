@@ -14,6 +14,7 @@
  */
 
 import type { Response } from 'express';
+import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { AuthRequest } from '@/middleware/auth.middleware.js';
 import {
@@ -89,6 +90,55 @@ function correlatedError(
       ...extra,
     },
   };
+}
+
+// ─── Correlation & redaction helpers ───────────────────────────────────────────
+
+const SENSITIVE_KEY_PATTERN =
+  /(secret|token|password|passwd|private[_-]?key|seed|mnemonic|authorization|api[_-]?key|credential|xdr)/i;
+
+/**
+ * Returns a correlation id for the current request, reusing an inbound
+ * `x-correlation-id` / `x-request-id` header when present so a single payment
+ * flow can be traced across controller, service, and provider calls.
+ */
+function getCorrelationId(req: AuthRequest): string {
+  const headerValue = req.headers?.['x-correlation-id'] ?? req.headers?.['x-request-id'];
+  const candidate = Array.isArray(headerValue) ? headerValue[0] : headerValue;
+  if (typeof candidate === 'string' && candidate.trim().length > 0 && candidate.length <= 128) {
+    return candidate.trim();
+  }
+  return randomUUID();
+}
+
+/**
+ * Recursively redacts credential-like fields from a value before it is logged
+ * or returned to a client. Never mutates the input.
+ */
+function redactCredentials<T>(value: T, depth = 0): T {
+  if (depth > 8 || value === null || typeof value !== 'object') {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => redactCredentials(item, depth + 1)) as unknown as T;
+  }
+  const out: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    out[key] = SENSITIVE_KEY_PATTERN.test(key) ? '[REDACTED]' : redactCredentials(entry, depth + 1);
+  }
+  return out as T;
+}
+
+/**
+ * Logs an error with correlation context, redacting any credential-like data
+ * that may have been attached to the error object.
+ */
+function logPaymentError(correlationId: string, message: string, err: unknown): void {
+  const detail =
+    err instanceof Error
+      ? { name: err.name, message: err.message, stack: err.stack }
+      : redactCredentials(err);
+  console.error(`[Payment][correlationId=${correlationId}] ${message}`, redactCredentials(detail));
 }
 
 // ─── Quote generation ──────────────────────────────────────────────────────────
@@ -287,6 +337,8 @@ export async function submitPayment(req: AuthRequest, res: Response): Promise<vo
     metadata,
   } = parsed.data;
   const tenantId = req.userId!;
+  const correlationId = getCorrelationId(req);
+  res.setHeader('x-correlation-id', correlationId);
 
   // ── 0. Establish correlation context (#993) ────────────────────────────────
   // The operation key is derived from the booking + quote so retries of the
@@ -387,6 +439,8 @@ export async function submitPayment(req: AuthRequest, res: Response): Promise<vo
     tenantId,
     amountStroops: stroops,
     quoteHash,
+    idempotencyKey,
+    correlationId,
     metadata,
     correlationId: ctx.correlationId,
     operationId: ctx.operationId,
@@ -395,12 +449,12 @@ export async function submitPayment(req: AuthRequest, res: Response): Promise<vo
   // ── 4. Submit signed XDR to Stellar ─────────────────────────────────────────
   let txHash: string;
   try {
-    const result = await submitTransaction(signedXdr);
+    const result = await submitTransaction(signedXdr, { correlationId, paymentId: payment.id });
     txHash = result.txHash;
-    await updatePaymentStatus(payment.id, txHash, 'submitted');
+    await updatePaymentStatus(payment.id, txHash, 'submitted', { correlationId });
     await recordSuccess('stellar_horizon');
   } catch (err) {
-    await updatePaymentStatus(payment.id, null, 'failed');
+    await updatePaymentStatus(payment.id, null, 'failed', { correlationId });
     await recordFailure('stellar_horizon');
     res.status(502).json(
       correlatedError(
@@ -649,6 +703,8 @@ export async function retryPayment(req: AuthRequest, res: Response): Promise<voi
   }
 
   const tenantId = req.userId!;
+  const correlationId = getCorrelationId(req);
+  res.setHeader('x-correlation-id', correlationId);
 
   // ── Attempt limiter ────────────────────────────────────────────────────────
   const attemptResult = await checkAndIncrementAttempts(payment.booking_id, tenantId);

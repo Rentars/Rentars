@@ -688,10 +688,18 @@ and the reconcile trigger is not exposed). They are real, owned, and dated
 today; the first drill will confirm them as live failures and track them to
 closure. Retrospectives append further rows in the same format.
 
+Rows 3–6 were raised by the **2026-11-15 recovery drill, which FAILED**
+(issue #910). They must all be closed, with evidence linked in the Tracking
+link column, before #910 is closed.
+
 | # | Risk / gap | Source (step) | Owner (A) | Due date | Tracking link | Status |
 |---|---|---|---|---|---|---|
-| 1 | `sync.routes.ts` handlers exist but the router is not mounted in `apps/backend/src/routes/index.ts`; `reconcileAllPendingEscrows` is not exposed via HTTP; no `/sync/status` or `/sync/reconcile/status` or `/reconciliation/discrepancies` endpoint. Drill §6.4 and §6.7 cannot pass until routes are mounted and reconcile wired. | §6.4, §6.7 | Backend On-Call | 2026-11-15 | (issue link) | Open |
+| 1 | `sync.routes.ts` handlers exist but the router is not mounted in `apps/backend/src/routes/index.ts`; `reconcileAllPendingEscrows` is not exposed via HTTP; no `/sync/status` or `/sync/reconcile/status` or `/reconciliation/discrepancies` endpoint. Drill §6.4 and §6.7 cannot pass until routes are mounted and reconcile wired. **Confirmed live by the 2026-11-15 drill: §6.4 sync-resume returned 404 on both sync routes and the phase FAILED by design.** | §6.4, §6.7 | Backend On-Call | 2026-11-15 | (issue link) | Open |
 | 2 | Drill measures sync freshness via `sync_log` age, not direct ledger lag; on-chain lookup uses the last synced status rather than a fresh contract read. A `stellar-cli` query or read-only contract call should verify the live chain state. | §6.4, §6.6 | Contracts Lead | 2026-12-01 | (issue link) | Open |
+| 3 | **2026-11-15 drill failure — §6.7 reconciliation could not run a fresh reconcile.** Because `reconcileAllPendingEscrows` has no HTTP route (risk #1), the drill fell back to the DB-only discrepancy count and the Finance Owner's manual Trustless Work cross-check. The drill cannot prove a fresh reconcile run until the trigger endpoint exists; wire the route and re-run §6.7 in the next drill. | §6.7 | Backend On-Call | 2026-11-29 | (issue link) | Open |
+| 4 | **2026-11-15 drill failure — §6.6 booking-lookup on-chain agreement is unverified.** The phase compares against the last `sync_log` row rather than a fresh contract read, so a booking whose on-chain state changed after the last sync would pass incorrectly. Add a read-only contract call (or `stellar-cli` query) to §6.6 step 3 and record the result in the drill report. | §6.6 | Contracts Lead | 2026-12-01 | (issue link) | Open |
+| 5 | **2026-11-15 drill failure — §6.4 sync freshness proxy is too weak.** `sync_log` age < 120 s does not detect a stalled sync service that is writing rows without advancing against the ledger. Add a ledger-lag check (chain head vs. last synced ledger) to the drill runner and fail the phase when lag > 30 ledgers. | §6.4 | Infra Owner (RPC) | 2026-12-13 | (issue link) | Open |
+| 6 | **2026-11-15 drill failure — drill report sign-off incomplete.** The uploaded `recovery_drill_<ts>.json` artifact did not carry the §6.8 sign-off table (Actual / Pass-Fail / Owner columns blank), so the aggregate PASS/FAIL could not be audited from the artifact alone. Have the drill script emit the sign-off table into the JSON report and require the Incident Commander to fill it before upload. | §6.8 | Incident Commander | 2026-11-22 | (issue link) | Open |
 
 Retrospective-added rows are appended below the pre-identified rows, never
 above them, so the history of pre-identified gaps stays auditable.
@@ -724,10 +732,87 @@ of pre-identified gaps stays auditable. If the retrospective identifies
 additional gaps from the 2026-10-25 run, append them here in the same format
 with an owner and a due date before the issue is closed.
 
+#### 7.2.2 Follow-up risks — recovery drill 2026-11-01 (FAILED)
+
+The recovery drill run on **2026-11-01** failed during preflight, before any
+phase ran. The [workflow run](https://github.com/Rentars/Rentars/actions/runs/41294701720)
+log reports `Missing required env var: STAGING_API_URL` and
+`Missing required env var: ADMIN_JWT`, so no staging calls were made and no
+JSON report was produced. `ADMIN_JWT` is sourced from the
+`RECOVERY_DRILL_ADMIN_JWT` secret in
+[`.github/workflows/recovery-drill.yml`](../.github/workflows/recovery-drill.yml).
+
+| # | Risk / gap (from the 2026-11-01 drill report) | Source (step) | Owner (A) | Due date | Tracking link | Status |
+|---|---|---|---|---|---|---|
+| N1-1 | `STAGING_API_URL` is unavailable in the `staging` environment; the drill aborts before §6.2–§6.7 can run. | §6.1 | Infra Owner | 2026-11-10 | [#902](https://github.com/Rentars/Rentars/issues/902) | Open |
+| N1-2 | `ADMIN_JWT` (from secret `RECOVERY_DRILL_ADMIN_JWT`) is missing, so authenticated admin phases cannot run. | §6.1 | Infra Owner | 2026-11-10 | [#902](https://github.com/Rentars/Rentars/issues/902) | Open |
+| N1-3 | No workflow preflight check names the missing staging secrets before the drill starts, delaying diagnosis. | §6.1 | On-Call SRE | 2026-11-17 | [#902](https://github.com/Rentars/Rentars/issues/902) | Open |
+
+Every row has an owner and a due date. The Incident Commander verifies closure
+at the retrospective (§7) before issue #902 is closed.
+
+#### 7.2.3 Follow-up risks — recovery drill 2026-11-02 (FAILED)
+
+The recovery drill run on **2026-11-02** failed during preflight, before any
+phase ran. The [workflow run](https://github.com/Rentars/Rentars/actions/runs/41426269457)
+log reports `Missing required env var: STAGING_API_URL` and
+`Missing required env var: ADMIN_JWT`, so no staging calls were made and no
+JSON report was produced. `ADMIN_JWT` is sourced from the
+`RECOVERY_DRILL_ADMIN_JWT` secret in
+[`.github/workflows/recovery-drill.yml`](../.github/workflows/recovery-drill.yml).
+
+| # | Risk / gap (from the 2026-11-02 drill report) | Source (step) | Owner (A) | Due date | Tracking link | Status |
+|---|---|---|---|---|---|---|
+| N2-1 | `STAGING_API_URL` is unavailable in the `staging` environment; the drill aborts before §6.2–§6.7 can run. | §6.1 | Infra Owner | 2026-11-11 | [#903](https://github.com/Rentars/Rentars/issues/903) | Open |
+| N2-2 | `ADMIN_JWT` (from secret `RECOVERY_DRILL_ADMIN_JWT`) is missing, so authenticated admin phases cannot run. | §6.1 | Infra Owner | 2026-11-11 | [#903](https://github.com/Rentars/Rentars/issues/903) | Open |
+| N2-3 | No workflow preflight check names the missing staging secrets before the drill starts, delaying diagnosis. | §6.1 | On-Call SRE | 2026-11-18 | [#903](https://github.com/Rentars/Rentars/issues/903) | Open |
+
+Every row has an owner and a due date. The Incident Commander verifies closure
+at the retrospective (§7) before issue #903 is closed.
+
+#### 7.2.4 Follow-up risks — recovery drill 2026-11-03 (FAILED)
+
+The recovery drill run on **2026-11-03** failed during preflight, before any
+phase ran. The [workflow run](https://github.com/Rentars/Rentars/actions/runs/41616950480)
+log reports `Missing required env var: STAGING_API_URL` and
+`Missing required env var: ADMIN_JWT`, so no staging calls were made and no
+JSON report was produced. `ADMIN_JWT` is sourced from the
+`RECOVERY_DRILL_ADMIN_JWT` secret in
+[`.github/workflows/recovery-drill.yml`](../.github/workflows/recovery-drill.yml).
+
+| # | Risk / gap (from the 2026-11-03 drill report) | Source (step) | Owner (A) | Due date | Tracking link | Status |
+|---|---|---|---|---|---|---|
+| N3-1 | `STAGING_API_URL` is unavailable in the `staging` environment; the drill aborts before §6.2–§6.7 can run. | §6.1 | Infra Owner | 2026-11-12 | [#904](https://github.com/Rentars/Rentars/issues/904) | Open |
+| N3-2 | `ADMIN_JWT` (from secret `RECOVERY_DRILL_ADMIN_JWT`) is missing, so authenticated admin phases cannot run. | §6.1 | Infra Owner | 2026-11-12 | [#904](https://github.com/Rentars/Rentars/issues/904) | Open |
+| N3-3 | No workflow preflight check names the missing staging secrets before the drill starts, delaying diagnosis. | §6.1 | On-Call SRE | 2026-11-19 | [#904](https://github.com/Rentars/Rentars/issues/904) | Open |
+
+Every row has an owner and a due date. The Incident Commander verifies closure
+at the retrospective (§7) before issue #904 is closed.
+
+#### 7.2.5 Follow-up risks — recovery drill 2026-11-04 (FAILED)
+
+The recovery drill run on **2026-11-04** failed during preflight, before any
+phase ran. The [workflow run](https://github.com/Rentars/Rentars/actions/runs/41811187115)
+log reports `Missing required env var: STAGING_API_URL` and
+`Missing required env var: ADMIN_JWT`, so no staging calls were made and no
+JSON report was produced. `ADMIN_JWT` is sourced from the
+`RECOVERY_DRILL_ADMIN_JWT` secret in
+[`.github/workflows/recovery-drill.yml`](../.github/workflows/recovery-drill.yml).
+
+| # | Risk / gap (from the 2026-11-04 drill report) | Source (step) | Owner (A) | Due date | Tracking link | Status |
+|---|---|---|---|---|---|---|
+| N4-1 | `STAGING_API_URL` is unavailable in the `staging` environment; the drill aborts before §6.2–§6.7 can run. | §6.1 | Infra Owner | 2026-11-13 | [#905](https://github.com/Rentars/Rentars/issues/905) | Open |
+| N4-2 | `ADMIN_JWT` (from secret `RECOVERY_DRILL_ADMIN_JWT`) is missing, so authenticated admin phases cannot run. | §6.1 | Infra Owner | 2026-11-13 | [#905](https://github.com/Rentars/Rentars/issues/905) | Open |
+| N4-3 | No workflow preflight check names the missing staging secrets before the drill starts, delaying diagnosis. | §6.1 | On-Call SRE | 2026-11-20 | [#905](https://github.com/Rentars/Rentars/issues/905) | Open |
+
+Every row has an owner and a due date. The Incident Commander verifies closure
+at the retrospective (§7) before issue #905 is closed.
+
 ### 7.3 Drill history
 
 | Date | Env | Commander | Result | Aggregate reads | Lookup+recon | Report |
 |---|---|---|---|---|---|---|
+| 2026-11-15 | staging | @handle | FAIL | __ min | __ min | `recovery_drill_*.json` (see #910) |
 | YYYY-MM-DD | staging | @handle | PASS/FAIL | __ min | __ min | `recovery_drill_*.json` |
 
 After each drill, append a row. The history is the evidence reviewed at launch

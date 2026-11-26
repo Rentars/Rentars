@@ -207,15 +207,23 @@ jobs:
           REDIS_URL: ""
         run: bun run test:contract
 
-  # ─── Job 4: RLS integration tests ───────────────────────────────────────────
+  # ─── Job 4: RLS integration tests (REQUIRED GATE) ───────────────────────────
   # Applies all migrations to a temporary PostgreSQL database and then runs RLS
-  # policy tests. Migration failures and RLS failures both block this job.
+  # policy tests. This job is a required CI gate: it CANNOT pass when the
+  # database, migrations, or the Supabase auth stack fail to start, and it
+  # CANNOT pass when any RLS policy assertion fails.
   #
-  # Failure modes are separated:
-  #   - PostgreSQL service unreachable → infrastructure failure (not a SQL error)
-  #   - SQL error during migration      → migration failure (blocks the build)
-  #   - Supabase auth stack failure     → infrastructure failure
-  #   - RLS assertion failure           → test failure (blocks the build)
+  # There is deliberately NO `continue-on-error`, NO `|| true`, and NO
+  # `|| echo 0` around the setup, migration, or test steps. Every failure mode
+  # exits non-zero and blocks the merge.
+  #
+  # Failure modes are explicitly separated in the job summary so a setup
+  # failure is never confused with a successfully executed policy suite:
+  #   - PostgreSQL service unreachable → SETUP FAILURE (not a SQL error)
+  #   - SQL error during migration      → MIGRATION FAILURE (blocks the build)
+  #   - Supabase auth stack failure     → SETUP FAILURE
+  #   - RLS assertion failure           → POLICY FAILURE (blocks the build)
+  #   - All steps pass                  → POLICY SUITE PASSED
   #
   # Local reproduction:
   #   docker run -e POSTGRES_PASSWORD=postgres -p 5432:5432 supabase/postgres:15.6.1.117
@@ -251,13 +259,21 @@ jobs:
 
       - name: Install Supabase CLI
         run: |
+          set -euo pipefail
           wget -qO- https://github.com/supabase/cli/releases/latest/download/supabase_linux_amd64.tar.gz | tar -xzf -
           sudo mv supabase /usr/local/bin/
+          supabase --version
 
-      - name: Verify PostgreSQL infrastructure
+      - name: Verify PostgreSQL infrastructure (bounded readiness wait)
         run: |
-          if ! PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -c '\q' 2>/dev/null; then
-            echo "::error::PostgreSQL service is unreachable — infrastructure failure, not a migration error."
+          set -euo pipefail
+          echo "RLS_STAGE=setup" >> "$GITHUB_ENV"
+          # Bounded wait: the service container health check should already have
+          # passed, but poll explicitly so a slow start fails as a SETUP FAILURE
+          # with a clear message rather than a confusing migration error.
+          if ! timeout 60 bash -c \
+            'until PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -d postgres -c "\q" >/dev/null 2>&1; do sleep 2; done'; then
+            echo "::error::SETUP FAILURE: PostgreSQL service is unreachable within 60 s — infrastructure failure, not a migration error."
             exit 1
           fi
           echo "PostgreSQL service is healthy."
@@ -266,11 +282,15 @@ jobs:
         working-directory: apps/backend/database
         run: |
           set -euo pipefail
+          echo "RLS_STAGE=migrations" >> "$GITHUB_ENV"
           # -v ON_ERROR_STOP=1 causes psql to abort immediately on any SQL error,
           # making a malformed migration fail this job with a non-zero exit code.
-          PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -d postgres \
+          if ! PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -d postgres \
             -v ON_ERROR_STOP=1 \
-            -f setup.sql
+            -f setup.sql; then
+            echo "::error::MIGRATION FAILURE: setup.sql failed to apply — see the psql output above."
+            exit 1
+          fi
           MIGRATION_COUNT=$(grep -c '^\\i' setup.sql)
           MIGRATION_FILES_TOTAL=$(find migrations -name '*.sql' | wc -l)
           echo "MIGRATION_COUNT=$MIGRATION_COUNT" >> "$GITHUB_ENV"
@@ -280,7 +300,7 @@ jobs:
           # This catches the case where new migration files were committed but
           # not added to setup.sql (which would allow CI to pass with a broken schema).
           if [[ "$MIGRATION_COUNT" -ne "$MIGRATION_FILES_TOTAL" ]]; then
-            echo "::error::setup.sql references $MIGRATION_COUNT migration files but migrations/ contains $MIGRATION_FILES_TOTAL. Add the missing files to setup.sql."
+            echo "::error::MIGRATION FAILURE: setup.sql references $MIGRATION_COUNT migration files but migrations/ contains $MIGRATION_FILES_TOTAL. Add the missing files to setup.sql."
             exit 1
           fi
 
@@ -288,19 +308,21 @@ jobs:
         working-directory: apps/backend
         run: bun install --frozen-lockfile
 
-      - name: Start Supabase stack for RLS auth layer
+      - name: Start Supabase stack for RLS auth layer (bounded readiness wait)
         working-directory: apps/backend
         run: |
           set -euo pipefail
-          supabase start --workdir . 2>&1 | tee /tmp/supabase_start.log || {
-            echo "::error::Supabase stack failed to start — infrastructure failure. Review the log above."
+          echo "RLS_STAGE=supabase-start" >> "$GITHUB_ENV"
+          if ! supabase start --workdir . 2>&1 | tee /tmp/supabase_start.log; then
+            echo "::error::SETUP FAILURE: Supabase stack failed to start — infrastructure failure. Review the log above."
             exit 1
-          }
-          timeout 120 bash -c \
-            'until curl -sf http://localhost:54321/rest/v1/ > /dev/null 2>&1; do sleep 2; done' || {
-            echo "::error::Supabase API did not become ready within 120 s — infrastructure timeout."
+          fi
+          if ! timeout 180 bash -c \
+            'until curl -sf http://localhost:54321/rest/v1/ > /dev/null 2>&1; do sleep 2; done'; then
+            echo "::error::SETUP FAILURE: Supabase API did not become ready within 180 s — infrastructure timeout."
             exit 1
-          }
+          fi
+          echo "Supabase auth stack is ready."
 
       - name: Run RLS tests
         working-directory: apps/backend
@@ -314,9 +336,16 @@ jobs:
           STELLAR_NETWORK: testnet
         run: |
           set -euo pipefail
-          bun run test:rls 2>&1 | tee /tmp/rls_output.txt
-          RLS_PASS=$(grep -cE 'pass|✓|\bok\b' /tmp/rls_output.txt || echo 0)
+          echo "RLS_STAGE=tests" >> "$GITHUB_ENV"
+          # No `|| true` and no `|| echo 0`: a non-zero exit from the test runner
+          # fails this step and therefore the whole required job.
+          if ! bun run test:rls 2>&1 | tee /tmp/rls_output.txt; then
+            echo "::error::POLICY FAILURE: RLS policy suite failed — a policy assertion was violated. See the output above."
+            exit 1
+          fi
+          RLS_PASS=$(grep -cE 'pass|✓|\bok\b' /tmp/rls_output.txt)
           echo "RLS_PASS=$RLS_PASS" >> "$GITHUB_ENV"
+          echo "RLS_STAGE=passed" >> "$GITHUB_ENV"
 
       - name: Emit job summary
         if: always()
@@ -324,13 +353,34 @@ jobs:
           {
             echo "## RLS & Migration Summary"
             echo ""
+            case "${RLS_STAGE:-unknown}" in
+              passed)
+                echo "**Result: POLICY SUITE PASSED** — migrations applied and all RLS policy assertions executed successfully."
+                ;;
+              tests)
+                echo "**Result: POLICY FAILURE** — the RLS policy suite ran but at least one assertion failed. This is a real authorization regression, not a setup problem."
+                ;;
+              supabase-start)
+                echo "**Result: SETUP FAILURE** — the Supabase auth stack did not start. The policy suite was NOT executed."
+                ;;
+              migrations)
+                echo "**Result: MIGRATION FAILURE** — migrations did not apply cleanly. The policy suite was NOT executed."
+                ;;
+              setup)
+                echo "**Result: SETUP FAILURE** — the PostgreSQL service was unreachable. The policy suite was NOT executed."
+                ;;
+              *)
+                echo "**Result: SETUP FAILURE** — the job did not reach the policy suite. See the failing step above."
+                ;;
+            esac
+            echo ""
             echo "| Metric | Value |"
             echo "|--------|-------|"
             echo "| Migration includes in setup.sql | ${MIGRATION_COUNT:-unknown} |"
             echo "| Total migration files in migrations/ | ${MIGRATION_FILES_TOTAL:-unknown} |"
             echo "| Authoritative migration command | \`psql … -v ON_ERROR_STOP=1 -f setup.sql\` |"
             echo "| Authoritative migration directory | \`apps/backend/database/migrations\` |"
-            echo "| RLS tests passing | ${RLS_PASS:-unknown} |"
+            echo "| RLS tests passing | ${RLS_PASS:-not executed} |"
             echo ""
             echo "**Local reproduction (same sequence as CI):**"
             echo "\`\`\`bash"
@@ -345,6 +395,39 @@ jobs:
             echo "cd apps/backend && supabase start && bun run test:rls"
             echo "\`\`\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ─── Job 4b: Optional local-stack diagnostics (NON-BLOCKING) ────────────────
+  # Best-effort diagnostics only. This job is intentionally allowed to fail and
+  # is NOT a required check. It must never be used to prove RLS coverage — the
+  # required gate is `rls-tests` above. Its sole purpose is to surface extra
+  # environment detail (versions, container state, logs) when debugging.
+  rls-diagnostics:
+    name: RLS Diagnostics (optional, non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.1.38'
+
+      - name: Report tool versions
+        run: |
+          node --version || true
+          bun --version || true
+          docker --version || true
+          psql --version || true
+
+      - name: Report Supabase config
+        run: |
+          ls -la apps/backend/supabase 2>/dev/null || true
+          cat apps/backend/supabase/config.toml 2>/dev/null || true
+
+      - name: Report migration inventory
+        run: |
+          find apps/backend/database/migrations -name '*.sql' | sort || true
 
   # ─── Job 5: Soroban contract builds and tests ───────────────────────────────
   # Compiles all Rust/Soroban contracts in release mode, runs unit tests, and
@@ -558,7 +641,64 @@ jobs:
             apps/web/test-results/
           retention-days: 14
 
-  # ─── Job 7b: Search rollout upgrade test (#747) ─────────────────────────────
+  # ─── Job 7b: Accessibility audit ────────────────────────────────────────────
+  # Runs axe-core (@axe-core/playwright) against live-rendered pages for auth,
+  # search, property detail, booking, and dashboard flows. Fails on new
+  # critical/serious violations. Known exceptions are scoped per-element in
+  # e2e/accessibility.spec.ts with a dated review comment.
+  #
+  # Local reproduction:
+  #   cd apps/web
+  #   yarn build && CI=true PORT=3001 yarn playwright test e2e/accessibility.spec.ts --project=chromium
+  accessibility-audit:
+    name: Accessibility Audit (axe)
+    runs-on: ubuntu-latest
+    needs: frontend-checks
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.18.0'
+          cache: yarn
+          cache-dependency-path: apps/web/yarn.lock
+
+      - name: Install web dependencies
+        working-directory: apps/web
+        run: yarn install --frozen-lockfile
+
+      - name: Install Playwright Chromium
+        working-directory: apps/web
+        run: yarn playwright install --with-deps chromium
+
+      - name: Build Next.js app
+        working-directory: apps/web
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:3000
+          NEXT_PUBLIC_SUPABASE_URL: https://mock.supabase.co
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: mock-anon-key
+        run: yarn build
+
+      - name: Run accessibility audit
+        working-directory: apps/web
+        env:
+          CI: true
+          PLAYWRIGHT_BASE_URL: http://localhost:3001
+          NEXT_PUBLIC_API_URL: http://localhost:3000
+          PORT: "3001"
+        run: yarn playwright test e2e/accessibility.spec.ts --project=chromium
+
+      - name: Upload accessibility report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: accessibility-report
+          path: apps/web/playwright-report/
+          retention-days: 14
+
+  # ─── Job 7c: Search rollout upgrade test (#747) ──────────────────────────────
   # Applies migration 00067 to a database that already holds listings, backfills in
   # batches, and asserts search and nearby search work and that the migration is
   # idempotent. Self-contained, so it does not depend on setup.sql.
@@ -616,6 +756,8 @@ jobs:
             apps/backend/README.md
             apps/backend/database/README.md
             apps/backend/database/MIGRATIONS_NAMING.md
+            apps/backend/tests/TEST_ISOLATION.md
+            apps/backend/tests/fixtures/README.md
           fail: true
 
   # ─── Job 9: Backup restore drill (#736) ─────────────────────────────────────

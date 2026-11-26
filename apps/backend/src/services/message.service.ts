@@ -18,6 +18,7 @@ import { checkAndSanitizeLinks } from '../utils/linkSafety.js';
 import { createNotification, shouldSendInApp } from './notification.service.js';
 import { isBlocked } from './blockList.service.js';
 import { createAbuseReport } from './blockList.service.js';
+import { isUserSuspended } from './userModeration.service.js';
 import type { ServiceResponse } from './index.js';
 
 // ─── Constants ─────────────────────────────────────────────────────────────────
@@ -153,6 +154,19 @@ export async function sendMessage(
     return { success: false, error: 'You cannot message yourself' };
   }
 
+  // ── 0. Suspension check ───────────────────────────────────────────────────────
+  // Suspended accounts cannot initiate or reply to messages. Read access is
+  // intentionally preserved (see getConversation) so disputes can still be
+  // reviewed by moderators and the affected parties. Restoration re-enables
+  // sending only after the moderation service clears the suspension.
+  const senderSuspended = await isUserSuspended(senderId);
+  if (senderSuspended) {
+    return {
+      success: false,
+      error: 'Your account is suspended and cannot send messages. Contact support for review.',
+    };
+  }
+
   // ── 1. Block check ────────────────────────────────────────────────────────────
   const blocked = await isBlocked(senderId, resolvedRecipientId);
   if (blocked) {
@@ -245,6 +259,10 @@ export async function sendMessage(
 /**
  * List the conversation between the caller and another user, scoped to a
  * single property. Both participants may call this for their own thread.
+ *
+ * Read access is deliberately NOT gated on suspension status: suspended users
+ * (and moderators reviewing a dispute) must still be able to read existing
+ * threads. Only sending is blocked while suspended.
  */
 export async function getConversation(
   userId: string,

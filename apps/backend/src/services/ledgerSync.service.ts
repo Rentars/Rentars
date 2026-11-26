@@ -41,6 +41,7 @@
 
 import { supabase } from '@/config/supabase.js';
 import type { ServiceResponse } from './index.js';
+import { metrics } from '@/observability/metrics.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -144,6 +145,34 @@ export interface LagReport {
     latest_on_chain: bigint;
     lag: bigint;
 }
+
+/**
+ * A single ledger event as delivered by the chain indexer.  `sequence` is a
+ * monotonically increasing, gap-free integer assigned by the indexer; it is
+ * the stable cursor used for keyset pagination.
+ */
+export interface LedgerEvent {
+    sequence: bigint;
+    event_key: string;
+    /** Raw event payload; escrow transitions must be derived from this only. */
+    payload: Record<string, unknown>;
+}
+
+export interface PageResult {
+    /** Events in ascending `sequence` order, at most `pageSize` entries. */
+    events: LedgerEvent[];
+    /** Cursor to persist after this page is fully projected. */
+    nextCursor: string;
+    /** True when no further events exist beyond this page. */
+    done: boolean;
+}
+
+/**
+ * Hard upper bound on events processed per page.  Kept small so a single
+ * worker tick stays well within Soroban/RPC resource limits and so a crash
+ * mid-page only ever replays a bounded amount of work.
+ */
+export const MAX_PAGE_SIZE = 50;
 
 // ─── Event Inbox ──────────────────────────────────────────────────────────────
 
@@ -389,6 +418,9 @@ export async function loadCursor(
  */
 export function measureLag(cursorKey: string, cursorValue: bigint, latestOnChain: bigint): LagReport {
     const lag = latestOnChain > cursorValue ? latestOnChain - cursorValue : 0n;
+    // Expose lag as a gauge.  `cursorKey` is a bounded worker identifier
+    // (e.g. "booking_sync"), never a user/booking/transaction ID.
+    metrics.ledgerSyncLagSeconds.set({ worker: cursorKey }, Number(lag));
     return { cursor_key: cursorKey, cursor_value: cursorValue, latest_on_chain: latestOnChain, lag };
 }
 
@@ -462,6 +494,136 @@ export async function retryDeadLetterEvent(
     return { success: true };
 }
 
+// ─── Bounded Page Processing ──────────────────────────────────────────────────
+
+/**
+ * Fetch one bounded page of ledger events strictly after `afterSequence`.
+ *
+ * Keyset (cursor) pagination — never offset-based — so concurrent inserts
+ * cannot cause duplicates or gaps.  `pageSize` is clamped to `MAX_PAGE_SIZE`.
+ */
+export async function fetchEventPage(
+    afterSequence: bigint,
+    pageSize: number = MAX_PAGE_SIZE,
+): Promise<ServiceResponse<PageResult>> {
+    const limit = Math.max(1, Math.min(pageSize, MAX_PAGE_SIZE));
+
+    const { data, error } = await supabase
+        .from('ledger_events')
+        .select('sequence, event_key, payload')
+        .gt('sequence', afterSequence.toString())
+        .order('sequence', { ascending: true })
+        .limit(limit);
+
+    if (error) {
+        return { success: false, error: `Failed to fetch event page: ${error.message}` };
+    }
+
+    const events: LedgerEvent[] = (data ?? []).map((row) => ({
+        sequence: BigInt(row.sequence as string),
+        event_key: row.event_key as string,
+        payload: (row.payload ?? {}) as Record<string, unknown>,
+    }));
+
+    const last = events.length > 0 ? events[events.length - 1].sequence : afterSequence;
+
+    return {
+        success: true,
+        data: {
+            events,
+            nextCursor: last.toString(),
+            done: events.length < limit,
+        },
+    };
+}
+
+/**
+ * Process ledger events in bounded pages, resuming from the persisted cursor.
+ *
+ * Guarantees:
+ *  - Each event is applied at most once (delegated to `processEventOnce`).
+ *  - The cursor only advances after a page is fully projected, so a crash
+ *    mid-page replays that page — duplicates are skipped by the inbox.
+ *  - Escrow transitions are only applied through `project`, which callers must
+ *    derive from verified ledger payloads (never from off-chain callbacks).
+ *
+ * @param cursorKey  - Worker identity, e.g. `"escrow_sync"`.
+ * @param project    - Applies domain side effects for one verified event.
+ * @param options.maxPages - Stop after this many pages (bounds a single tick).
+ */
+export async function processEventPages(
+    cursorKey: string,
+    project: (event: LedgerEvent) => Promise<void>,
+    {
+        maxPages = 10,
+        pageSize = MAX_PAGE_SIZE,
+        maxAttempts = 5,
+    }: { maxPages?: number; pageSize?: number; maxAttempts?: number } = {},
+): Promise<ServiceResponse<{ processed: number; deadLettered: number; cursor: string; done: boolean }>> {
+    const cursorResult = await loadCursor(cursorKey);
+    if (!cursorResult.success) {
+        return { success: false, error: cursorResult.error };
+    }
+
+    let cursor = BigInt(cursorResult.data ?? '0');
+    let processed = 0;
+    let deadLettered = 0;
+    let done = false;
+
+    for (let page = 0; page < maxPages; page++) {
+        const pageResult = await fetchEventPage(cursor, pageSize);
+        if (!pageResult.success) {
+            return { success: false, error: pageResult.error };
+        }
+
+        const { events, nextCursor, done: pageDone } = pageResult.data;
+        done = pageDone;
+
+        if (events.length === 0) {
+            break;
+        }
+
+        for (const event of events) {
+            const outcome = await processEventOnce(
+                { eventKey: event.event_key, workerId: cursorKey },
+                () => project(event),
+                { maxAttempts },
+            );
+
+            if (!outcome.success) {
+                // Stop the page; cursor is NOT advanced past this event so the
+                // next tick retries it rather than silently skipping it.
+                return {
+                    success: false,
+                    error: `Failed processing ${event.event_key}: ${outcome.error}`,
+                };
+            }
+
+            if (outcome.data.outcome === 'dead_letter') {
+                deadLettered++;
+            } else if (outcome.data.outcome === 'projected') {
+                processed++;
+            }
+        }
+
+        // Persist cursor only after the whole page is projected.
+        const saveResult = await saveCursor(cursorKey, nextCursor);
+        if (!saveResult.success) {
+            return { success: false, error: saveResult.error };
+        }
+        cursor = BigInt(nextCursor);
+
+        if (pageDone) {
+            break;
+        }
+    }
+
+    return {
+        success: true,
+        data: { processed, deadLettered, cursor: cursor.toString(), done },
+    };
+}
+
 // ─── Idempotent Projection Helper ─────────────────────────────────────────────
 
 /**
@@ -504,15 +666,18 @@ export async function processEventOnce(
         operationId,
     });
     if (!inboxResult.success) {
+        finish('failed');
         return { success: false, error: inboxResult.error };
     }
 
     // 2. Check if already projected (covers restarts that skip the inbox insert)
     const projectedResult = await isEventProjected(eventKey);
     if (!projectedResult.success) {
+        finish('failed');
         return { success: false, error: projectedResult.error };
     }
     if (projectedResult.data) {
+        finish('duplicate');
         return { success: true, data: { outcome: 'skipped' } };
     }
 
@@ -543,12 +708,14 @@ export async function processEventOnce(
             );
         }
 
+        finish('projected');
         return { success: true, data: { outcome: 'projected' } };
     } catch (err) {
         const message = (err as Error).message;
         const failureResult = await recordEventAttemptFailure(eventKey, message);
 
         if (!failureResult.success) {
+            finish('failed');
             return { success: false, error: failureResult.error };
         }
 
@@ -567,4 +734,197 @@ export async function processEventOnce(
             error: `Projection failed (attempt ${failureResult.data.attempts})${formatCorrelationContext(context)}: ${message}`,
         };
     }
+}
+
+// ─── Payment Reconciliation ───────────────────────────────────────────────────
+
+/**
+ * A single immutable payment event as stored in the payment ledger.
+ *
+ * Events are append-only: each attempt or state transition produces a new
+ * record rather than mutating a prior one.  The current payment status is
+ * *derived* from the ordered set of events, never stored as mutable state.
+ */
+export interface PaymentLedgerEvent {
+    /** Globally unique event id (idempotency key for the ledger append). */
+    event_id: string;
+    /** Booking this event belongs to. */
+    booking_id: string;
+    /** Quote the payment was created against, when known. */
+    quote_id: string | null;
+    /** Payment provider (e.g. `stripe`, `circle`). */
+    provider: string;
+    /** Network for on-chain payments (e.g. `ethereum`, `stellar`); null for fiat. */
+    network: string | null;
+    /** Amount in minor units as a decimal string — exact currency precision. */
+    amount: string;
+    /** ISO-4217 currency code (e.g. `USD`, `USDC`). */
+    currency: string;
+    /** Provider-side reference (charge id, tx hash, etc.). */
+    external_reference: string | null;
+    /** Correlation id propagated across every external call. */
+    correlation_id: string | null;
+    /** Event kind: attempt, authorization, capture, failure, refund, etc. */
+    event_type: PaymentEventType;
+    /** Monotonically increasing provider sequence, when available. */
+    provider_sequence: string | null;
+    /** When the provider reported the event (may arrive out of order). */
+    occurred_at: string;
+}
+
+export type PaymentEventType =
+    | 'attempt'
+    | 'authorized'
+    | 'captured'
+    | 'failed'
+    | 'refunded'
+    | 'cancelled';
+
+export type DerivedPaymentStatus =
+    | 'pending'
+    | 'authorized'
+    | 'captured'
+    | 'failed'
+    | 'refunded'
+    | 'cancelled';
+
+/** Terminal event types that must not be overridden by later, stale events. */
+const TERMINAL_EVENT_TYPES: ReadonlySet<PaymentEventType> = new Set([
+    'captured',
+    'failed',
+    'refunded',
+    'cancelled',
+]);
+
+/**
+ * Derive the current payment status from the stored event history.
+ *
+ * The derivation is deterministic and order-independent: events are sorted by
+ * `provider_sequence` (falling back to `occurred_at`, then `event_id`) so that
+ * out-of-order delivery yields the same result as in-order delivery.  Once a
+ * terminal event is reached, later non-terminal events cannot regress it.
+ *
+ * This is a pure function — the same event set always produces the same status,
+ * which is what makes the derived status reproducible from stored events.
+ */
+export function derivePaymentStatus(events: readonly PaymentLedgerEvent[]): DerivedPaymentStatus {
+    if (events.length === 0) return 'pending';
+
+    const ordered = [...events].sort(comparePaymentEvents);
+
+    let status: DerivedPaymentStatus = 'pending';
+    for (const event of ordered) {
+        switch (event.event_type) {
+            case 'attempt':
+                if (status === 'pending') status = 'pending';
+                break;
+            case 'authorized':
+                if (status === 'pending') status = 'authorized';
+                break;
+            case 'captured':
+                status = 'captured';
+                break;
+            case 'failed':
+                if (status !== 'captured' && status !== 'refunded') status = 'failed';
+                break;
+            case 'refunded':
+                if (status === 'captured') status = 'refunded';
+                break;
+            case 'cancelled':
+                if (status === 'pending' || status === 'authorized') status = 'cancelled';
+                break;
+        }
+    }
+
+    return status;
+}
+
+/**
+ * Total captured amount (minor units) derived from the event history.
+ *
+ * Duplicate `captured` events sharing the same `event_id` are collapsed so a
+ * redelivered callback cannot double-count the financial effect.
+ */
+export function deriveCapturedAmount(events: readonly PaymentLedgerEvent[]): bigint {
+    const seen = new Set<string>();
+    let total = 0n;
+    for (const event of events) {
+        if (event.event_type !== 'captured') continue;
+        if (seen.has(event.event_id)) continue;
+        seen.add(event.event_id);
+        total += BigInt(event.amount);
+    }
+    return total;
+}
+
+function comparePaymentEvents(a: PaymentLedgerEvent, b: PaymentLedgerEvent): number {
+    if (a.provider_sequence !== null && b.provider_sequence !== null) {
+        const sa = BigInt(a.provider_sequence);
+        const sb = BigInt(b.provider_sequence);
+        if (sa !== sb) return sa < sb ? -1 : 1;
+    }
+    if (a.occurred_at !== b.occurred_at) {
+        return a.occurred_at < b.occurred_at ? -1 : 1;
+    }
+    return a.event_id < b.event_id ? -1 : a.event_id > b.event_id ? 1 : 0;
+}
+
+export interface ReconciliationReport {
+    booking_id: string;
+    derived_status: DerivedPaymentStatus;
+    captured_amount: string;
+    /** Event ids that were received more than once (duplicates collapsed). */
+    duplicate_event_ids: string[];
+    /** True when the derived status is terminal and no further action is needed. */
+    settled: boolean;
+    /** True when no provider callback has been observed for this booking. */
+    missing_provider_callback: boolean;
+}
+
+/**
+ * Reconcile a booking's stored payment events into a reproducible report.
+ *
+ * Handles the three failure modes support cares about:
+ *  - **duplicate** callbacks: collapsed by `event_id`, no double financial effect;
+ *  - **out-of-order** callbacks: ordering is normalized before derivation;
+ *  - **missing** provider callbacks: surfaced via `missing_provider_callback`.
+ */
+export function reconcilePaymentEvents(
+    bookingId: string,
+    events: readonly PaymentLedgerEvent[],
+): ReconciliationReport {
+    const counts = new Map<string, number>();
+    for (const event of events) {
+        counts.set(event.event_id, (counts.get(event.event_id) ?? 0) + 1);
+    }
+    const duplicate_event_ids = [...counts.entries()]
+        .filter(([, count]) => count > 1)
+        .map(([id]) => id)
+        .sort();
+
+    const derived_status = derivePaymentStatus(events);
+    const captured_amount = deriveCapturedAmount(events).toString();
+
+    const hasProviderCallback = events.some(
+        (e) => e.external_reference !== null && e.event_type !== 'attempt',
+    );
+
+    return {
+        booking_id: bookingId,
+        derived_status,
+        captured_amount,
+        duplicate_event_ids,
+        settled: TERMINAL_EVENT_TYPES.has(
+            derived_status === 'captured'
+                ? 'captured'
+                : derived_status === 'failed'
+                    ? 'failed'
+                    : derived_status === 'refunded'
+                        ? 'refunded'
+                        : derived_status === 'cancelled'
+                            ? 'cancelled'
+                            : 'attempt',
+        ),
+        missing_provider_callback: !hasProviderCallback,
+    };
 }

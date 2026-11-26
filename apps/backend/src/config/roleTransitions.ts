@@ -23,6 +23,32 @@
  *
  * The DB `users_role_check` constraint (migration 00057) is the storage-level
  * allow-list. `both` from the web type is not stored by the backend.
+ *
+ * ---------------------------------------------------------------------------
+ * Account suspension / restoration policy (#978)
+ * ---------------------------------------------------------------------------
+ *
+ * Suspension is a reversible status transition, not a deletion. The effects of
+ * `users.status = 'suspended'` are:
+ *
+ *   - Login: existing sessions are revoked and new logins are refused. The
+ *     account cannot authenticate until it is restored.
+ *   - Bookings: no new bookings may be created. Bookings that are already
+ *     `active` are NOT cancelled automatically; they must be resolved by an
+ *     operator (completed, cancelled, or refunded) before suspension is allowed,
+ *     so guests and hosts are never stranded mid-stay.
+ *   - Messages: the account can no longer send messages; existing threads are
+ *     retained for dispute and audit purposes.
+ *   - Payments: payouts to the account are paused. Funds already owed are held,
+ *     not forfeited, and are released only after restoration clears policy.
+ *
+ * Restoration re-enables login and messaging and resumes payouts, but it must
+ * never restore access to data or funds improperly. Restoration is blocked
+ * while the account is party to an active dispute, so held funds cannot be
+ * released before the dispute is resolved.
+ *
+ * Both decisions are pure functions: no I/O, no environment reads. Persistence
+ * and auditing live in the user moderation service.
  */
 
 export const ASSIGNABLE_ROLES = [
@@ -51,6 +77,144 @@ export type RoleTransitionDenial =
   | 'NO_CHANGE'
   | 'PRIVILEGED_TO_PRIVILEGED'
   | 'LAST_ADMIN';
+
+/** Account statuses relevant to moderation. */
+export const MODERATABLE_STATUSES = ['active', 'suspended'] as const;
+
+export type ModeratableStatus = (typeof MODERATABLE_STATUSES)[number];
+
+export function isModeratableStatus(value: unknown): value is ModeratableStatus {
+  return typeof value === 'string' && (MODERATABLE_STATUSES as readonly string[]).includes(value);
+}
+
+export type SuspensionDenial =
+  | 'ACTOR_NOT_ADMIN'
+  | 'SELF_SUSPENSION'
+  | 'UNKNOWN_STATUS'
+  | 'ALREADY_SUSPENDED'
+  | 'ACTIVE_BOOKINGS'
+  | 'REASON_REQUIRED';
+
+export type RestorationDenial =
+  | 'ACTOR_NOT_ADMIN'
+  | 'SELF_RESTORATION'
+  | 'UNKNOWN_STATUS'
+  | 'NOT_SUSPENDED'
+  | 'ACTIVE_DISPUTES'
+  | 'REASON_REQUIRED';
+
+export type ModerationDecision<Denial extends string> =
+  | { allowed: true }
+  | { allowed: false; code: Denial; message: string };
+
+export interface SuspensionInput {
+  actorRole: string | null | undefined;
+  actorId: string;
+  targetId: string;
+  /** Current `users.status` of the target. */
+  targetStatus: string | null | undefined;
+  /** Number of bookings currently in an `active` state for the target. */
+  activeBookingCount: number;
+  /** Operator-supplied reason; must be non-blank. */
+  reason: string | null | undefined;
+}
+
+export interface RestorationInput {
+  actorRole: string | null | undefined;
+  actorId: string;
+  targetId: string;
+  /** Current `users.status` of the target. */
+  targetStatus: string | null | undefined;
+  /** Number of disputes currently open involving the target. */
+  activeDisputeCount: number;
+  /** Operator-supplied reason; must be non-blank. */
+  reason: string | null | undefined;
+}
+
+function hasReason(reason: string | null | undefined): boolean {
+  return typeof reason === 'string' && reason.trim().length > 0;
+}
+
+/**
+ * Decide whether the target account may be suspended.
+ * Pure function: no I/O, no environment reads.
+ */
+export function evaluateSuspension(input: SuspensionInput): ModerationDecision<SuspensionDenial> {
+  if (input.actorRole !== 'admin') {
+    return {
+      allowed: false,
+      code: 'ACTOR_NOT_ADMIN',
+      message: 'Only administrators can suspend accounts.',
+    };
+  }
+  if (input.actorId === input.targetId) {
+    return {
+      allowed: false,
+      code: 'SELF_SUSPENSION',
+      message: 'You cannot suspend your own account.',
+    };
+  }
+  if (!isModeratableStatus(input.targetStatus)) {
+    return { allowed: false, code: 'UNKNOWN_STATUS', message: 'Unknown account status.' };
+  }
+  if (input.targetStatus === 'suspended') {
+    return { allowed: false, code: 'ALREADY_SUSPENDED', message: 'Account is already suspended.' };
+  }
+  if (input.activeBookingCount > 0) {
+    return {
+      allowed: false,
+      code: 'ACTIVE_BOOKINGS',
+      message:
+        'This account has active bookings. Resolve or cancel them before suspending the account.',
+    };
+  }
+  if (!hasReason(input.reason)) {
+    return { allowed: false, code: 'REASON_REQUIRED', message: 'A reason is required.' };
+  }
+  return { allowed: true };
+}
+
+/**
+ * Decide whether the target account may be restored from suspension.
+ * Restoration must not release held funds or data while a dispute is open.
+ * Pure function: no I/O, no environment reads.
+ */
+export function evaluateRestoration(
+  input: RestorationInput,
+): ModerationDecision<RestorationDenial> {
+  if (input.actorRole !== 'admin') {
+    return {
+      allowed: false,
+      code: 'ACTOR_NOT_ADMIN',
+      message: 'Only administrators can restore accounts.',
+    };
+  }
+  if (input.actorId === input.targetId) {
+    return {
+      allowed: false,
+      code: 'SELF_RESTORATION',
+      message: 'You cannot restore your own account.',
+    };
+  }
+  if (!isModeratableStatus(input.targetStatus)) {
+    return { allowed: false, code: 'UNKNOWN_STATUS', message: 'Unknown account status.' };
+  }
+  if (input.targetStatus !== 'suspended') {
+    return { allowed: false, code: 'NOT_SUSPENDED', message: 'Account is not suspended.' };
+  }
+  if (input.activeDisputeCount > 0) {
+    return {
+      allowed: false,
+      code: 'ACTIVE_DISPUTES',
+      message:
+        'This account is party to an active dispute. Resolve the dispute before restoring access.',
+    };
+  }
+  if (!hasReason(input.reason)) {
+    return { allowed: false, code: 'REASON_REQUIRED', message: 'A reason is required.' };
+  }
+  return { allowed: true };
+}
 
 export type RoleTransitionDecision =
   | { allowed: true }

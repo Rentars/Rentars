@@ -83,6 +83,15 @@ export const rejectReviewSchema = z.object({
   explanation: z.string().max(2000).optional(),
 });
 
+/** Retry an on-chain review submission after a failed/pending transaction. */
+export const retryOnChainSubmissionSchema = z.object({
+  reason: z
+    .string()
+    .trim()
+    .max(500, 'reason must be at most 500 characters')
+    .optional(),
+});
+
 /** Repair task resolution. */
 export const resolveRepairTaskSchema = z.object({
   resolutionNote: z

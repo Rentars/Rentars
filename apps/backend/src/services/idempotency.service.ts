@@ -87,8 +87,27 @@ export interface IdempotencyRecord {
  * `{a:2,b:1}` produce the same hash.
  */
 export function hashRequestBody(body: unknown): string {
-  const stable = JSON.stringify(body, Object.keys(body as object).sort());
-  return createHash('sha256').update(stable).digest('hex');
+  return createHash('sha256').update(stableSerialize(body)).digest('hex');
+}
+
+/**
+ * Deterministic JSON serialisation: object keys are sorted at every depth and
+ * array order is preserved. Nested key reordering must not turn a retry into a
+ * "different payload" conflict.
+ */
+function stableSerialize(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value) ?? 'null';
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(stableSerialize).join(',')}]`;
+  }
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, item]) => item !== undefined)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return `{${entries
+    .map(([key, item]) => `${JSON.stringify(key)}:${stableSerialize(item)}`)
+    .join(',')}}`;
 }
 
 /** Keys whose values must never be persisted or logged. */

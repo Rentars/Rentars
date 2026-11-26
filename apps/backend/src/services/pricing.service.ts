@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { supabase } from '@/config/supabase.js';
 import { toDay } from '@/utils/availabilityRange.js';
 import { RESERVING_BOOKING_STATUSES } from '@/utils/bookingStatus.js';
@@ -100,6 +100,10 @@ export interface PriceQuote {
   expires_at?: string;
   /** True when every requested night is bookable. */
   available: boolean;
+  /** Stable identifier for this server-generated quote. */
+  quote_id: string;
+  /** Human-readable line items, in the quote currency, covering every charged amount. */
+  line_items: Array<{ id: string; label: string; amount: number; currency: string }>;
   /** Signed binding of this total to its inputs; null when signing is not configured. */
   quote_token: string | null;
   /** Pricing rule version this quote was computed under (see PRICING_VERSION). */
@@ -717,9 +721,26 @@ export async function getPropertyQuote(
   // Create quote version hash from property state
   const quoteVersion = Buffer.from(`${propertyId}:${propertyUpdatedAt}`).toString('base64');
   const expiresAt = new Date(Date.now() + QUOTE_TTL_MS).toISOString();
+  const quoteId = randomUUID();
+
+  // Every charged component is disclosed as its own line item. The total is still
+  // authoritative from the integer-minor-unit calculation above.
+  const lineItems: PriceQuote['line_items'] = breakdown.map((day) => ({
+    id: `night:${day.date}`,
+    label: `Nightly rate – ${day.date}`,
+    amount: day.price,
+    currency: quoteCurrency,
+  }));
+  lineItems.push({
+    id: 'platform-fee',
+    label: `Platform fee (${(PLATFORM_FEE_PCT * 100).toFixed(0)}%)`,
+    amount: platformFee,
+    currency: quoteCurrency,
+  });
 
   // Bind the total to its exact inputs (including occupancy) so booking can verify nothing drifted.
   const quoteToken = signQuoteToken({
+    qid: quoteId,
     pid: propertyId,
     ci: checkInDate.toISOString(),
     co: checkOutDate.toISOString(),
@@ -756,6 +777,8 @@ export async function getPropertyQuote(
       version: quoteVersion,
       expires_at: expiresAt,
       available: unavailableIntervals.length === 0,
+      quote_id: quoteId,
+      line_items: lineItems,
       quote_token: quoteToken,
       pricing_version: PRICING_VERSION,
       pricing_fingerprint: pricingFingerprint,
@@ -772,6 +795,7 @@ export async function getPropertyQuote(
 export function pricingSnapshotFromQuote(quote: PriceQuote): Record<string, unknown> {
   return {
     version: quote.pricing_version ?? null,
+    quote_id: quote.quote_id ?? null,
     fingerprint: quote.pricing_fingerprint ?? null,
     currency: quote.currency ?? DEFAULT_CURRENCY,
     currency_precision: quote.currency_precision ?? currencyPrecision(DEFAULT_CURRENCY),
@@ -806,6 +830,10 @@ export interface QuotedTotalInput {
   now?: number;
   /** Guest count the booking will use; checked against token gc when a token is supplied. */
   guestCount?: number;
+  /** Quote identifier the tenant accepted; must match the token's qid. */
+  quoteId?: string;
+  /** When the tenant explicitly accepted the displayed quote. */
+  quoteAcceptedAt?: string;
 }
 
 /**
@@ -824,7 +852,7 @@ export async function assertQuotedTotal(
   const { propertyId, checkIn, checkOut, clientTotal, quoteToken } = input;
   const now = input.now ?? Date.now();
 
-  const quoted = await getPropertyQuote(propertyId, checkIn, checkOut);
+  const quoted = await getPropertyQuote(propertyId, checkIn, checkOut, input.guestCount);
   if (!quoted.success || !quoted.data) {
     const notFound = quoted.error === 'Property not found';
     return {
@@ -866,6 +894,32 @@ export async function assertQuotedTotal(
         statusCode: 400,
         code: 'QUOTE_MISMATCH',
       };
+    }
+
+    if (input.quoteId && claims.qid && claims.qid !== input.quoteId) {
+      return {
+        success: false,
+        error: 'Quote identifier does not match the accepted quote',
+        statusCode: 400,
+        code: 'QUOTE_MISMATCH',
+      };
+    }
+
+    if (input.quoteAcceptedAt) {
+      const acceptedAt = Date.parse(input.quoteAcceptedAt);
+      if (
+        !Number.isFinite(acceptedAt) ||
+        acceptedAt > now ||
+        acceptedAt > Date.parse(claims.exp)
+      ) {
+        return {
+          success: false,
+          error: 'The accepted quote is no longer valid; request a new quote',
+          conflict: true,
+          code: 'QUOTE_EXPIRED',
+          details: { quote },
+        };
+      }
     }
 
     if (Date.parse(claims.exp) <= now) {

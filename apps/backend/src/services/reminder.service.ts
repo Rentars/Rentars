@@ -25,6 +25,7 @@ import { supabase } from '@/config/supabase.js';
 import { createNotificationWithEmail, getPreferences } from './notification.service.js';
 import type { NotificationPreferences } from './notification.service.js';
 import type { ServiceResponse } from './index.js';
+import { Clock } from '@/utils/clock.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -92,7 +93,7 @@ export function getLeadTimeHours(): {
  */
 export function isInQuietHours(
   prefs: NotificationPreferences,
-  now: Date = new Date(),
+  now: Date = Clock.date(),
 ): boolean {
   const start = prefs.quiet_hours_start;
   const end   = prefs.quiet_hours_end;
@@ -265,8 +266,8 @@ async function processCheckInReminders(
   leadHours: number,
   result:    ReminderResult,
 ): Promise<void> {
-  const now       = new Date();
-  const windowEnd = new Date(now.getTime() + leadHours * 3_600_000);
+  const now       = Clock.date();
+  const windowEnd = new Date(Clock.now() + leadHours * 3_600_000);
 
   const { data: bookings, error } = await supabase
     .from('bookings')
@@ -313,8 +314,8 @@ async function processCheckOutReminders(
   leadHours: number,
   result:    ReminderResult,
 ): Promise<void> {
-  const now       = new Date();
-  const windowEnd = new Date(now.getTime() + leadHours * 3_600_000);
+  const now       = Clock.date();
+  const windowEnd = new Date(Clock.now() + leadHours * 3_600_000);
 
   const { data: bookings, error } = await supabase
     .from('bookings')
@@ -371,8 +372,8 @@ async function processPaymentDeadlineReminders(
 ): Promise<void> {
   // Payment deadline = 48 h after booking creation.
   // We fire a reminder when the deadline is ≤ leadHours away.
-  const deadlineWindowStart = new Date(Date.now() - (48 - leadHours) * 3_600_000);
-  const deadlineWindowEnd   = new Date(Date.now() - (48 - leadHours - 1) * 3_600_000);
+  const deadlineWindowStart = new Date(Clock.now() - (48 - leadHours) * 3_600_000);
+  const deadlineWindowEnd   = new Date(Clock.now() - (48 - leadHours - 1) * 3_600_000);
 
   const { data: bookings, error } = await supabase
     .from('bookings')
@@ -416,7 +417,7 @@ async function processDisputeReminders(
   leadHours: number,
   result:    ReminderResult,
 ): Promise<void> {
-  const openSince = new Date(Date.now() - leadHours * 3_600_000);
+  const openSince = new Date(Clock.now() - leadHours * 3_600_000);
 
   const { data: bookings, error } = await supabase
     .from('bookings')

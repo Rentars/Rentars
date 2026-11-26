@@ -4,6 +4,7 @@ import {
   ImageValidationError,
   IMAGE_LIMITS,
   assertDimensionsAllowed,
+  assertSingleFrame,
   detectImageFormat,
 } from '../services/imageValidation.js';
 
@@ -55,6 +56,9 @@ export async function optimizeImage(
   if (!detectImageFormat(buffer)) {
     throw new ImageValidationError('File is not a supported image (JPEG, PNG or WebP)');
   }
+  if (buffer.length > IMAGE_LIMITS.maxBytes) {
+    throw new ImageValidationError('Image exceeds the maximum allowed size');
+  }
 
   const sharp = await getSharp();
   if (!sharp) {
@@ -63,12 +67,13 @@ export async function optimizeImage(
 
   const sharpOptions = { limitInputPixels: IMAGE_LIMITS.maxPixels };
 
-  let metadata: { width?: number; height?: number };
+  let metadata: { width?: number; height?: number; pages?: number };
   try {
     metadata = await (sharp as any)(buffer, sharpOptions).metadata();
   } catch {
     throw new ImageValidationError('Image could not be decoded');
   }
+  assertSingleFrame(metadata.pages);
   assertDimensionsAllowed(metadata.width, metadata.height);
 
   let optimized: Buffer;

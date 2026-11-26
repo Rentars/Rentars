@@ -34,9 +34,26 @@
  *     every payment has a complete, auditable lifecycle.
  *  4. Unknown / unsupported statuses returned by external providers are
  *     quarantined rather than silently accepted.
+ *
+ * State ownership (closes #116):
+ *
+ *  Terminal states (`confirmed`, `refunded`, `failed`) are *contract-owned*.
+ *  They may only be entered when the transition is backed by verified
+ *  on-chain evidence (a sealed ledger event whose booking, amount and
+ *  escrow all match the payment record). Off-chain actors (provider
+ *  callbacks, sync services, payment UI) may only *request* a transition;
+ *  they can never unilaterally mark funds released or refunded.
+ *
+ *  Pending states (`pending`, `submitted`, `timed_out`) are *off-chain
+ *  owned*: they reflect intent and submission progress and carry no
+ *  settlement authority.
+ *
+ *  When on-chain and provider state disagree, the payment is moved to
+ *  `under_review` with the disagreement recorded — it is never silently
+ *  resolved in favour of either side.
  */
 
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { supabase } from '@/config/supabase.js';
 import { auditLogger } from './auditLogger.service.js';
 import {
@@ -146,6 +163,12 @@ export interface CreatePaymentIntentParams {
   sourceAccount?: string;
   metadata?: Record<string, unknown>;
   /**
+   * Whether the tenant account is currently suspended (admin moderation).
+   * Suspended tenants may not initiate new payment intents. Existing payments
+   * and escrow are never mutated by suspension (see policy below).
+   */
+  tenantSuspended?: boolean;
+  /**
    * Conversion details captured at quote time. When provided, the original
    * currency amount, converted amount, rate source and rate timestamp are
    * persisted alongside the payment intent for audit and disclosure.
@@ -157,6 +180,85 @@ export interface TransitionResult {
   payment: Payment;
   /** True when the event was a duplicate (same hash) — no side-effects applied. */
   replayed: boolean;
+}
+
+/**
+ * Verified on-chain evidence required to enter a terminal state.
+ *
+ * This is the *only* authority that can move a payment to `confirmed`,
+ * `refunded` or `failed`. It must be produced by a verifier that has
+ * independently confirmed the ledger event (e.g. Horizon transaction
+ * lookup + escrow contract read), never by a raw provider callback.
+ */
+export interface VerifiedChainEvidence {
+  /** Stellar transaction hash of the sealed ledger event. */
+  txHash: string;
+  /** Ledger sequence in which the event was sealed (must be > 0). */
+  ledger: number;
+  /** Booking the on-chain event belongs to — must match the payment. */
+  bookingId: string;
+  /** Escrow contract the event was emitted from — must match the payment. */
+  escrowId: string;
+  /** Amount settled on-chain, in stroops — must match the payment. */
+  amountStroops: bigint;
+  /** Canonical status the verified event represents. */
+  status: Extract<PaymentStatus, 'confirmed' | 'refunded' | 'failed'>;
+  /** True only when the verifier authenticated and validated the event. */
+  verified: boolean;
+}
+
+/** States that represent settlement and are owned by the contract. */
+const TERMINAL_STATES: ReadonlySet<PaymentStatus> = new Set([
+  'confirmed',
+  'refunded',
+  'failed',
+]);
+
+/** States that represent off-chain intent/progress only. */
+const PENDING_STATES: ReadonlySet<PaymentStatus> = new Set([
+  'pending',
+  'submitted',
+  'timed_out',
+]);
+
+/** Returns true when `status` is a terminal, contract-owned state. */
+export function isTerminalStatus(status: PaymentStatus): boolean {
+  return TERMINAL_STATES.has(status);
+}
+
+/** Returns true when `status` is a pending, off-chain-owned state. */
+export function isPendingStatus(status: PaymentStatus): boolean {
+  return PENDING_STATES.has(status);
+}
+
+/**
+ * Validate that `evidence` is authentic and consistent with `payment`.
+ *
+ * @returns null when the evidence is valid, otherwise a human-readable
+ *          reason describing why it must not be trusted.
+ */
+export function validateChainEvidence(
+  payment: Payment,
+  evidence: VerifiedChainEvidence,
+): string | null {
+  if (!evidence.verified) return 'Chain evidence is not verified';
+  if (!evidence.txHash) return 'Chain evidence missing transaction hash';
+  if (!Number.isInteger(evidence.ledger) || evidence.ledger <= 0) {
+    return 'Chain evidence missing sealed ledger sequence';
+  }
+  if (evidence.bookingId !== payment.booking_id) {
+    return `Chain evidence booking mismatch: ${evidence.bookingId} ≠ ${payment.booking_id}`;
+  }
+  if (!payment.escrow_id || evidence.escrowId !== payment.escrow_id) {
+    return `Chain evidence escrow mismatch: ${evidence.escrowId} ≠ ${payment.escrow_id ?? 'none'}`;
+  }
+  if (evidence.amountStroops !== payment.amount_stroops) {
+    return `Chain evidence amount mismatch: ${evidence.amountStroops} ≠ ${payment.amount_stroops}`;
+  }
+  if (!isTerminalStatus(evidence.status)) {
+    return `Chain evidence status ${evidence.status} is not terminal`;
+  }
+  return null;
 }
 
 // ─── Escrow operation state machine (issues #949 / #993) ─────────────────────
@@ -668,13 +770,74 @@ export function mapProviderStatus(raw: string): PaymentStatus {
   return PROVIDER_STATUS_MAP[raw] ?? 'under_review';
 }
 
+/** Keys whose values must never be persisted in the event ledger. */
+const REDACTED_KEY_PATTERN = /(secret|token|password|credential|private[_-]?key|api[_-]?key|authorization|signature)/i;
+
+/**
+ * Recursively redact credential-like values from an event payload.
+ * Returns a new object; the input is never mutated.
+ */
+export function redactPayload(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => redactPayload(item));
+  }
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = REDACTED_KEY_PATTERN.test(key) ? '[REDACTED]' : redactPayload(val);
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
+ * Derive the current payment status reproducibly from an ordered list of
+ * stored events. Events are replayed through the same transition graph used
+ * by the live service, so the result is deterministic for a given history.
+ *
+ * Out-of-order events are sorted by `created_at` (then id) before replay.
+ * Disallowed transitions quarantine to `under_review`, matching live behaviour.
+ */
+export function deriveStatusFromEvents(events: ReadonlyArray<PaymentEvent>): PaymentStatus {
+  const ordered = [...events].sort((a, b) => {
+    const byTime = a.created_at.localeCompare(b.created_at);
+    return byTime !== 0 ? byTime : a.id.localeCompare(b.id);
+  });
+
+  let status: PaymentStatus = 'pending';
+  for (const event of ordered) {
+    if (!event.status) continue;
+    if (event.status === status) continue;
+    status = isAllowedTransition(status, event.status) ? event.status : 'under_review';
+  }
+  return status;
+}
+
 // ─── Service functions ────────────────────────────────────────────────────────
+
+/**
+ * Account-suspension policy for payments (issue #978).
+ *
+ * Suspension is a *reversible access* control, not a financial action:
+ *
+ *  - Suspension NEVER mutates an existing payment's status, amount, escrow or
+ *    transaction hash. Escrow is never released or refunded by suspension.
+ *  - Suspended tenants may not initiate NEW payment intents (guard below).
+ *  - Payments already `submitted`/`confirmed` continue to settle normally so
+ *    counterparties are not harmed by a moderation action.
+ *  - Restoration re-enables new intents only. It does not re-open, re-fund or
+ *    otherwise restore access to funds/escrow that policy has already moved
+ *    (e.g. refunded or failed payments stay terminal).
+ */
+export const SUSPENDED_TENANT_PAYMENT_ERROR =
+  'Tenant account is suspended; new payments cannot be initiated';
 
 /**
  * Create a new payment intent in `pending` state.
  *
  * @returns The newly created Payment record.
- * @throws  On database error.
+ * @throws  On database error, or when the tenant is suspended.
  */
 export async function createPaymentIntent(
   params: CreatePaymentIntentParams,
@@ -687,7 +850,24 @@ export async function createPaymentIntent(
     escrowId,
     metadata,
     conversion,
+    tenantSuspended,
   } = params;
+
+  // ── Suspension guard: block NEW intents only; never touch existing state ──
+  if (tenantSuspended) {
+    await auditLogger.log({
+      actorId: tenantId,
+      action: 'payment.failed',
+      resourceType: 'payment',
+      resourceId: bookingId,
+      meta: {
+        reason: 'tenant_suspended',
+        bookingId,
+        correlationId: (metadata?.correlationId as string | undefined) ?? null,
+      },
+    });
+    throw new Error(SUSPENDED_TENANT_PAYMENT_ERROR);
+  }
 
   // ── Validate precision and conversion consistency (integer minor units) ──
   if (amountStroops <= 0n) {
@@ -761,6 +941,18 @@ export async function createPaymentIntent(
 
   const payment = rowToPayment(data);
 
+  // Append the genesis event so the ledger is complete from creation.
+  await appendPaymentEvent({
+    paymentId: payment.id,
+    eventType: 'intent_created',
+    status: 'pending',
+    provider: escrowId ? 'trustlesswork' : 'stellar',
+    network: metadata?.network as string | undefined ?? null,
+    externalRef: escrowId ?? null,
+    payload: { bookingId, amountStroops: amountStroops.toString(), quoteHash },
+    actorId: tenantId,
+  });
+
   await auditLogger.log({
     actorId: tenantId,
     action: 'payment.submit',
@@ -824,6 +1016,11 @@ export async function bindPaymentNetwork(
  * Record a submitted transaction hash. Idempotent: if a hash is already
  * recorded, the existing hash is returned and no duplicate broadcast is
  * implied. Callers must re-poll the existing hash rather than re-submitting.
+ *
+ * Suspension policy: recording a hash for an already-created intent is a
+ * settlement step, not a new payment, so it is permitted even if the tenant
+ * was suspended after the intent was created. Suspension never blocks or
+ * reverses settlement of in-flight payments.
  */
 export async function recordSubmittedTx(
   paymentId: string,
@@ -885,6 +1082,8 @@ export async function recordSubmittedTx(
  * @param eventPayload - Raw event data (used for duplicate detection).
  * @param txHash       - Optional Stellar transaction hash to record.
  * @param actorId      - Optional actor UUID for audit (omit for system actions).
+ * @param evidence     - Verified on-chain evidence. REQUIRED to enter any
+ *                       terminal state; ignored for pending transitions.
  *
  * @returns TransitionResult containing updated Payment and replayed flag.
  */
@@ -894,6 +1093,7 @@ export async function transitionPaymentStatus(
   eventPayload: Record<string, unknown>,
   txHash?: string | null,
   actorId?: string,
+  evidence?: VerifiedChainEvidence | null,
 ): Promise<ServiceResponse<TransitionResult>> {
   const payment = await getPaymentStatus(paymentId);
   if (!payment) {
@@ -901,9 +1101,28 @@ export async function transitionPaymentStatus(
   }
 
   const eventHash = hashEventPayload(eventPayload);
+  const providerClass = providerClassFor(eventPayload);
 
   // ── Idempotency: same event hash → replay without side-effects ────────────
   if (payment.last_event_hash === eventHash) {
+    return {
+      success: true,
+      data: { payment, replayed: true },
+    };
+  }
+
+  // ── Idempotency: same idempotency key already in the ledger ───────────────
+  const idempotencyKey =
+    typeof eventPayload.idempotency_key === 'string'
+      ? eventPayload.idempotency_key
+      : eventHash;
+  const { data: existingEvent } = await supabase
+    .from('payment_events')
+    .select('id')
+    .eq('payment_id', paymentId)
+    .eq('idempotency_key', idempotencyKey)
+    .maybeSingle();
+  if (existingEvent) {
     return {
       success: true,
       data: { payment, replayed: true },
@@ -918,6 +1137,30 @@ export async function transitionPaymentStatus(
     // Unknown or regressive transition → quarantine
     targetStatus = 'under_review';
     quarantineReason = `Disallowed transition: ${payment.status} → ${newStatus}`;
+  }
+
+  // ── Terminal states require verified on-chain evidence ────────────────────
+  // Off-chain actors (provider callbacks, sync, UI) cannot mark funds
+  // released/refunded without verifiable external settlement.
+  if (isTerminalStatus(newStatus)) {
+    if (!evidence) {
+      targetStatus = 'under_review';
+      quarantineReason =
+        `Terminal transition ${payment.status} → ${newStatus} rejected: ` +
+        'missing verified on-chain evidence';
+    } else {
+      const evidenceError = validateChainEvidence(payment, evidence);
+      if (evidenceError) {
+        targetStatus = 'under_review';
+        quarantineReason = `Terminal transition ${payment.status} → ${newStatus} rejected: ${evidenceError}`;
+      } else if (evidence.status !== newStatus) {
+        // On-chain and provider state disagree — surface, do not resolve.
+        targetStatus = 'under_review';
+        quarantineReason =
+          `On-chain/provider disagreement: chain reports ${evidence.status}, ` +
+          `provider requested ${newStatus}`;
+      }
+    }
   }
 
   // ── Persist with optimistic concurrency ───────────────────────────────────
@@ -936,6 +1179,27 @@ export async function transitionPaymentStatus(
       quarantined_at: new Date().toISOString(),
     };
   }
+  if (evidence && isTerminalStatus(targetStatus)) {
+    // Record the verified settlement evidence alongside the terminal state.
+    updatePayload.metadata = {
+      ...((updatePayload.metadata as Record<string, unknown> | undefined) ??
+        payment.metadata ??
+        {}),
+      chain_evidence: {
+        tx_hash: evidence.txHash,
+        ledger: evidence.ledger,
+        booking_id: evidence.bookingId,
+        escrow_id: evidence.escrowId,
+        amount_stroops: evidence.amountStroops.toString(),
+        status: evidence.status,
+        verified_at: new Date().toISOString(),
+      },
+    };
+  }
+
+  const stopTimer = paymentWorkflowDurationSeconds.startTimer({
+    operation: 'transition',
+  });
 
   const { data, error } = await supabase
     .from('payments')
@@ -944,6 +1208,8 @@ export async function transitionPaymentStatus(
     .eq('version', payment.version) // optimistic concurrency guard
     .select()
     .single();
+
+  stopTimer();
 
   if (error || !data) {
     // Version conflict — another process transitioned first
@@ -954,6 +1220,23 @@ export async function transitionPaymentStatus(
   }
 
   const updated = rowToPayment(data);
+
+  // ── Append immutable ledger event (history is never overwritten) ──────────
+  const eventType: PaymentEventType =
+    targetStatus === 'under_review' ? 'under_review' : (targetStatus as PaymentEventType);
+  await appendPaymentEvent({
+    paymentId,
+    eventType,
+    status: targetStatus,
+    idempotencyKey,
+    correlationId:
+      typeof eventPayload.correlation_id === 'string' ? eventPayload.correlation_id : undefined,
+    provider: typeof eventPayload.provider === 'string' ? eventPayload.provider : null,
+    network: typeof eventPayload.network === 'string' ? eventPayload.network : null,
+    externalRef: txHash ?? null,
+    payload: eventPayload,
+    actorId,
+  });
 
   // ── Audit ─────────────────────────────────────────────────────────────────
   const auditAction =
@@ -972,6 +1255,7 @@ export async function transitionPaymentStatus(
       toStatus: targetStatus,
       txHash,
       quarantineReason,
+      evidenceTxHash: evidence?.txHash,
     },
   });
 
@@ -999,12 +1283,15 @@ export async function updatePaymentStatus(
   paymentId: string,
   txHash: string | null,
   status: PaymentStatus,
+  evidence?: VerifiedChainEvidence | null,
 ): Promise<Payment> {
   const result = await transitionPaymentStatus(
     paymentId,
     status,
     { txHash, status, _source: 'stellar_confirmation' },
     txHash,
+    undefined,
+    evidence,
   );
 
   if (!result.success || !result.data) {
@@ -1044,6 +1331,9 @@ export async function getPaymentByBookingId(bookingId: string): Promise<Payment 
  * Comparison is performed exclusively on integer minor units (USDC stroops)
  * via compareMinorUnits() — binary floating-point values are never used, so
  * rounding can never silently change the amount transferred.
+ *
+ * Suspension policy: reconciliation is read-only and always permitted; it
+ * never releases escrow or restores funds on behalf of a suspended tenant.
  *
  * @param paymentId       - UUID of the payment to reconcile.
  * @param reportedStroops - Amount reported by the provider/ledger, in stroops.
@@ -1089,11 +1379,60 @@ export function toStroops(usdcAmount: string): bigint {
   return amountUsdcToStroops(usdcAmount);
 }
 
+/**
+ * Describe the payment-side effects of suspending or restoring a user, so the
+ * admin UI can explain consequences before applying a moderation action.
+ *
+ * This is a pure, read-only helper: it never mutates payments or escrow.
+ */
+export function describeSuspensionPaymentEffects(): {
+  onSuspend: string[];
+  onRestore: string[];
+} {
+  return {
+    onSuspend: [
+      'New payment intents are blocked for the suspended tenant.',
+      'Existing payments keep their current status; escrow is not released or refunded.',
+      'In-flight submitted/confirmed payments continue to settle normally.',
+    ],
+    onRestore: [
+      'New payment intents are permitted again.',
+      'Previously refunded or failed payments remain terminal; funds are not restored.',
+      'Escrow state is unchanged by restoration.',
+    ],
+  };
+}
+
 // ─── Row mapping ──────────────────────────────────────────────────────────────
 
 /**
  * Map a raw Supabase row to a typed Payment, handling BigInt conversion.
  */
+/**
+ * Map a raw Supabase row from `payment_events` to a typed PaymentEvent.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: raw Supabase row
+function rowToPaymentEvent(row: any): PaymentEvent {
+  return {
+    id:              row.id,
+    payment_id:      row.payment_id,
+    booking_id:      row.booking_id,
+    quote_hash:      row.quote_hash ?? null,
+    provider:        row.provider ?? null,
+    network:         row.network ?? null,
+    amount_stroops:  BigInt(row.amount_stroops ?? 0),
+    currency:        row.currency ?? 'USDC',
+    event_type:      row.event_type as PaymentEventType,
+    status:          (row.status as PaymentStatus | null) ?? null,
+    idempotency_key: row.idempotency_key,
+    correlation_id:  row.correlation_id,
+    external_ref:    row.external_ref ?? null,
+    event_hash:      row.event_hash,
+    payload:         row.payload ?? {},
+    created_at:      row.created_at,
+  };
+}
+
 // biome-ignore lint/suspicious/noExplicitAny: raw Supabase row
 function rowToPayment(row: any): Payment {
   return {

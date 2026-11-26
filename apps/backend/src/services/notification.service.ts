@@ -5,6 +5,39 @@ import type { ServiceResponse } from './index.js';
 import { decodeCursor, buildCursorPage } from '../utils/cursor.js';
 import type { PaginatedResult } from '../types/pagination.js';
 import { executePaginatedQuery } from '../utils/pagination.js';
+import {
+  notificationWorkflowTotal,
+  notificationBacklogSize,
+} from '../metrics/index.js';
+
+/** Delivery channels tracked by the notification workflow metric. */
+type NotificationChannel = 'in_app' | 'email' | 'push';
+/** Bounded outcome vocabulary for notification delivery events. */
+type NotificationOutcome = 'enqueued' | 'sent' | 'failed' | 'suppressed';
+
+/**
+ * Record a single logical notification delivery event.
+ * Labels are bounded (channel + outcome) — never user or notification IDs.
+ */
+function recordNotificationEvent(channel: NotificationChannel, outcome: NotificationOutcome): void {
+  notificationWorkflowTotal.inc({ channel, outcome });
+}
+
+/**
+ * Refresh the notification backlog gauge from the outbox depth.
+ * Failures are swallowed — observability must never break delivery.
+ */
+async function refreshNotificationBacklog(): Promise<void> {
+  try {
+    const { count, error } = await supabase
+      .from('notification_outbox')
+      .select('id', { count: 'exact', head: true });
+    if (error) return;
+    notificationBacklogSize.set(count ?? 0);
+  } catch {
+    // Gauge refresh is best-effort
+  }
+}
 
 export interface CursorPaginatedResult<T> {
   data: T[];
@@ -34,8 +67,11 @@ export type NotificationType =
   | 'appeal_submitted'
   | 'report_notification'
   | 'moderation_decision'
+  | 'dispute_under_review'
   | 'dispute_decision_recorded'
-  | 'dispute_settled';
+  | 'dispute_settlement_pending'
+  | 'dispute_settlement_completed'
+  | 'dispute_settlement_failed';
 
 /** Coarse bucket used for filtering the notification list. */
 export type NotificationCategory =
@@ -84,8 +120,11 @@ export function categoryForType(type: NotificationType): NotificationCategory {
       return 'review';
     case 'dispute_initiated':
     case 'booking_disputed':
+    case 'dispute_under_review':
     case 'dispute_decision_recorded':
-    case 'dispute_settled':
+    case 'dispute_settlement_pending':
+    case 'dispute_settlement_completed':
+    case 'dispute_settlement_failed':
       return 'dispute';
     case 'message_received':
       return 'message';
@@ -96,6 +135,8 @@ export function categoryForType(type: NotificationType): NotificationCategory {
       return 'moderation';
     case 'new_property':
       return 'social';
+    case 'property_updated':
+      return 'booking';
     default:
       return 'system';
   }
@@ -149,8 +190,11 @@ const EMAIL_TEMPLATES: Partial<Record<NotificationType, string>> = {
   review_submitted: 'New Review Submitted',
   host_response: 'Host Responded to Your Review',
   dispute_initiated: 'Dispute Initiated',
+  dispute_under_review: 'Dispute Under Review',
   dispute_decision_recorded: 'Dispute Decision Recorded',
-  dispute_settled: 'Dispute Settlement Update',
+  dispute_settlement_pending: 'Dispute Settlement Pending',
+  dispute_settlement_completed: 'Dispute Settlement Completed',
+  dispute_settlement_failed: 'Dispute Settlement Failed',
   new_property: 'New Listing from a Host You Follow',
   system_alert: 'System Alert',
   report_created: 'New Report Submitted',
@@ -180,8 +224,11 @@ const VALID_NOTIFICATION_TYPES: ReadonlyArray<NotificationType> = [
   'appeal_submitted',
   'report_notification',
   'moderation_decision',
+  'dispute_under_review',
   'dispute_decision_recorded',
-  'dispute_settled',
+  'dispute_settlement_pending',
+  'dispute_settlement_completed',
+  'dispute_settlement_failed',
 ];
 
 /**
@@ -199,6 +246,13 @@ const SENSITIVE_DATA_KEYS = [
   'supportLink',
   'attempt',
   'audience',
+  'evidence',
+  'evidenceUrls',
+  'reviewerNotes',
+  'reviewerId',
+  'internalNotes',
+  'adminNotes',
+  'resolutionNotes',
 ] as const;
 
 /**
@@ -323,12 +377,18 @@ export async function enqueueNotificationOutbox(
       },
       { onConflict: 'recipient_id,dedupe_key', ignoreDuplicates: true },
     );
-  if (error) return { success: false, error: error.message };
+  if (error) {
+    recordNotificationEvent('in_app', 'failed');
+    return { success: false, error: error.message };
+  }
+
+  recordNotificationEvent('in_app', 'enqueued');
 
   // Invalidate the notification cache so the next list request sees the new row.
   await invalidateNotificationCache(userId);
+  await refreshNotificationBacklog();
 
-  return { success: true, data: notification as Notification };
+  return { success: true, data: undefined };
 }
 
 export async function getNotifications(
@@ -770,149 +830,142 @@ export async function createNotificationWithAllChannels(
 
 export { EMAIL_TEMPLATES };
 
-// ─── Dispute outcome notifications ────────────────────────────────────────────
+// ─── Dispute timeline notifications ───────────────────────────────────────────
 
 /**
- * Privacy-safe summary of a dispute decision, shared with both parties.
- *
- * Deliberately excludes evidence contents, internal reviewer notes, reviewer
- * identity, and any other administrator-only fields. Only the documented
- * outcome, the reasoning intended for the parties, and the follow-up payment
- * state are exposed.
+ * Participant-safe dispute timeline stages.  Each stage maps to exactly one
+ * notification type so participants can distinguish a recorded decision from
+ * a completed (or still pending / failed) financial settlement.
  */
-export interface DisputeOutcomeSummary {
-  /** UUID of the dispute. */
-  disputeId: string;
-  /** UUID of the booking the dispute relates to. */
-  bookingId: string;
-  /** Documented decision outcome, e.g. 'refund_full', 'release_to_host', 'split'. */
-  decision: string;
-  /** Human-readable reasoning intended for the parties (never internal notes). */
-  reasoning: string;
-  /** Follow-up payment state, e.g. 'pending', 'processing', 'completed', 'failed'. */
-  paymentState: string;
-  /** Optional amount (in the booking currency) affected by the decision. */
-  amount?: number | null;
-  /** ISO currency code for `amount`, if provided. */
-  currency?: string | null;
-  /** ISO timestamp when the decision was recorded. */
-  decidedAt?: string | null;
-  /** ISO timestamp when the financial settlement completed, if it has. */
-  settledAt?: string | null;
-}
+export type DisputeTimelineStage =
+  | 'opened'
+  | 'under_review'
+  | 'decision_recorded'
+  | 'settlement_pending'
+  | 'settlement_completed'
+  | 'settlement_failed';
+
+const DISPUTE_STAGE_NOTIFICATION_TYPE: Record<DisputeTimelineStage, NotificationType> = {
+  opened: 'dispute_initiated',
+  under_review: 'dispute_under_review',
+  decision_recorded: 'dispute_decision_recorded',
+  settlement_pending: 'dispute_settlement_pending',
+  settlement_completed: 'dispute_settlement_completed',
+  settlement_failed: 'dispute_settlement_failed',
+};
 
 /**
- * Build the privacy-safe notification payload for a dispute outcome.
- *
- * Only fields from {@link DisputeOutcomeSummary} are copied — any extra keys
- * present on the input (e.g. evidence, reviewer notes) are dropped so they can
- * never leak into a notification row or email.
+ * Fields that must never be forwarded to participants from dispute records.
+ * Reviewer notes, evidence and internal identifiers stay server-side.
  */
-function buildDisputeOutcomePayload(
-  summary: DisputeOutcomeSummary,
+const DISPUTE_INTERNAL_KEYS = [
+  'evidence',
+  'evidenceUrls',
+  'evidence_urls',
+  'reviewerNotes',
+  'reviewer_notes',
+  'reviewerId',
+  'reviewer_id',
+  'internalNotes',
+  'internal_notes',
+  'adminNotes',
+  'admin_notes',
+  'resolutionNotes',
+  'resolution_notes',
+  'internalNote',
+  'supportLink',
+] as const;
+
+/**
+ * Build a participant-safe payload for a dispute timeline notification.
+ * Only whitelisted, participant-facing fields are copied; anything else
+ * (evidence, reviewer notes, internal identifiers) is dropped.
+ */
+export function buildDisputeTimelinePayload(
+  stage: DisputeTimelineStage,
+  input: Record<string, unknown>,
 ): Record<string, unknown> {
-  return {
-    disputeId: summary.disputeId,
-    bookingId: summary.bookingId,
-    decision: summary.decision,
-    reasoning: summary.reasoning,
-    paymentState: summary.paymentState,
-    ...(summary.amount !== undefined && { amount: summary.amount }),
-    ...(summary.currency !== undefined && { currency: summary.currency }),
-    ...(summary.decidedAt !== undefined && { decidedAt: summary.decidedAt }),
-    ...(summary.settledAt !== undefined && { settledAt: summary.settledAt }),
+  const payload: Record<string, unknown> = {
+    stage,
+    disputeId: input.disputeId ?? input.dispute_id ?? null,
+    bookingId: input.bookingId ?? input.booking_id ?? null,
+    status: input.status ?? null,
   };
+
+  // Decision outcome is participant-facing (e.g. 'refund', 'release', 'split').
+  const outcome = input.outcome ?? input.decision ?? null;
+  if (outcome !== null && outcome !== undefined) payload.outcome = outcome;
+
+  // Financial action state — kept separate from the decision itself.
+  const financialAction = input.financialAction ?? input.financial_action ?? null;
+  if (financialAction !== null && financialAction !== undefined) {
+    payload.financialAction = financialAction;
+  }
+  const financialStatus = input.financialStatus ?? input.financial_status ?? null;
+  if (financialStatus !== null && financialStatus !== undefined) {
+    payload.financialStatus = financialStatus;
+  }
+
+  // Optional participant-facing copy fields.
+  for (const key of ['userEmail', 'userName', 'propertyTitle', 'amount', 'currency'] as const) {
+    if (input[key] !== undefined) payload[key] = input[key];
+  }
+
+  // Defensive: strip any internal keys that slipped through.
+  for (const key of DISPUTE_INTERNAL_KEYS) {
+    delete payload[key];
+  }
+
+  return payload;
 }
 
 /**
- * Notify both parties that a dispute decision has been recorded.
+ * Notify a single participant of a dispute timeline transition.
  *
- * A recorded decision does NOT imply financial settlement — the payload's
- * `paymentState` communicates the current follow-up payment state so parties
- * understand that money movement is still pending verification.
- *
- * Evidence contents and internal reviewer notes are never included.
- *
- * @param partyUserIds - User IDs of the parties to notify (host and guest).
- * @param summary      - Privacy-safe outcome summary.
- * @returns            - Count of notifications successfully created.
+ * Uses a deterministic event id (`dispute:<id>:<stage>`) so repeated
+ * resolution events / retries are idempotent and never duplicate.
  */
-export async function notifyDisputeDecisionRecorded(
-  partyUserIds: string[],
-  summary: DisputeOutcomeSummary,
-): Promise<ServiceResponse<{ notified: number }>> {
-  const recipients = Array.from(new Set(partyUserIds.filter((id) => !!id)));
-  if (recipients.length === 0) {
-    return { success: false, error: 'At least one party user id is required' };
+export async function notifyDisputeTimelineTransition(
+  userId: string,
+  stage: DisputeTimelineStage,
+  input: Record<string, unknown>,
+): Promise<ServiceResponse<Notification>> {
+  const type = DISPUTE_STAGE_NOTIFICATION_TYPE[stage];
+  if (!type) {
+    return { success: false, error: `Unknown dispute timeline stage: ${stage}` };
   }
 
-  const payload = buildDisputeOutcomePayload(summary);
-  const deepLink = `/disputes/${summary.disputeId}`;
+  const payload = buildDisputeTimelinePayload(stage, input);
+  const disputeId = String(payload.disputeId ?? '');
+  const eventId = disputeId
+    ? `dispute:${disputeId}:${stage}`
+    : `dispute:${stage}:${String(payload.bookingId ?? userId)}`;
 
-  let notified = 0;
-  for (const userId of recipients) {
-    try {
-      const send = await shouldSendInApp(userId, 'dispute_decision_recorded');
-      if (!send) continue;
+  const deepLink = disputeId ? `/disputes/${disputeId}` : undefined;
 
-      const eventId = `dispute_decision_recorded:${summary.disputeId}:${userId}`;
-      const result = await createNotification(userId, 'dispute_decision_recorded', payload, {
-        deepLink,
-        eventId,
-      });
-      if (result.success) notified++;
-    } catch (err) {
-      console.error(
-        `[notifyDisputeDecisionRecorded] Failed to notify user ${userId}:`,
-        err,
-      );
-    }
-  }
-
-  return { success: true, data: { notified } };
+  return createNotification(userId, type, payload, { eventId, deepLink });
 }
 
 /**
- * Notify both parties that a dispute's financial settlement has completed
- * (or failed) after verification.
- *
- * This is separate from {@link notifyDisputeDecisionRecorded}: a decision is
- * recorded first, and settlement is only announced once the refund/release
- * has been verified by the payment service.
- *
- * Evidence contents and internal reviewer notes are never included.
- *
- * @param partyUserIds - User IDs of the parties to notify (host and guest).
- * @param summary      - Privacy-safe outcome summary including settlement state.
- * @returns            - Count of notifications successfully created.
+ * Notify all participants (guest and host) of a dispute timeline transition.
+ * Each participant gets their own idempotent notification; failures for one
+ * participant do not abort the other.
  */
-export async function notifyDisputeSettled(
-  partyUserIds: string[],
-  summary: DisputeOutcomeSummary,
+export async function notifyDisputeParticipants(
+  participantIds: ReadonlyArray<string>,
+  stage: DisputeTimelineStage,
+  input: Record<string, unknown>,
 ): Promise<ServiceResponse<{ notified: number }>> {
-  const recipients = Array.from(new Set(partyUserIds.filter((id) => !!id)));
-  if (recipients.length === 0) {
-    return { success: false, error: 'At least one party user id is required' };
-  }
-
-  const payload = buildDisputeOutcomePayload(summary);
-  const deepLink = `/disputes/${summary.disputeId}`;
-
+  const unique = Array.from(new Set(participantIds.filter((id) => !!id)));
   let notified = 0;
-  for (const userId of recipients) {
-    try {
-      const send = await shouldSendInApp(userId, 'dispute_settled');
-      if (!send) continue;
 
-      const eventId = `dispute_settled:${summary.disputeId}:${userId}`;
-      const result = await createNotification(userId, 'dispute_settled', payload, {
-        deepLink,
-        eventId,
-      });
+  for (const userId of unique) {
+    try {
+      const result = await notifyDisputeTimelineTransition(userId, stage, input);
       if (result.success) notified++;
     } catch (err) {
       console.error(
-        `[notifyDisputeSettled] Failed to notify user ${userId}:`,
+        `[notifyDisputeParticipants] Failed to notify ${userId} for stage ${stage}:`,
         err,
       );
     }
@@ -998,6 +1051,113 @@ export async function notifyHostFollowers(
       // Log and continue — one follower's failure must not abort the fan-out
       console.error(
         `[notifyHostFollowers] Failed to notify follower ${followerId}:`,
+        err,
+      );
+    }
+  }
+
+  return { success: true, data: { notified } };
+}
+
+// ─── Property-change tenant fan-out ──────────────────────────────────────────
+
+export interface PropertyChangedNotificationData {
+  /** UUID of the property that was updated. */
+  propertyId: string;
+  /** Human-readable property title. */
+  propertyTitle: string;
+  /** URL slug for deep-linking into the property detail page. */
+  propertySlug: string;
+  /** UUID of the booking that connects the tenant to this property. */
+  bookingId: string;
+  /** ISO date strings for the booked stay — shown in the notification body. */
+  checkIn: string;
+  checkOut: string;
+  /**
+   * Sanitised before/after summary produced by buildPropertyChangeSummary().
+   * Never contains private host metadata (owner_id, internal notes, etc.).
+   */
+  changeSummary: Array<{ field: string; before: unknown; after: unknown }>;
+}
+
+/**
+ * Fan-out a `property_updated` notification to every tenant with an upcoming
+ * confirmed or pending booking for `propertyId`.
+ *
+ * Rules:
+ *  - Only bookings with status Confirmed or Pending are notified.
+ *    Cancelled, Completed, Disputed, and Expired stays are excluded.
+ *  - Each tenant receives at most one notification per update event
+ *    (deduped by eventId = `property_updated:<propertyId>:<bookingId>`).
+ *  - Notification preferences are respected; a tenant who has disabled
+ *    `property_updated` (or all booking notifications) is skipped.
+ *  - Per-tenant failures are logged and do not abort the overall fan-out.
+ *
+ * @param data - Property and change metadata.
+ * @returns Count of notifications successfully enqueued.
+ */
+export async function notifyBookedTenantsOfPropertyChange(
+  data: PropertyChangedNotificationData,
+): Promise<ServiceResponse<{ notified: number }>> {
+  const { propertyId, propertyTitle, propertySlug, checkIn, checkOut, changeSummary } = data;
+
+  // Fetch all upcoming non-terminal bookings for this property.
+  // We only load the columns we need so we never expose unrelated booking data.
+  const { data: bookings, error } = await supabase
+    .from('bookings')
+    .select('id, tenant_id, check_in, check_out, status')
+    .eq('property_id', propertyId)
+    .in('status', ['Pending', 'Confirmed'])
+    .gte('check_out', new Date().toISOString().slice(0, 10)); // future stays only
+
+  if (error) {
+    return { success: false, error: `Failed to fetch bookings for property ${propertyId}: ${error.message}` };
+  }
+
+  const rows = (bookings ?? []) as Array<{
+    id: string;
+    tenant_id: string;
+    check_in: string;
+    check_out: string;
+    status: string;
+  }>;
+
+  if (rows.length === 0) {
+    return { success: true, data: { notified: 0 } };
+  }
+
+  let notified = 0;
+
+  for (const booking of rows) {
+    const eventId = `property_updated:${propertyId}:${booking.id}`;
+
+    const payload: Record<string, unknown> = {
+      propertyId,
+      propertyTitle,
+      propertySlug,
+      bookingId: booking.id,
+      checkIn: booking.check_in,
+      checkOut: booking.check_out,
+      changeSummary,
+    };
+
+    try {
+      // Check the tenant's notification preference before writing anything.
+      const send = await shouldSendInApp(booking.tenant_id, 'property_updated');
+      if (!send) continue;
+
+      // Use the outbox for durability — the row is upserted with a dedupe key
+      // so a retry of the same update does not create a second notification.
+      const result = await enqueueNotificationOutbox(
+        booking.tenant_id,
+        'property_updated',
+        payload,
+        eventId,
+      );
+      if (result.success) notified++;
+    } catch (err) {
+      console.error(
+        `[notifyBookedTenantsOfPropertyChange] Failed for booking ${booking.id}:`,
         err,
       );
     }

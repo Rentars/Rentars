@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { supabase } from '@/config/supabase.js';
+import { redactLogFields } from '@/utils/redact.js';
 
 // ─── Request correlation context ──────────────────────────────────────────────
 
@@ -200,6 +201,13 @@ class SecurityLogger {
     meta?: Record<string, unknown>,
   ): Promise<void> {
     const context = getRequestContext();
+
+    // Redact meta before spreading so provider responses, request bodies, or
+    // token values passed as debug metadata cannot reach the log sink.
+    const safeMeta = meta
+      ? (redactLogFields(meta) as Record<string, unknown>)
+      : undefined;
+
     const entry = {
       event,
       userId: userId ?? context?.userId,
@@ -207,7 +215,7 @@ class SecurityLogger {
       method: context?.method,
       path: context?.path,
       timestamp: new Date().toISOString(),
-      ...meta,
+      ...safeMeta,
     };
 
     // Console output always

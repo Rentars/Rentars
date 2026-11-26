@@ -20,25 +20,33 @@ import {
   walletUnlinkSchema,
   validateBody,
 } from '@/validators/auth.validator.js';
-import { createAuthRouteLimiter, emailFromBody, stellarAddressFromBody } from '@/middleware/authRateLimit.middleware.js';
+import {
+  createAuthRouteLimiter,
+  emailFromBody,
+  stellarAddressFromBody,
+  userFromRequest,
+} from '@/middleware/authRateLimit.middleware.js';
 import { captchaMiddleware } from '@/middleware/captcha.middleware.js';
 import { authenticate } from '@/middleware/auth.middleware.js';
 
 const router = Router();
 
-// Each route has its own IP bucket and, where an account identifier is in the body,
-// a per-account bucket. See authRateLimit.middleware.ts for limits and failure policy.
+// Each route has its own budget, keyed by identity class:
+//  - anonymous callers are keyed by the trusted-proxy-resolved client IP
+//  - authenticated callers are keyed by their user id (never by spoofable headers)
+//  - where an account identifier is in the body, an additional per-account bucket applies
+// See authRateLimit.middleware.ts for limits and failure policy.
 const registerLimiter = createAuthRouteLimiter({ name: 'register', accountKey: emailFromBody });
 const loginLimiter = createAuthRouteLimiter({ name: 'login', accountKey: emailFromBody });
-const refreshLimiter = createAuthRouteLimiter({ name: 'refresh' });
+const refreshLimiter = createAuthRouteLimiter({ name: 'refresh', userKey: userFromRequest });
 const passwordResetRequestLimiter = createAuthRouteLimiter({ name: 'password-reset-request', accountKey: emailFromBody });
 const passwordResetConfirmLimiter = createAuthRouteLimiter({ name: 'password-reset-confirm' });
 const verifyEmailLimiter = createAuthRouteLimiter({ name: 'verify-email' });
 const verifyEmailResendLimiter = createAuthRouteLimiter({ name: 'verify-email-resend', accountKey: emailFromBody });
 const walletChallengeLimiter = createAuthRouteLimiter({ name: 'wallet-challenge', accountKey: stellarAddressFromBody });
 const walletVerifyLimiter = createAuthRouteLimiter({ name: 'wallet-verify', accountKey: stellarAddressFromBody });
-const walletLinkLimiter = createAuthRouteLimiter({ name: 'wallet-link', accountKey: stellarAddressFromBody });
-const walletUnlinkLimiter = createAuthRouteLimiter({ name: 'wallet-unlink' });
+const walletLinkLimiter = createAuthRouteLimiter({ name: 'wallet-link', accountKey: stellarAddressFromBody, userKey: userFromRequest });
+const walletUnlinkLimiter = createAuthRouteLimiter({ name: 'wallet-unlink', userKey: userFromRequest });
 
 // POST /api/v1/auth/register — CAPTCHA required
 router.post('/register', registerLimiter, validateBody(registerSchema), captchaMiddleware, register);
@@ -50,10 +58,10 @@ router.post('/login', loginLimiter, validateBody(loginSchema), captchaMiddleware
 router.post('/refresh', refreshLimiter, refreshAccessToken);
 
 // POST /api/v1/auth/logout — revoke refresh token
-router.post('/logout', logout);
+router.post('/logout', refreshLimiter, logout);
 
 // POST /api/v1/auth/logout-all-devices — revoke all refresh tokens for user
-router.post('/logout-all-devices', authenticate, logoutAllDevices);
+router.post('/logout-all-devices', authenticate, refreshLimiter, logoutAllDevices);
 
 // Current identity and server-side role (#916).
 router.get('/me', authenticate, getCurrentUserHandler);

@@ -246,21 +246,40 @@ All triggers execute `update_updated_at_column()` `BEFORE UPDATE` for each row.
 
 ### Authoritative migration command
 
-`setup.sql` is the single authoritative source of truth for the database schema.
-It applies all migrations in the correct order (see `MIGRATIONS_NAMING.md` for the
-canonical ordering of files with shared prefixes).
+The unified migration runner is the single authoritative way to apply migrations:
 
 ```bash
-# Apply the full schema from scratch — aborts immediately on any SQL error
+# Apply pending migrations
+cd apps/backend
+bun run db:migrate
+
+# Preview pending migrations without applying
+bun run db:migrate --dry-run
+```
+
+This runner:
+- Applies migrations in canonical order (see `MIGRATIONS_NAMING.md`)
+- Tracks applied migrations in `schema_migrations` table
+- Validates checksums to detect drift
+- Prevents duplicate or out-of-order migrations
+- Is idempotent: safe to run multiple times
+
+See `MIGRATION_RUNNER.md` for complete documentation.
+
+### Legacy setup.sql (CI only)
+
+`setup.sql` remains for CI compatibility and applies the same migrations via psql includes.
+For local development and deployment, use `bun run db:migrate`.
+
+```bash
+# CI command (do not use locally):
 cd apps/backend/database
 PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1 -f setup.sql
 ```
 
-This is the **same command CI uses**. Running it locally reproduces the exact CI schema.
-
 > **Do not** apply migrations piecemeal by hand unless you are adding a single new
-> file. Always use `setup.sql` for a fresh database. See `MIGRATIONS_NAMING.md` for
-> the naming convention and how to add new migrations.
+> file. Always use `bun run db:migrate` for local development.
+> See `MIGRATIONS_NAMING.md` for the naming convention and how to add new migrations.
 
 ### Validate migration filenames
 

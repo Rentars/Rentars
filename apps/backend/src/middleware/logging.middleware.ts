@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { type Request, type Response, type NextFunction } from 'express';
 import { env } from '../config/env.js';
 import { getRequestContext, runWithRequestContext } from '../services/logging.service.js';
+import { redactLogFields, redactRequestHeaders } from '../utils/redact.js';
 
 // ── Correlation header names ──────────────────────────────────────────────────
 
@@ -49,30 +50,70 @@ export interface LogEntry {
   level: LogLevel;
   message: string;
   timestamp: string;
+  service?: string;
+  environment?: string;
   requestId?: string;
   correlationId?: string;
   bookingId?: string;
   operationId?: string;
   userId?: string;
+  traceId?: string;
+  spanId?: string;
+  correlationId?: string;
   [key: string]: unknown;
 }
 
 /**
+ * Well-known top-level schema keys that are safe to include verbatim.
+ * Every other key on a LogEntry is treated as an "extra" and passed through
+ * redactLogFields before serialisation so that a caller who accidentally
+ * includes a request body, provider response, or auth object cannot leak
+ * credentials into the log-aggregation pipeline.
+ */
+const SAFE_SCHEMA_KEYS = new Set([
+  'level', 'message', 'timestamp', 'requestId', 'userId',
+  'method', 'path', 'status', 'durationMs', 'ip',
+  'userAgent', 'route',
+]);
+
+/**
  * Emit a structured JSON log line.
+ *
  * In development the line is pretty-printed; in production it is a single-line
- * JSON object suitable for log-aggregation pipelines (Loki, CloudWatch, etc.).
+ * JSON object suitable for Loki / CloudWatch / any structured log pipeline.
  *
  * The log is suppressed when its level falls below the configured LOG_LEVEL.
+ *
+ * Before serialisation any field that is not in SAFE_SCHEMA_KEYS is passed
+ * through redactLogFields, ensuring credentials and PII in arbitrary extra
+ * fields are stripped before they reach the log sink.
  */
 export function structuredLog(entry: LogEntry): void {
   const configuredLevel = getConfiguredLevel();
   if (LEVEL_PRIORITY[entry.level] < LEVEL_PRIORITY[configuredLevel]) return;
 
   // Fall back to the AsyncLocalStorage-backed request context for any field
-  // the caller didn't set explicitly, so log calls made deep inside services
-  // (with no direct access to `req`) still carry the correlation id.
+  // the caller didn't set explicitly.
   const context = getRequestContext();
+
+  // Separate safe schema keys from arbitrary extras.
+  const safeFields: Record<string, unknown> = {};
+  const extraFields: Record<string, unknown> = {};
+
+  for (const [k, v] of Object.entries(entry)) {
+    if (SAFE_SCHEMA_KEYS.has(k)) {
+      safeFields[k] = v;
+    } else {
+      extraFields[k] = v;
+    }
+  }
+
+  // Redact extras in-place before merging into the final log line.
+  const redactedExtras = redactLogFields(extraFields) as Record<string, unknown>;
+
   const merged: LogEntry = {
+    service: 'rentars-api',
+    environment: env.NODE_ENV,
     ...entry,
     requestId: entry.requestId ?? context?.requestId,
     correlationId: entry.correlationId ?? context?.correlationId,
@@ -80,6 +121,11 @@ export function structuredLog(entry: LogEntry): void {
     operationId: entry.operationId ?? context?.operationId,
     userId: entry.userId ?? context?.userId,
   };
+
+  // Drop undefined fields so the JSON payload stays clean.
+  for (const key of Object.keys(merged)) {
+    if (merged[key] === undefined) delete merged[key];
+  }
 
   const line =
     env.NODE_ENV === 'development'
@@ -166,11 +212,12 @@ export interface RequestWithId extends Request {
 /**
  * Structured HTTP request/response logger.
  *
- * Emits a single structured log entry per request on response finish, containing:
+ * Emits one structured log entry per request on response finish containing:
  *   - ISO timestamp
  *   - Request-ID, correlation-ID, booking-ID and operation-ID for correlation
  *   - HTTP method, normalised path, status code, duration
  *   - Authenticated user-ID (if present on req.userId)
+ *   - outcome: 'success' | 'client_error' | 'server_error'
  *
  * Auth headers, cookies, request bodies and query strings are never logged so
  * that tokens, wallet secrets and payment payloads cannot leak into logs.
@@ -194,7 +241,14 @@ export function requestLoggingMiddleware(
 
   res.on('finish', () => {
     const duration = Date.now() - startMs;
-    const level: LogLevel = res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info';
+    const level: LogLevel =
+      res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info';
+
+    // Redact request headers so Authorization / Cookie can never appear in
+    // the access log even if they were forwarded by a misconfigured proxy.
+    const safeHeaders = redactRequestHeaders(
+      req.headers as Record<string, string | string[] | undefined>,
+    );
 
     structuredLog({
       level,
@@ -209,7 +263,8 @@ export function requestLoggingMiddleware(
       path: req.path,
       status: res.statusCode,
       durationMs: duration,
-      userAgent: req.headers['user-agent'],
+      // userAgent sourced from the already-redacted header map (safe field)
+      userAgent: safeHeaders['user-agent'] as string | undefined,
       ip: req.ip,
     });
   });

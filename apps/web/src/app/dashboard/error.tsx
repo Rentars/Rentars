@@ -1,5 +1,6 @@
 'use client';
 
+import { useEffect, useId, useRef } from 'react';
 import { ErrorContent } from '@/components/error/ErrorContent';
 import { useI18n } from '@/lib/i18n/I18nProvider';
 

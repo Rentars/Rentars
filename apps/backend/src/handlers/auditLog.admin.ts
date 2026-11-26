@@ -7,49 +7,136 @@ import type { Request, Response } from 'express';
 import { auditLogger } from '@/services/auditLogger.service.js';
 import type { AuditAction, ResourceType } from '@/services/auditLogger.service.js';
 
+/**
+ * Narrow scope required to read audit logs. No other scope grants access.
+ */
+export const AUDIT_READ_SCOPE = 'admin:audit:read';
+
+/**
+ * Maximum window (in ms) allowed for a single audit query. Requests must
+ * supply a bounded time range so operators never scan the whole table.
+ */
+const MAX_TIME_RANGE_MS = 90 * 24 * 60 * 60 * 1000; // 90 days
+
+const DEFAULT_PAGE_SIZE = 50;
+const MAX_PAGE_SIZE = 100;
+
+function hasAuditReadScope(req: Request): boolean {
+  const scopes = (req as any).auth?.scopes ?? (req as any).user?.scopes ?? [];
+  return Array.isArray(scopes) && scopes.includes(AUDIT_READ_SCOPE);
+}
+
+function denyForbidden(res: Response): void {
+  res.status(403).json({
+    error: {
+      code: 'FORBIDDEN',
+      message: 'Audit log access requires the admin:audit:read scope',
+    },
+  });
+}
+
+function badRequest(res: Response, code: string, message: string): void {
+  res.status(400).json({ error: { code, message } });
+}
+
+function parseDate(value: string | undefined): Date | undefined {
+  if (!value) return undefined;
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? undefined : d;
+}
+
+function parsePositiveInt(value: string | undefined, fallback: number): number {
+  const n = parseInt(value ?? '', 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
 export async function searchAuditLogs(req: Request, res: Response): Promise<void> {
+  if (!hasAuditReadScope(req)) {
+    denyForbidden(res);
+    return;
+  }
+
   try {
     const {
       actorId,
-      resourceType,
-      resourceId,
       action,
+      targetType,
+      targetId,
       since,
       until,
-      limit = 50,
-      offset = 0,
+      page = '1',
+      pageSize = String(DEFAULT_PAGE_SIZE),
     } = req.query as {
       actorId?: string;
-      resourceType?: ResourceType;
-      resourceId?: string;
       action?: AuditAction;
+      targetType?: ResourceType;
+      targetId?: string;
       since?: string;
       until?: string;
-      limit?: string;
-      offset?: string;
+      page?: string;
+      pageSize?: string;
     };
 
-    const filters: Parameters<typeof auditLogger.query>[0] = {};
+    const sinceDate = parseDate(since);
+    const untilDate = parseDate(until);
 
-    if (actorId) filters.actorId = actorId;
-    if (resourceType) filters.resourceType = resourceType;
-    if (resourceId) filters.resourceId = resourceId;
-    if (action) filters.action = action;
-    if (since) filters.since = new Date(since);
-    if (until) filters.until = new Date(until);
+    // Require a bounded time range.
+    if (!sinceDate || !untilDate) {
+      badRequest(
+        res,
+        'MISSING_TIME_RANGE',
+        'A bounded time range (since and until) is required',
+      );
+      return;
+    }
+    if (sinceDate > untilDate) {
+      badRequest(res, 'INVALID_TIME_RANGE', 'since must be before until');
+      return;
+    }
+    if (untilDate.getTime() - sinceDate.getTime() > MAX_TIME_RANGE_MS) {
+      badRequest(
+        res,
+        'TIME_RANGE_TOO_LARGE',
+        'Time range must not exceed 90 days',
+      );
+      return;
+    }
 
-    const parsedLimit = Math.min(parseInt(limit, 10) || 50, 100);
-    const parsedOffset = Math.max(parseInt(offset, 10) || 0, 0);
+    // Require at least one specific filter beyond the time range.
+    if (!actorId && !action && !targetType && !targetId) {
+      badRequest(
+        res,
+        'MISSING_FILTER',
+        'At least one of actorId, action, targetType, or targetId is required',
+      );
+      return;
+    }
 
-    const result = await auditLogger.query(filters, parsedLimit, parsedOffset);
+    const parsedPage = parsePositiveInt(page, 1);
+    const parsedPageSize = Math.min(
+      parsePositiveInt(pageSize, DEFAULT_PAGE_SIZE),
+      MAX_PAGE_SIZE,
+    );
+
+    const result = await auditLogger.listAuditLogs({
+      actorId,
+      action,
+      targetType,
+      targetId,
+      since: sinceDate,
+      until: untilDate,
+      page: parsedPage,
+      pageSize: parsedPageSize,
+    });
 
     res.json({
       data: result.entries,
       pagination: {
-        limit: parsedLimit,
-        offset: parsedOffset,
+        page: parsedPage,
+        pageSize: parsedPageSize,
         total: result.total,
-        hasMore: parsedOffset + parsedLimit < result.total,
+        totalPages: Math.ceil(result.total / parsedPageSize),
+        hasMore: parsedPage * parsedPageSize < result.total,
       },
     });
   } catch (err) {
@@ -64,6 +151,11 @@ export async function searchAuditLogs(req: Request, res: Response): Promise<void
 }
 
 export async function getResourceHistory(req: Request, res: Response): Promise<void> {
+  if (!hasAuditReadScope(req)) {
+    denyForbidden(res);
+    return;
+  }
+
   try {
     const { resourceType, resourceId, limit = '50' } = req.query as {
       resourceType?: string;
@@ -102,6 +194,11 @@ export async function getResourceHistory(req: Request, res: Response): Promise<v
 }
 
 export async function getActorHistory(req: Request, res: Response): Promise<void> {
+  if (!hasAuditReadScope(req)) {
+    denyForbidden(res);
+    return;
+  }
+
   try {
     const { actorId, limit = '50' } = req.query as {
       actorId?: string;

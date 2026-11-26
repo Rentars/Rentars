@@ -24,6 +24,11 @@ export interface AccessibleMarkerProps {
   onSelect?: (source: PinSelectSource) => void;
   /** Extra Leaflet handlers (delegated before the built-in behaviour). */
   eventHandlers?: Record<string, EventHandler | undefined>;
+  /**
+   * Called when the marker's popup closes (including Escape). Focus is returned
+   * to the originating pin when the interaction started from the keyboard.
+   */
+  onClose?: () => void;
   children?: React.ReactNode;
 }
 
@@ -53,6 +58,7 @@ export default function AccessibleMarker({
   selected = false,
   onSelect,
   eventHandlers,
+  onClose,
   children,
 }: AccessibleMarkerProps) {
   const markerRef = useRef<LeafletMarker | null>(null);
@@ -74,10 +80,29 @@ export default function AccessibleMarker({
     }
   }, [label, selected, icon]);
 
+  // Leaflet fires `popupclose` on the marker for pointer closes, Escape and
+  // programmatic closes. Return focus to the pin for keyboard users so they
+  // are never stranded inside a removed popup.
+  useEffect(() => {
+    const marker = markerRef.current;
+    if (!marker?.on) return;
+    const handlePopupClose = () => {
+      if (keyboardActivationRef.current) {
+        marker.getElement?.()?.focus();
+        keyboardActivationRef.current = false;
+      }
+      onClose?.();
+    };
+    marker.on('popupclose', handlePopupClose);
+    return () => {
+      marker.off?.('popupclose', handlePopupClose);
+    };
+  }, [onClose]);
+
   const handleClick: EventHandler = (event) => {
     eventHandlers?.click?.(event);
     const source: PinSelectSource = keyboardActivationRef.current ? 'keyboard' : 'pointer';
-    keyboardActivationRef.current = false;
+    if (source === 'pointer') keyboardActivationRef.current = false;
     onSelect?.(source);
   };
 
@@ -86,6 +111,12 @@ export default function AccessibleMarker({
     const original = (event as { originalEvent?: KeyboardEvent }).originalEvent;
     // Leaflet activates markers on Enter; without this, Space would scroll the
     // page instead of selecting the listing.
+    if (original?.key === 'Enter') {
+      // Leaflet activates the marker itself on Enter; remember the input source
+      // so a later Escape/popup close can restore focus here.
+      keyboardActivationRef.current = true;
+      return;
+    }
     if (original && (original.key === ' ' || original.key === 'Spacebar')) {
       original.preventDefault();
       keyboardActivationRef.current = true;

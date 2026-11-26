@@ -22,6 +22,20 @@
 #   DRILL_BACKUP_OUT           directory that keeps the encrypted backup and checksum
 #   DRILL_REPORT_DIR           report directory (default: restore-drill-reports)
 #   DRILL_REQUIRED_EXTENSIONS  space-separated extensions (default: "postgis btree_gist")
+#   DRILL_RPO_SECONDS          recovery point objective (default: 86400 = 24h); the
+#                              drill fails when the backup is older than this
+#   DRILL_RTO_SECONDS          recovery time objective (default: 3600 = 1h); the
+#                              drill fails when the restore takes longer than this
+#   DRILL_EXPECTED_MIGRATION   latest migration name expected in the restored
+#                              schema_migrations table (release manifest); when set,
+#                              a mismatch fails the drill
+#
+# Sanitized source requirement: the source database (PROD_DB_* or the database
+# captured in DRILL_SOURCE_BACKUP) MUST be a sanitized non-production snapshot.
+# Production secrets, credentials and PII must never be present in it, because
+# the restored copy lands in the isolated verify instance. This script never
+# copies configuration or secret stores into the verify database; only the
+# database dump is restored.
 #
 # Usage: bash scripts/backup-restore-drill.sh
 
@@ -40,6 +54,12 @@ VERIFY_DB="rentars_verify_$(tr -cd '0-9' <<<"$DRILL_ID")"
 WORK_DIR="$(mktemp -d)"
 LOG_FILE="$WORK_DIR/drill.log"
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+DRILL_STARTED_AT="$(date +%s)"
+
+# Documented recovery objectives. Owners: see docs/operations/backup-restore.md.
+RPO_SECONDS="${DRILL_RPO_SECONDS:-86400}"
+RTO_SECONDS_TARGET="${DRILL_RTO_SECONDS:-3600}"
+EXPECTED_MIGRATION="${DRILL_EXPECTED_MIGRATION:-}"
 
 SOURCE_MODE=""
 BACKUP_TAKEN_AT=0
@@ -47,6 +67,12 @@ BACKUP_BYTES=0
 BACKUP_SHA256=""
 RESTORE_STARTED_AT=0
 RTO_SECONDS=""
+RPO_STATUS="skipped"
+RTO_STATUS="skipped"
+MIGRATION_STATUS="skipped"
+MIGRATION_APPLIED=""
+DRILL_DURATION_SECONDS=""
+REMEDIATION=()
 VERIFY_CREATED=0
 FAILURES=0
 CHECKS=()
@@ -126,8 +152,15 @@ json_escape() {
   printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\n'
 }
 
+# remediation <note>: records a follow-up action for the operational process.
+remediation() {
+  REMEDIATION+=("$1")
+  log "REMEDIATION: $1"
+}
+
 write_report() {
   local rc=$1 status=passed now backup_age=null sep="" entry name state detail
+  local rem_sep="" note
   if (( rc != 0 || FAILURES > 0 )); then
     status=failed
   fi
@@ -135,6 +168,7 @@ write_report() {
   if (( BACKUP_TAKEN_AT > 0 )); then
     backup_age=$((now - BACKUP_TAKEN_AT))
   fi
+  DRILL_DURATION_SECONDS=$((now - DRILL_STARTED_AT))
 
   mkdir -p "$REPORT_DIR"
   {
@@ -143,10 +177,23 @@ write_report() {
     printf '  "status": "%s",\n' "$status"
     printf '  "started_at": "%s",\n' "$STARTED_AT"
     printf '  "finished_at": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '  "drill_duration_seconds": %s,\n' "$DRILL_DURATION_SECONDS"
     printf '  "backup": {"source": "%s", "sha256": "%s", "bytes": %s, "taken_at_epoch": %s},\n' \
       "$SOURCE_MODE" "$BACKUP_SHA256" "$BACKUP_BYTES" "$BACKUP_TAKEN_AT"
+    printf '  "objectives": {\n'
+    printf '    "rpo_seconds": %s, "rpo_status": "%s",\n' "$RPO_SECONDS" "$RPO_STATUS"
+    printf '    "rto_seconds": %s, "rto_status": "%s"\n' "$RTO_SECONDS_TARGET" "$RTO_STATUS"
+    printf '  },\n'
     printf '  "recovery": {"rto_seconds": %s, "backup_age_seconds": %s},\n' \
       "${RTO_SECONDS:-null}" "$backup_age"
+    printf '  "migration": {"expected": "%s", "applied": "%s", "status": "%s"},\n' \
+      "$(json_escape "$EXPECTED_MIGRATION")" "$(json_escape "$MIGRATION_APPLIED")" "$MIGRATION_STATUS"
+    printf '  "remediation": ['
+    for note in "${REMEDIATION[@]}"; do
+      printf '%s"%s"' "$rem_sep" "$(json_escape "$note")"
+      rem_sep=', '
+    done
+    printf '],\n'
     printf '  "checks": [\n'
     for entry in "${CHECKS[@]}"; do
       IFS='|' read -r name state detail <<<"$entry"
@@ -367,6 +414,46 @@ validate_restore() {
     check references fail "$orphans orphaned payment or booking rows"
   fi
 
+  # Explicit booking/payment integrity queries beyond the aggregate reference
+  # check, so a failure names the broken relationship.
+  local orphan_payments orphan_bookings escrow_mismatch
+  orphan_payments="$(pg_verify "$VERIFY_DB" -c "
+    SELECT count(*) FROM payments p
+    WHERE NOT EXISTS (SELECT 1 FROM bookings b WHERE b.id = p.booking_id)")"
+  if [[ "$orphan_payments" == 0 ]]; then
+    check integrity:orphan_payments pass "every payment references an existing booking"
+  else
+    check integrity:orphan_payments fail "$orphan_payments payments reference a missing booking"
+    remediation "Investigate $orphan_payments orphaned payment rows; check FK constraints on payments.booking_id."
+  fi
+
+  orphan_bookings="$(pg_verify "$VERIFY_DB" -c "
+    SELECT count(*) FROM bookings b
+    WHERE NOT EXISTS (SELECT 1 FROM properties pr WHERE pr.id = b.property_id)")"
+  if [[ "$orphan_bookings" == 0 ]]; then
+    check integrity:orphan_bookings pass "every booking references an existing property"
+  else
+    check integrity:orphan_bookings fail "$orphan_bookings bookings reference a missing property"
+    remediation "Investigate $orphan_bookings bookings without a property; check FK constraints on bookings.property_id."
+  fi
+
+  # Escrow state consistency: a booking marked as paid must have at least one
+  # completed payment, and a completed payment must belong to a paid booking.
+  escrow_mismatch="$(pg_verify "$VERIFY_DB" -c "
+    SELECT (SELECT count(*) FROM bookings b
+              WHERE b.status = 'paid'
+                AND NOT EXISTS (SELECT 1 FROM payments p
+                                WHERE p.booking_id = b.id AND p.status = 'completed'))
+         + (SELECT count(*) FROM payments p
+              JOIN bookings b ON b.id = p.booking_id
+             WHERE p.status = 'completed' AND b.status <> 'paid')")"
+  if [[ "$escrow_mismatch" == 0 ]]; then
+    check integrity:escrow_state pass "booking and payment states are consistent"
+  else
+    check integrity:escrow_state fail "$escrow_mismatch booking/payment state mismatches"
+    remediation "Reconcile $escrow_mismatch booking/payment state mismatches before relying on this backup."
+  fi
+
   if pg_verify "$VERIFY_DB" -c "SELECT id, email FROM users LIMIT 1" >/dev/null; then
     check read_probe pass "user read succeeded"
   else
@@ -396,6 +483,65 @@ SQL
   RTO_SECONDS=$(( $(date +%s) - RESTORE_STARTED_AT ))
 }
 
+verify_migration() {
+  local applied
+  if ! applied="$(pg_verify "$VERIFY_DB" -c "
+    SELECT version FROM public.schema_migrations ORDER BY version DESC LIMIT 1" 2>/dev/null)"; then
+    MIGRATION_STATUS=fail
+    check migration_compatibility fail "schema_migrations table missing or unreadable after restore"
+    remediation "Ensure the backup includes the schema_migrations table so migration state can be verified."
+    return
+  fi
+  MIGRATION_APPLIED="$applied"
+  if [[ -z "$EXPECTED_MIGRATION" ]]; then
+    MIGRATION_STATUS=skipped
+    check migration_compatibility skipped "latest applied migration '$applied'; no DRILL_EXPECTED_MIGRATION set"
+    return
+  fi
+  if [[ "$applied" == "$EXPECTED_MIGRATION" ]]; then
+    MIGRATION_STATUS=pass
+    check migration_compatibility pass "latest applied migration matches release manifest ($applied)"
+  else
+    MIGRATION_STATUS=fail
+    check migration_compatibility fail "latest applied migration '$applied' != expected '$EXPECTED_MIGRATION'"
+    remediation "Backup migration state '$applied' does not match release '$EXPECTED_MIGRATION'; re-export from a migrated source."
+  fi
+}
+
+verify_objectives() {
+  local now backup_age
+  now="$(date +%s)"
+
+  if (( BACKUP_TAKEN_AT > 0 )); then
+    backup_age=$((now - BACKUP_TAKEN_AT))
+    if (( backup_age <= RPO_SECONDS )); then
+      RPO_STATUS=pass
+      check rpo pass "backup age ${backup_age}s within RPO ${RPO_SECONDS}s"
+    else
+      RPO_STATUS=fail
+      check rpo fail "backup age ${backup_age}s exceeds RPO ${RPO_SECONDS}s"
+      remediation "Backup is older than the RPO; increase backup frequency or fix the backup schedule."
+    fi
+  else
+    RPO_STATUS=skipped
+    check rpo skipped "backup timestamp unknown"
+  fi
+
+  if [[ -n "$RTO_SECONDS" ]]; then
+    if (( RTO_SECONDS <= RTO_SECONDS_TARGET )); then
+      RTO_STATUS=pass
+      check rto pass "restore took ${RTO_SECONDS}s within RTO ${RTO_SECONDS_TARGET}s"
+    else
+      RTO_STATUS=fail
+      check rto fail "restore took ${RTO_SECONDS}s, exceeds RTO ${RTO_SECONDS_TARGET}s"
+      remediation "Restore exceeded the RTO; investigate restore throughput and verify instance sizing."
+    fi
+  else
+    RTO_STATUS=skipped
+    check rto skipped "restore duration not measured"
+  fi
+}
+
 main() {
   require_env BACKUP_ENCRYPTION_KEY VERIFY_DB_HOST VERIFY_DB_USER VERIFY_DB_PASSWORD
   if [[ -z "${DRILL_SOURCE_BACKUP:-}" ]]; then
@@ -417,11 +563,13 @@ main() {
   create_verify_db
   restore_backup
   validate_restore
+  verify_migration
+  verify_objectives
 
   if (( FAILURES > 0 )); then
     fatal "$FAILURES check(s) failed"
   fi
-  log "Drill passed: RTO ${RTO_SECONDS}s, backup age $(( $(date +%s) - BACKUP_TAKEN_AT ))s"
+  log "Drill passed: RTO ${RTO_SECONDS}s (target ${RTO_SECONDS_TARGET}s), backup age $(( $(date +%s) - BACKUP_TAKEN_AT ))s (RPO ${RPO_SECONDS}s)"
 }
 
 main "$@"

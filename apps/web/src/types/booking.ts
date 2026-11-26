@@ -1,23 +1,104 @@
-// ─── Booking status ───────────────────────────────────────────────────────────
-
 /**
- * All valid booking status values.
+ * Booking types — re-exported from the canonical Zod schema.
  *
- * DB stores title-case (Pending, Confirmed, …) but the frontend normalises
- * everything to lowercase for comparisons so both forms are included.
+ * The Zod schema at @/lib/api-schemas/booking.schema is the single source of
+ * truth.  Import directly from there to access the schema validators. This
+ * file re-exports the inferred TypeScript types for backwards compatibility
+ * with existing code that imports from @/types/booking.
  */
-export type BookingStatus =
-  | 'Pending'   | 'pending'
-  | 'Confirmed' | 'confirmed'
-  | 'Completed' | 'completed'
-  | 'Cancelled' | 'cancelled'
-  | 'Disputed'  | 'disputed'
-  | 'escrow_reconcile_failed';
+
+export type {
+  BookingStatus,
+  EscrowStatus,
+  BookingDetail as Booking,
+  BookingListResponse,
+  CreateBookingRequest as BookingFormData,
+} from '@/lib/api-schemas/booking.schema';
+
+export {
+  BookingStatusSchema,
+  EscrowStatusSchema,
+  BookingDetailSchema,
+  BookingListResponseSchema,
+} from '@/lib/api-schemas/booking.schema';
+
+// ── Utility helpers (not part of the schema) ──────────────────────────────────
 
 /** Normalise a raw status string from the API to lowercase. */
-export function normaliseStatus(status: string): Lowercase<BookingStatus> {
-  return status.toLowerCase() as Lowercase<BookingStatus>;
+export function normaliseStatus(status: string): string {
+  return status.toLowerCase();
 }
+
+// ─── Semantic status tokens ──────────────────────────────────────────────────
+
+/**
+ * Semantic status categories shared by badges, alerts and blockchain status
+ * components. These map onto the shared design tokens (success, warning,
+ * error, pending, focus) so state is never communicated by color alone.
+ */
+export type SemanticStatus =
+  | 'success'
+  | 'warning'
+  | 'error'
+  | 'pending'
+  | 'neutral';
+
+/** Human-readable label for each semantic status (used alongside icons). */
+export const SEMANTIC_STATUS_LABELS: Record<SemanticStatus, string> = {
+  success: 'Success',
+  warning: 'Warning',
+  error: 'Error',
+  pending: 'Pending',
+  neutral: 'Neutral',
+};
+
+/**
+ * Map a booking status to its semantic status category. Unknown or
+ * reconciliation-failure states fall back to `error` so they are never
+ * presented as a confirmed success.
+ */
+export function bookingStatusToSemantic(status: string): SemanticStatus {
+  switch (normaliseStatus(status)) {
+    case 'confirmed':
+    case 'completed':
+      return 'success';
+    case 'pending':
+      return 'pending';
+    case 'disputed':
+    case 'escrow_reconcile_failed':
+      return 'error';
+    case 'cancelled':
+      return 'neutral';
+    default:
+      return 'warning';
+  }
+}
+
+// ─── Async state ─────────────────────────────────────────────────────────────
+
+/**
+ * Typed async state used by data hooks (booking history, notifications,
+ * wishlists, analytics, search). Distinguishes initial loading from
+ * background refresh and never represents stale data as confirmed success.
+ */
+export type AsyncState<T> =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'success'; data: T; isStale: boolean; refreshedAt: string | null }
+  | { status: 'error'; error: Error; isRecoverable: boolean; previousData: T | null };
+
+/** Metadata describing a refresh of already-loaded data. */
+export interface RefreshMeta {
+  /** True while a background refresh is in flight over existing data. */
+  isRefreshing: boolean;
+  /** ISO timestamp of the last confirmed successful response. */
+  refreshedAt: string | null;
+  /** True when the displayed data predates the latest successful fetch. */
+  isStale: boolean;
+}
+
+/** Initial async state before any request has been made. */
+export const IDLE_ASYNC_STATE: AsyncState<never> = { status: 'idle' };
 
 // ─── Allowed lifecycle transitions ───────────────────────────────────────────
 
@@ -25,12 +106,15 @@ export function normaliseStatus(status: string): Lowercase<BookingStatus> {
  * Valid transitions the current user (tenant) may trigger from each state.
  * Mirrors the server-side state machine.
  */
-export const TENANT_TRANSITIONS: Record<string, ('confirm' | 'complete' | 'cancel' | 'dispute')[]> = {
-  pending:   ['cancel'],
+export const TENANT_TRANSITIONS: Record<
+  string,
+  ('confirm' | 'complete' | 'cancel' | 'dispute')[]
+> = {
+  pending: ['cancel'],
   confirmed: ['complete', 'dispute', 'cancel'],
   completed: [],
   cancelled: [],
-  disputed:  [],
+  disputed: [],
 };
 
 // ─── Payment / transaction status ────────────────────────────────────────────
@@ -209,14 +293,80 @@ export interface Booking {
   rate_stale?: boolean;
 }
 
-export interface BookingFormData {
-  checkIn: Date;
-  checkOut: Date;
-  guestCount: number;
-  propertyId: string;
+// ─── Dispute timeline (participant-safe read model) ──────────────────────────
+
+/**
+ * Lifecycle stages of a dispute as exposed to participants.
+ *
+ * A recorded decision is deliberately distinct from the financial settlement
+ * that follows it: a refund or release may still be pending (or may fail)
+ * after the decision has been recorded.
+ */
+export type DisputeTimelineStage =
+  | 'opened'
+  | 'under_review'
+  | 'decision_recorded'
+  | 'settlement_pending'
+  | 'settlement_completed'
+  | 'settlement_failed';
+
+/** Financial action that a dispute decision may trigger. */
+export type DisputeFinancialAction = 'refund' | 'release' | 'none';
+
+/** Verified state of the financial action, sourced from the payment ledger. */
+export type DisputeSettlementStatus =
+  | 'not_required'
+  | 'pending'
+  | 'completed'
+  | 'failed';
+
+/** A single entry in the participant-safe dispute timeline. */
+export interface DisputeTimelineEvent {
+  id: string;
+  stage: DisputeTimelineStage;
+  /** ISO timestamp of when this transition occurred. */
+  occurred_at: string;
+  /** Participant-facing summary. Never contains internal evidence or reviewer notes. */
+  message?: string | null;
+  /** Financial action associated with this event, if any. */
+  financial_action?: DisputeFinancialAction;
+  /** Verified settlement status at the time of this event. */
+  settlement_status?: DisputeSettlementStatus;
 }
 
-export interface BookingWithProperty extends Booking {
+/**
+ * Aggregated dispute timeline for a booking.
+ *
+ * `decision_recorded` reflects that a decision exists; it does NOT imply the
+ * refund/release has completed. Consumers must check `settlement_status`
+ * (and `settlement_completed_at`) before presenting the dispute as resolved.
+ */
+export interface DisputeTimeline {
+  booking_id: string;
+  dispute_id?: string;
+  /** Current authoritative stage, derived from decision history + payment state. */
+  current_stage: DisputeTimelineStage;
+  /** Whether a decision has been recorded (independent of settlement). */
+  decision_recorded: boolean;
+  /** ISO timestamp of the recorded decision, if any. */
+  decision_recorded_at?: string | null;
+  /** Financial action resulting from the decision, if any. */
+  financial_action: DisputeFinancialAction;
+  /** Verified settlement state from the payment ledger. */
+  settlement_status: DisputeSettlementStatus;
+  /** ISO timestamp when settlement was verified complete, if applicable. */
+  settlement_completed_at?: string | null;
+  /** ISO timestamp of the last settlement attempt (successful or not). */
+  settlement_last_attempt_at?: string | null;
+  /** Participant-safe failure reason when settlement_status is 'failed'. */
+  settlement_failure_reason?: string | null;
+  /** Ordered events, oldest first. */
+  events: DisputeTimelineEvent[];
+}
+
+import type { BookingDetail } from '@/lib/api-schemas/booking.schema';
+
+export interface BookingWithProperty extends BookingDetail {
   property?: {
     id: string;
     title: string;

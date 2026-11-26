@@ -41,6 +41,13 @@ export const CITY_MAX = 100;
 export const COUNTRY_MAX = 100;
 export const LAT_RANGE: [number, number] = [-90, 90];
 export const LNG_RANGE: [number, number] = [-180, 180];
+/**
+ * Guest capacity bounds. Mirrors the backend constants (MAX_GUESTS_MIN / MAX_GUESTS_MAX in
+ * property.validator.ts) and the database CHECK constraint on listings.max_guests, so the
+ * form, search filters, quotes and booking creation all agree on the valid range.
+ */
+export const MAX_GUESTS_MIN = 1;
+export const MAX_GUESTS_MAX = 50;
 
 /** Canonical amenity ids accepted by the API (apps/backend/src/types/amenities.ts). */
 export const AMENITY_OPTIONS: ReadonlyArray<{ id: string; label: string }> = [
