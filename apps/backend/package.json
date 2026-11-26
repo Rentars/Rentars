@@ -21,6 +21,8 @@
     "test:api": "bash tests/api/simple.test.sh && bash tests/api/endpoints.test.sh && bash tests/api/profile.test.sh",
     "test:docker": "bash tests/docker/integration.test.sh",
     "test:contract": "bun test tests/contract.test.ts",
+    "test:schema-contract": "bun test tests/schema-contract.test.ts",
+    "test:search-benchmark": "bun test tests/search-benchmark.test.ts",
     "test:property-based": "bun test tests/unit/property-based.test.ts",
     "test:concurrency": "bun test tests/integration/concurrency.test.ts",
     "test:performance": "bun test tests/integration/booking-performance.test.ts",

@@ -1,13 +1,15 @@
-/** Shared types for search — used by usePropertySearch and FilterSidebar. */
+/**
+ * Search types — re-exported from the canonical Zod schema.
+ *
+ * Import from @/lib/api-schemas/property.schema to access the Zod validators.
+ */
 
-export interface PriceHistogramBucket {
-  /** Lower bound of this bucket (inclusive). */
-  min: number;
-  /** Upper bound of this bucket (exclusive, except the last bucket). */
-  max: number;
-  /** Number of listings in this bucket. */
-  count: number;
-}
+export type {
+  PriceHistogramBucket,
+  PriceHistogramResult as PriceHistogramResult,
+  ZeroResultSuggestion,
+  AdvancedSearchResponse,
+} from '@/lib/api-schemas/property.schema';
 
 export interface PriceHistogramResult {
   buckets: PriceHistogramBucket[];

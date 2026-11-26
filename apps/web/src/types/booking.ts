@@ -1,22 +1,32 @@
-// ─── Booking status ───────────────────────────────────────────────────────────
-
 /**
- * All valid booking status values.
+ * Booking types — re-exported from the canonical Zod schema.
  *
- * DB stores title-case (Pending, Confirmed, …) but the frontend normalises
- * everything to lowercase for comparisons so both forms are included.
+ * The Zod schema at @/lib/api-schemas/booking.schema is the single source of
+ * truth.  Import directly from there to access the schema validators. This
+ * file re-exports the inferred TypeScript types for backwards compatibility
+ * with existing code that imports from @/types/booking.
  */
-export type BookingStatus =
-  | 'Pending'   | 'pending'
-  | 'Confirmed' | 'confirmed'
-  | 'Completed' | 'completed'
-  | 'Cancelled' | 'cancelled'
-  | 'Disputed'  | 'disputed'
-  | 'escrow_reconcile_failed';
+
+export type {
+  BookingStatus,
+  EscrowStatus,
+  BookingDetail as Booking,
+  BookingListResponse,
+  CreateBookingRequest as BookingFormData,
+} from '@/lib/api-schemas/booking.schema';
+
+export {
+  BookingStatusSchema,
+  EscrowStatusSchema,
+  BookingDetailSchema,
+  BookingListResponseSchema,
+} from '@/lib/api-schemas/booking.schema';
+
+// ── Utility helpers (not part of the schema) ──────────────────────────────────
 
 /** Normalise a raw status string from the API to lowercase. */
-export function normaliseStatus(status: string): Lowercase<BookingStatus> {
-  return status.toLowerCase() as Lowercase<BookingStatus>;
+export function normaliseStatus(status: string): string {
+  return status.toLowerCase();
 }
 
 // ─── Semantic status tokens ──────────────────────────────────────────────────
@@ -96,12 +106,15 @@ export const IDLE_ASYNC_STATE: AsyncState<never> = { status: 'idle' };
  * Valid transitions the current user (tenant) may trigger from each state.
  * Mirrors the server-side state machine.
  */
-export const TENANT_TRANSITIONS: Record<string, ('confirm' | 'complete' | 'cancel' | 'dispute')[]> = {
-  pending:   ['cancel'],
+export const TENANT_TRANSITIONS: Record<
+  string,
+  ('confirm' | 'complete' | 'cancel' | 'dispute')[]
+> = {
+  pending: ['cancel'],
   confirmed: ['complete', 'dispute', 'cancel'],
   completed: [],
   cancelled: [],
-  disputed:  [],
+  disputed: [],
 };
 
 // ─── Payment / transaction status ────────────────────────────────────────────
@@ -351,14 +364,9 @@ export interface DisputeTimeline {
   events: DisputeTimelineEvent[];
 }
 
-export interface BookingFormData {
-  checkIn: Date;
-  checkOut: Date;
-  guestCount: number;
-  propertyId: string;
-}
+import type { BookingDetail } from '@/lib/api-schemas/booking.schema';
 
-export interface BookingWithProperty extends Booking {
+export interface BookingWithProperty extends BookingDetail {
   property?: {
     id: string;
     title: string;

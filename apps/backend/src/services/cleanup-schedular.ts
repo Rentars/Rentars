@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { syncAllBookings, syncAllProperties, reconcileAllPendingEscrows } from './sync.service.js';
 import { purgeExpired as purgeExpiredIdempotencyKeys } from './idempotency.service.js';
 import { BookingService } from './booking.service.js';
@@ -8,6 +9,31 @@ import {
   type RetentionRunSummary,
 } from './retention.service.js';
 import { env } from '@/config/env.js';
+import { structuredLog } from '@/middleware/logging.middleware.js';
+
+// ── Shared log context ────────────────────────────────────────────────────────
+
+const SERVICE = 'scheduler';
+
+/** Emit a structured log line pre-filled with service + environment. */
+function schedLog(
+  level: 'debug' | 'info' | 'warn' | 'error',
+  message: string,
+  correlationId: string,
+  extra: Record<string, unknown> = {},
+): void {
+  structuredLog({
+    level,
+    message,
+    timestamp: new Date().toISOString(),
+    service: SERVICE,
+    environment: env.NODE_ENV,
+    correlationId,
+    ...extra,
+  });
+}
+
+// ── Worker instances ──────────────────────────────────────────────────────────
 
 const bookingService = new BookingService();
 
@@ -21,83 +47,122 @@ const MAX_CONCURRENT_RECONCILIATIONS = 5;
 const INITIAL_BACKOFF_MS = 1000; // 1 second
 const MAX_BACKOFF_MS = 30000; // 30 seconds
 
-/**
- * How often the full data-retention sweep runs.
- * Default: once every 24 hours.  Configurable via RETENTION_INTERVAL_HOURS.
- */
 const RETENTION_INTERVAL_MS =
   (env.RETENTION_INTERVAL_HOURS ?? 24) * 60 * 60 * 1000;
 
-/**
- * Delay before the startup dry-run preview fires.
- * Set short (10 s) so operators see a preview soon after boot without
- * blocking the server from accepting traffic.
- */
 const RETENTION_STARTUP_PREVIEW_DELAY_MS = 10_000;
 
+const MAX_CONCURRENT_RECONCILIATIONS = 5;
+const INITIAL_BACKOFF_MS             = 1_000;
+const MAX_BACKOFF_MS                 = 30_000;
+
+// ── Run-once guards (prevent tick overlap within the same process) ─────────────
+
 let concurrentReconciliations = 0;
-let reconciliationBackoffMs = INITIAL_BACKOFF_MS;
+let reconciliationBackoffMs   = INITIAL_BACKOFF_MS;
 let notificationOutboxRunning = false;
+let bookingExpiryRunning      = false;
+let retentionRunning          = false;
 
-/** Guard: prevent two full retention runs from overlapping. */
-let retentionRunning = false;
-
-/**
- * Guard: prevent two booking-expiry sweeps from overlapping in-process. The
- * underlying write is already claim-based and safe across processes/replicas
- * (see `transitionStatus` in booking.service.ts), but skipping an overlapping
- * tick here avoids doing the same read work twice if a sweep runs long.
- */
-let bookingExpiryRunning = false;
+// ─────────────────────────────────────────────────────────────────────────────
+// Blockchain sync
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function runSync(): Promise<void> {
+  const correlationId = randomUUID();
+  const start = Date.now();
+
+  schedLog('info', 'blockchain sync started', correlationId, { job: 'blockchain-sync' });
+
   const propertiesResult = await syncAllProperties();
   if (propertiesResult.success) {
-    console.log(
-      `[sync] Properties: ${propertiesResult.data?.synced} synced, ${propertiesResult.data?.failed} failed`,
-    );
+    schedLog('info', 'property sync complete', correlationId, {
+      job: 'blockchain-sync',
+      outcome: 'success',
+      synced: propertiesResult.data?.synced,
+      failed: propertiesResult.data?.failed,
+    });
   } else {
-    console.error(`[sync] Property sync failed: ${propertiesResult.error}`);
+    schedLog('error', 'property sync failed', correlationId, {
+      job: 'blockchain-sync',
+      outcome: 'failure',
+      error: propertiesResult.error,
+    });
   }
 
   const bookingsResult = await syncAllBookings();
   if (bookingsResult.success) {
-    console.log(
-      `[sync] Bookings: ${bookingsResult.data?.synced} synced, ${bookingsResult.data?.failed} failed`,
-    );
+    schedLog('info', 'booking sync complete', correlationId, {
+      job: 'blockchain-sync',
+      outcome: 'success',
+      synced: bookingsResult.data?.synced,
+      failed: bookingsResult.data?.failed,
+      durationMs: Date.now() - start,
+    });
   } else {
-    console.error(`[sync] Booking sync failed: ${bookingsResult.error}`);
+    schedLog('error', 'booking sync failed', correlationId, {
+      job: 'blockchain-sync',
+      outcome: 'failure',
+      error: bookingsResult.error,
+      durationMs: Date.now() - start,
+    });
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Escrow reconciliation
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function runEscrowReconciliation(): Promise<void> {
   if (concurrentReconciliations >= MAX_CONCURRENT_RECONCILIATIONS) {
-    console.log(`[reconcile] Skipping reconciliation — max concurrency (${MAX_CONCURRENT_RECONCILIATIONS}) reached`);
+    const correlationId = randomUUID();
+    schedLog('warn', 'escrow reconciliation skipped — max concurrency reached', correlationId, {
+      job: 'escrow-reconciliation',
+      outcome: 'skipped',
+      concurrentReconciliations,
+      maxConcurrentReconciliations: MAX_CONCURRENT_RECONCILIATIONS,
+    });
     return;
   }
 
+  const correlationId = randomUUID();
+  const start = Date.now();
   concurrentReconciliations++;
+
+  schedLog('info', 'escrow reconciliation started', correlationId, {
+    job: 'escrow-reconciliation',
+  });
 
   try {
     const result = await reconcileAllPendingEscrows();
     if (result.success) {
-      console.log(
-        `[reconcile] Escrows: ${result.data?.reconciled} reconciled, ${result.data?.failed} failed`,
-      );
       reconciliationBackoffMs = INITIAL_BACKOFF_MS;
+      schedLog('info', 'escrow reconciliation complete', correlationId, {
+        job: 'escrow-reconciliation',
+        outcome: 'success',
+        reconciled: result.data?.reconciled,
+        failed: result.data?.failed,
+        durationMs: Date.now() - start,
+      });
     } else {
-      console.error(`[reconcile] Reconciliation failed: ${result.error}`);
-      reconciliationBackoffMs = Math.min(
-        reconciliationBackoffMs * 2,
-        MAX_BACKOFF_MS,
-      );
+      reconciliationBackoffMs = Math.min(reconciliationBackoffMs * 2, MAX_BACKOFF_MS);
+      schedLog('error', 'escrow reconciliation failed', correlationId, {
+        job: 'escrow-reconciliation',
+        outcome: 'failure',
+        error: result.error,
+        nextBackoffMs: reconciliationBackoffMs,
+        durationMs: Date.now() - start,
+      });
     }
   } catch (err) {
-    console.error('[reconcile] Scheduler error:', err);
-    reconciliationBackoffMs = Math.min(
-      reconciliationBackoffMs * 2,
-      MAX_BACKOFF_MS,
-    );
+    reconciliationBackoffMs = Math.min(reconciliationBackoffMs * 2, MAX_BACKOFF_MS);
+    schedLog('error', 'escrow reconciliation threw unexpectedly', correlationId, {
+      job: 'escrow-reconciliation',
+      outcome: 'failure',
+      error: err instanceof Error ? err.message : String(err),
+      nextBackoffMs: reconciliationBackoffMs,
+      durationMs: Date.now() - start,
+    });
   } finally {
     concurrentReconciliations--;
   }
@@ -185,63 +250,144 @@ export function startSyncScheduler(): void {
 async function runNotificationOutbox(): Promise<void> {
   if (notificationOutboxRunning) return;
   notificationOutboxRunning = true;
+
+  const correlationId = randomUUID();
+  const start = Date.now();
+
   try {
     const result = await processNotificationOutbox();
     if (!result.success) {
-      console.error(`[notification-outbox] Dispatch failed: ${result.error}`);
+      schedLog('error', 'notification outbox dispatch failed', correlationId, {
+        job: 'notification-outbox',
+        outcome: 'failure',
+        error: result.error,
+        durationMs: Date.now() - start,
+      });
+    } else {
+      schedLog('info', 'notification outbox dispatched', correlationId, {
+        job: 'notification-outbox',
+        outcome: 'success',
+        durationMs: Date.now() - start,
+      });
     }
   } finally {
     notificationOutboxRunning = false;
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Idempotency key cleanup
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function runIdempotencyCleanup(): Promise<void> {
+  const correlationId = randomUUID();
+  const start = Date.now();
+
   const result = await purgeExpiredIdempotencyKeys();
   if (result.success) {
-    if ((result.data?.deleted ?? 0) > 0) {
-      console.log(`[idempotency] Purged ${result.data?.deleted} expired idempotency key(s)`);
+    const deleted = result.data?.deleted ?? 0;
+    if (deleted > 0) {
+      schedLog('info', 'idempotency keys purged', correlationId, {
+        job: 'idempotency-cleanup',
+        outcome: 'success',
+        deleted,
+        durationMs: Date.now() - start,
+      });
     }
+    // No log if nothing was deleted — avoids noise on quiet ticks.
   } else {
-    console.error(`[idempotency] Cleanup failed: ${result.error}`);
+    schedLog('error', 'idempotency cleanup failed', correlationId, {
+      job: 'idempotency-cleanup',
+      outcome: 'failure',
+      error: result.error,
+      durationMs: Date.now() - start,
+    });
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Booking expiry
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function runBookingExpiryCleanup(): Promise<void> {
   if (bookingExpiryRunning) {
-    console.log('[expiry] Skipping tick — previous sweep still in progress');
+    const correlationId = randomUUID();
+    schedLog('info', 'booking expiry sweep skipped — previous sweep still running', correlationId, {
+      job: 'booking-expiry',
+      outcome: 'skipped',
+    });
     return;
   }
+
   bookingExpiryRunning = true;
+  const correlationId = randomUUID();
+  const start = Date.now();
+
+  schedLog('info', 'booking expiry sweep started', correlationId, { job: 'booking-expiry' });
+
   try {
+    // Warning pass
     const warnResult = await bookingService.sendExpiryWarnings();
     if (warnResult.success) {
-      const { warned, failed } = warnResult.data ?? { warned: 0, failed: 0 };
+      const { warned = 0, failed = 0 } = warnResult.data ?? {};
       if (warned > 0 || failed > 0) {
-        console.log(`[expiry] Warned ${warned} booking(s) of imminent expiry, ${failed} failure(s)`);
+        schedLog('info', 'expiry warnings sent', correlationId, {
+          job: 'booking-expiry',
+          warned,
+          warnFailed: failed,
+        });
       }
     } else {
-      console.error(`[expiry] Warning pass failed: ${warnResult.error}`);
+      schedLog('error', 'expiry warning pass failed', correlationId, {
+        job: 'booking-expiry',
+        outcome: 'failure',
+        error: warnResult.error,
+      });
     }
 
-    const result = await bookingService.expireStaleBookings();
-    if (result.success) {
-      const { expired, failed } = result.data ?? { expired: 0, failed: 0 };
+    // Expiry pass
+    const expireResult = await bookingService.expireStaleBookings();
+    if (expireResult.success) {
+      const { expired = 0, failed = 0 } = expireResult.data ?? {};
       if (expired > 0 || failed > 0) {
-        console.log(`[expiry] Expired ${expired} booking(s), ${failed} failure(s)`);
+        schedLog('info', 'stale bookings expired', correlationId, {
+          job: 'booking-expiry',
+          expired,
+          expireFailed: failed,
+        });
       }
     } else {
-      console.error(`[expiry] Cleanup failed: ${result.error}`);
+      schedLog('error', 'booking expiry pass failed', correlationId, {
+        job: 'booking-expiry',
+        outcome: 'failure',
+        error: expireResult.error,
+      });
     }
 
+    // Modification expiry pass
     const modResult = await bookingService.expireStaleModifications();
     if (modResult.success) {
-      const { expired, failed } = modResult.data ?? { expired: 0, failed: 0 };
+      const { expired = 0, failed = 0 } = modResult.data ?? {};
       if (expired > 0 || failed > 0) {
-        console.log(`[expiry] Expired ${expired} modification proposal(s), ${failed} failure(s)`);
+        schedLog('info', 'stale modification proposals expired', correlationId, {
+          job: 'booking-expiry',
+          expiredModifications: expired,
+          modFailed: failed,
+        });
       }
     } else {
-      console.error(`[expiry] Modification cleanup failed: ${modResult.error}`);
+      schedLog('error', 'modification expiry pass failed', correlationId, {
+        job: 'booking-expiry',
+        outcome: 'failure',
+        error: modResult.error,
+      });
     }
+
+    schedLog('info', 'booking expiry sweep complete', correlationId, {
+      job: 'booking-expiry',
+      outcome: 'success',
+      durationMs: Date.now() - start,
+    });
   } finally {
     bookingExpiryRunning = false;
   }
@@ -267,6 +413,7 @@ async function runDataRetention(
     console.log(`[retention] Skipping ${label} — previous sweep still in progress`);
     return null;
   }
+
   retentionRunning = true;
   const startedAt = Date.now();
   try {
@@ -302,4 +449,145 @@ async function runDataRetention(
   } finally {
     retentionRunning = false;
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scheduler startup
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function startSyncScheduler(): void {
+  const startupCorrelationId = randomUUID();
+
+  // ── Recurring intervals ───────────────────────────────────────────────────
+
+  setInterval(() => {
+    runSync().catch((err) =>
+      schedLog('error', 'blockchain sync interval threw', randomUUID(), {
+        job: 'blockchain-sync',
+        outcome: 'failure',
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+  }, SYNC_INTERVAL_MS);
+
+  setInterval(() => {
+    runEscrowReconciliation().catch((err) =>
+      schedLog('error', 'escrow reconciliation interval threw', randomUUID(), {
+        job: 'escrow-reconciliation',
+        outcome: 'failure',
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+  }, RECONCILIATION_INTERVAL_MS);
+
+  setInterval(() => {
+    runNotificationOutbox().catch((err) =>
+      schedLog('error', 'notification outbox interval threw', randomUUID(), {
+        job: 'notification-outbox',
+        outcome: 'failure',
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+  }, NOTIFICATION_OUTBOX_INTERVAL_MS);
+
+  setInterval(() => {
+    runIdempotencyCleanup().catch((err) =>
+      schedLog('error', 'idempotency cleanup interval threw', randomUUID(), {
+        job: 'idempotency-cleanup',
+        outcome: 'failure',
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+  }, IDEMPOTENCY_CLEANUP_INTERVAL_MS);
+
+  setInterval(() => {
+    runBookingExpiryCleanup().catch((err) =>
+      schedLog('error', 'booking expiry interval threw', randomUUID(), {
+        job: 'booking-expiry',
+        outcome: 'failure',
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+  }, BOOKING_EXPIRY_INTERVAL_MS);
+
+  setInterval(() => {
+    processDueAccountDeletions().catch((err) =>
+      schedLog('error', 'account deletion interval threw', randomUUID(), {
+        job: 'account-deletion',
+        outcome: 'failure',
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+  }, ACCOUNT_DELETION_INTERVAL_MS);
+
+  setInterval(() => {
+    runDataRetention().catch((err) =>
+      schedLog('error', 'data retention interval threw', randomUUID(), {
+        job: 'data-retention',
+        outcome: 'failure',
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+  }, RETENTION_INTERVAL_MS);
+
+  // ── Startup one-shot tasks ────────────────────────────────────────────────
+
+  // Initial cleanup 30 s after boot so stale keys don't survive a restart.
+  setTimeout(() => {
+    runIdempotencyCleanup().catch((err) =>
+      schedLog('error', 'idempotency initial cleanup threw', randomUUID(), {
+        job: 'idempotency-cleanup',
+        outcome: 'failure',
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+    runBookingExpiryCleanup().catch((err) =>
+      schedLog('error', 'booking expiry initial cleanup threw', randomUUID(), {
+        job: 'booking-expiry',
+        outcome: 'failure',
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+  }, 30_000);
+
+  // Retention dry-run preview 10 s after startup — lets operators see what
+  // the next scheduled run will touch before it mutates anything.
+  setTimeout(() => {
+    runDataRetention({ dryRun: true, label: 'startup-preview' }).catch((err) =>
+      schedLog('error', 'retention startup preview threw', randomUUID(), {
+        job: 'data-retention',
+        outcome: 'failure',
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+  }, RETENTION_STARTUP_PREVIEW_DELAY_MS);
+
+  // Optional immediate live run after a retention-policy change.
+  if (env.RETENTION_RUN_ON_STARTUP) {
+    setTimeout(() => {
+      runDataRetention({ dryRun: false, label: 'startup-live' }).catch((err) =>
+        schedLog('error', 'retention startup live-run threw', randomUUID(), {
+          job: 'data-retention',
+          outcome: 'failure',
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
+    }, 60_000);
+  }
+
+  // ── Startup confirmation log ──────────────────────────────────────────────
+
+  schedLog('info', 'scheduler started', startupCorrelationId, {
+    job: 'startup',
+    outcome: 'success',
+    intervals: {
+      syncMs: SYNC_INTERVAL_MS,
+      reconciliationMs: RECONCILIATION_INTERVAL_MS,
+      notificationOutboxMs: NOTIFICATION_OUTBOX_INTERVAL_MS,
+      idempotencyCleanupMs: IDEMPOTENCY_CLEANUP_INTERVAL_MS,
+      bookingExpiryMs: BOOKING_EXPIRY_INTERVAL_MS,
+      accountDeletionMs: ACCOUNT_DELETION_INTERVAL_MS,
+      retentionMs: RETENTION_INTERVAL_MS,
+    },
+  });
 }

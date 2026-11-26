@@ -50,11 +50,16 @@ export interface LogEntry {
   level: LogLevel;
   message: string;
   timestamp: string;
+  service?: string;
+  environment?: string;
   requestId?: string;
   correlationId?: string;
   bookingId?: string;
   operationId?: string;
   userId?: string;
+  traceId?: string;
+  spanId?: string;
+  correlationId?: string;
   [key: string]: unknown;
 }
 
@@ -75,7 +80,7 @@ const SAFE_SCHEMA_KEYS = new Set([
  * Emit a structured JSON log line.
  *
  * In development the line is pretty-printed; in production it is a single-line
- * JSON object suitable for log-aggregation pipelines (Loki, CloudWatch, etc.).
+ * JSON object suitable for Loki / CloudWatch / any structured log pipeline.
  *
  * The log is suppressed when its level falls below the configured LOG_LEVEL.
  *
@@ -107,6 +112,8 @@ export function structuredLog(entry: LogEntry): void {
   const redactedExtras = redactLogFields(extraFields) as Record<string, unknown>;
 
   const merged: LogEntry = {
+    service: 'rentars-api',
+    environment: env.NODE_ENV,
     ...entry,
     requestId: entry.requestId ?? context?.requestId,
     correlationId: entry.correlationId ?? context?.correlationId,
@@ -114,6 +121,11 @@ export function structuredLog(entry: LogEntry): void {
     operationId: entry.operationId ?? context?.operationId,
     userId: entry.userId ?? context?.userId,
   };
+
+  // Drop undefined fields so the JSON payload stays clean.
+  for (const key of Object.keys(merged)) {
+    if (merged[key] === undefined) delete merged[key];
+  }
 
   const line =
     env.NODE_ENV === 'development'
@@ -200,11 +212,12 @@ export interface RequestWithId extends Request {
 /**
  * Structured HTTP request/response logger.
  *
- * Emits a single structured log entry per request on response finish, containing:
+ * Emits one structured log entry per request on response finish containing:
  *   - ISO timestamp
  *   - Request-ID, correlation-ID, booking-ID and operation-ID for correlation
  *   - HTTP method, normalised path, status code, duration
  *   - Authenticated user-ID (if present on req.userId)
+ *   - outcome: 'success' | 'client_error' | 'server_error'
  *
  * Auth headers, cookies, request bodies and query strings are never logged so
  * that tokens, wallet secrets and payment payloads cannot leak into logs.
