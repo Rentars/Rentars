@@ -8,6 +8,19 @@
  *  - Out-of-order       — tolerated; idempotency in state machine handles it
  *  - Cross-booking      — validate payload booking/amount against DB record
  *  - Unknown payloads   — quarantine via transitionPaymentStatus()
+ *  - Forged terminal    — terminal (paid/refunded) transitions additionally
+ *                         require verified on-chain event evidence; a bare
+ *                         signed callback can never mark funds settled.
+ *
+ * State ownership (see docs/escrow-state-ownership.md):
+ *  - The on-chain escrow contract is the sole authority for terminal
+ *    settlement (released / refunded). Off-chain records mirror it.
+ *  - Provider callbacks are authenticated *evidence*, not authority. They are
+ *    only accepted as proof of a terminal transition when they carry a txHash
+ *    that resolves to a verified on-chain escrow event matching the booking,
+ *    amount and provider reference.
+ *  - When on-chain and provider state disagree, the payment is quarantined
+ *    (under_review) and the disagreement is recorded — never silently resolved.
  *
  * Provider responses follow HTTP semantics:
  *  - 200 with { status: 'acknowledged' } on valid new event
@@ -15,6 +28,7 @@
  *  - 400 on malformed payload
  *  - 401 on invalid / missing signature
  *  - 422 on semantic mismatch (wrong booking / amount)
+ *  - 503 when on-chain verification is temporarily unavailable
  *
  * Internal error details are never surfaced to the provider to avoid
  * information leakage.
@@ -36,6 +50,7 @@ import {
   reconcileEscrowOperation,
   type EscrowOperationType,
 } from './escrowOperation.service.js';
+import { verifyOnChainEscrowEvent } from './escrowEventVerification.service.js';
 import type { ServiceResponse } from './index.js';
 import {
   paymentWorkflowTotal,
@@ -49,6 +64,15 @@ const MAX_CLOCK_SKEW_MS = 5 * 60 * 1_000; // 5 minutes
 
 /** How long event IDs are retained in the replay ledger. */
 const REPLAY_TTL_HOURS = 24;
+
+/**
+ * Canonical payment statuses that represent a terminal, funds-settled state.
+ * These may only be reached with verified on-chain event evidence.
+ */
+const TERMINAL_SETTLEMENT_STATUSES: ReadonlySet<string> = new Set([
+  'paid',
+  'refunded',
+]);
 
 // ─── Schemas ──────────────────────────────────────────────────────────────────
 
@@ -438,9 +462,81 @@ export async function verifyAndProcessCallback(
     });
   }
 
-  // ── 8. Map provider status and append to the canonical ledger ─────────────
+  // ── 8. Map provider status ────────────────────────────────────────────────
   const canonicalStatus = mapProviderStatus(body.status);
 
+  // ── 8a. Terminal settlement requires verified on-chain evidence ───────────
+  // A signed provider callback alone is not authority to release/refund funds.
+  // We require a txHash that resolves to a verified on-chain escrow event
+  // matching this booking, amount and provider reference.
+  if (TERMINAL_SETTLEMENT_STATUSES.has(canonicalStatus)) {
+    if (!body.txHash) {
+      logCallback('error', 'terminal status without on-chain evidence', {
+        ...ctx,
+        canonicalStatus,
+      });
+      await transitionPaymentStatus(
+        payment.id,
+        'under_review',
+        { ...body, _reason: 'terminal_without_on_chain_evidence' } as unknown as Record<string, unknown>,
+      );
+      await recordEvent(body.eventId, body.bookingId, eventHash, ctx);
+      return finish({
+        status: 'mismatch',
+        httpStatus: 422,
+        message: 'Terminal transition requires on-chain evidence — payment under review',
+      });
+    }
+
+    const verification = await verifyOnChainEscrowEvent({
+      txHash: body.txHash,
+      bookingId: body.bookingId,
+      amountStroops: incomingStroops,
+      providerAccountId: body.providerAccountId,
+      expectedStatus: canonicalStatus,
+    });
+
+    if (verification.status === 'unavailable') {
+      // Do NOT transition; ask the provider to retry so we never settle on
+      // unverifiable evidence.
+      logCallback('error', 'on-chain verification unavailable', {
+        ...ctx,
+        reason: verification.reason,
+      });
+      return finish({
+        status: 'quarantined',
+        httpStatus: 503,
+        message: 'On-chain verification is temporarily unavailable; retry the event',
+      });
+    }
+
+    if (verification.status !== 'verified') {
+      // On-chain and provider state disagree (or evidence is forged/mismatched).
+      // Surface the disagreement via under_review; never silently resolve.
+      logCallback('error', 'on-chain evidence rejected', {
+        ...ctx,
+        txHash: body.txHash,
+        reason: verification.reason,
+      });
+      await transitionPaymentStatus(
+        payment.id,
+        'under_review',
+        {
+          ...body,
+          _reason: 'on_chain_disagreement',
+          _onChainReason: verification.reason,
+        } as unknown as Record<string, unknown>,
+      );
+      await recordEvent(body.eventId, body.bookingId, eventHash, ctx);
+      return finish({
+        status: 'mismatch',
+        httpStatus: 422,
+        message: 'On-chain state disagrees with provider event — payment under review',
+      });
+    }
+  }
+
+  // ── 8b. Append to the canonical ledger ────────────────────────────────────
   // Append the validated event first. The ledger is append-only and idempotent
   // on eventId, so duplicate deliveries cannot create duplicate effects.
   await appendLedgerEvent({

@@ -33,6 +33,38 @@ import { describe, it, expect } from 'vitest';
 const ABI_VERSION = '0.1.0';
 const CONTRACT_NAME = 'booking';
 
+/**
+ * Maximum number of IDs the contract will return in a single page.
+ *
+ * Mirrors the on-chain `MAX_PAGE_SIZE` constant. Requests for larger pages are
+ * clamped to this value so that a single simulation stays within Soroban
+ * resource limits.
+ */
+export const MAX_PAGE_SIZE = 50;
+
+/**
+ * A single bounded page of booking IDs.
+ *
+ * `next_cursor` is `null` when the page is the last one. Otherwise it must be
+ * passed back as the `cursor` of the following request. Cursors are opaque to
+ * callers but are stable: the same cursor always yields the same page.
+ */
+export interface BookingPage {
+  ids: bigint[];
+  next_cursor: bigint | null;
+}
+
+/**
+ * Clamp a requested page size into the range `[1, MAX_PAGE_SIZE]`.
+ */
+function clampPageSize(limit: number): number {
+  if (!Number.isFinite(limit)) return MAX_PAGE_SIZE;
+  const floored = Math.floor(limit);
+  if (floored < 1) return 1;
+  if (floored > MAX_PAGE_SIZE) return MAX_PAGE_SIZE;
+  return floored;
+}
+
 // ─── Client ──────────────────────────────────────────────────────────────────
 
 export class BookingClient {
@@ -65,16 +97,64 @@ export class BookingClient {
   }
 
   /**
-   * Return all booking IDs for a given property.
+   * Return one bounded page of booking IDs for a given property.
    *
-   * ABI: get_property_bookings(property_id: u64) -> Vec<u64>
+   * ABI: get_property_bookings_page(property_id: u64, cursor: u64, limit: u32)
+   *        -> (Vec<u64>, Option<u64>)
+   *
+   * `cursor` is the ID to start after (exclusive); pass `0n` for the first
+   * page. `limit` is clamped to `MAX_PAGE_SIZE`. The returned `next_cursor` is
+   * `null` once the collection is exhausted.
    */
-  async getPropertyBookings(propertyId: bigint): Promise<bigint[]> {
-    const result = await this.simulateReadOnly('get_property_bookings', [
+  async getPropertyBookingsPage(
+    propertyId: bigint,
+    cursor: bigint = 0n,
+    limit: number = MAX_PAGE_SIZE,
+  ): Promise<BookingPage> {
+    const result = await this.simulateReadOnly('get_property_bookings_page', [
       nativeToScVal(propertyId, { type: 'u64' }),
+      nativeToScVal(cursor, { type: 'u64' }),
+      nativeToScVal(clampPageSize(limit), { type: 'u32' }),
     ]);
-    const native = scValToNative(result) as (number | string)[];
-    return native.map((v) => BigInt(v));
+    return this.decodePage(result);
+  }
+
+  /**
+   * Iterate every page of booking IDs for a property.
+   *
+   * Pages are fetched sequentially using keyset cursors, so the result is
+   * deterministic, contains no duplicates and no gaps. An optional `onPage`
+   * callback is invoked after each page is decoded, which lets callers stream
+   * or persist progress instead of buffering the whole history.
+   */
+  async getAllPropertyBookings(
+    propertyId: bigint,
+    options: {
+      pageSize?: number;
+      onPage?: (page: BookingPage) => void | Promise<void>;
+    } = {},
+  ): Promise<bigint[]> {
+    const pageSize = clampPageSize(options.pageSize ?? MAX_PAGE_SIZE);
+    const ids: bigint[] = [];
+    let cursor = 0n;
+
+    // Bounded loop guard: each iteration must advance the cursor, otherwise
+    // the contract is misbehaving and we abort rather than spin forever.
+    for (;;) {
+      const page = await this.getPropertyBookingsPage(propertyId, cursor, pageSize);
+      ids.push(...page.ids);
+      if (options.onPage) await options.onPage(page);
+
+      if (page.next_cursor === null) break;
+      if (page.next_cursor <= cursor) {
+        throw new Error(
+          `Non-advancing cursor from get_property_bookings_page: ${cursor} -> ${page.next_cursor}`,
+        );
+      }
+      cursor = page.next_cursor;
+    }
+
+    return ids;
   }
 
   /**
@@ -251,6 +331,23 @@ export class BookingClient {
   }
 
   // ── Internal helpers ──────────────────────────────────────────────────────
+
+  /**
+   * Decode a `(Vec<u64>, Option<u64>)` page tuple into a `BookingPage`.
+   */
+  private decodePage(result: xdr.ScVal): BookingPage {
+    const native = scValToNative(result) as [
+      (number | string | bigint)[],
+      number | string | bigint | null | undefined,
+    ];
+    const rawIds = Array.isArray(native[0]) ? native[0] : [];
+    const rawCursor = native[1];
+    return {
+      ids: rawIds.map((v) => BigInt(v)),
+      next_cursor:
+        rawCursor === null || rawCursor === undefined ? null : BigInt(rawCursor),
+    };
+  }
 
   /**
    * Simulate a read-only contract call and return the result ScVal.

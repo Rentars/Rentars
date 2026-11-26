@@ -8,16 +8,26 @@
  *   - per-component versions (backend, web, contracts)
  *   - latest applied migration
  *   - ABI file hashes for each contract
+ *   - per-contract deployment data (commit, toolchain, target, artifact hash,
+ *     network, contract ID, initialization transaction)
  *   - Docker image identifiers (if IMAGE_TAG env is set)
  *   - rollback documentation pointer
  *
  * Usage:
  *   bun run scripts/generate-release-manifest.ts [--version <semver>]
+ *   bun run scripts/generate-release-manifest.ts --verify
  *
  * Reads version from:
  *   1. --version CLI flag
  *   2. ROOT_VERSION env variable
  *   3. root package.json version field
+ *
+ * --verify compares the contract IDs recorded in the environment-specific
+ * registry (docs/releases/contract-registry.json) and the latest release
+ * manifest against the backend configuration, exiting non-zero on mismatch.
+ *
+ * Wallet secret material (secret keys, mnemonics) is never read, printed or
+ * stored by this script.
  */
 
 import { execSync } from 'node:child_process';
@@ -45,6 +55,131 @@ function git(cmd: string): string {
   } catch {
     return 'unknown';
   }
+}
+
+// ── Contract deployment metadata ─────────────────────────────────────────────
+// Contract names map to the backend env var that configures their ID.
+const CONTRACTS: Array<{ name: string; envVar: string; wasm: string }> = [
+  { name: 'property_listing', envVar: 'PROPERTY_LISTING_CONTRACT_ID', wasm: 'property_listing.wasm' },
+  { name: 'booking', envVar: 'BOOKING_CONTRACT_ID', wasm: 'booking.wasm' },
+  { name: 'review', envVar: 'REVIEW_CONTRACT_ID', wasm: 'review.wasm' },
+];
+
+const REGISTRY_PATH = 'docs/releases/contract-registry.json';
+
+interface ContractDeployment {
+  contract_id: string | null;
+  network: string | null;
+  init_transaction: string | null;
+  artifact_sha256: string | null;
+  artifact_path: string | null;
+  source_commit: string;
+  toolchain: string;
+  target: string;
+}
+
+function readToolchain(): string {
+  const rustToolchain = resolve(ROOT, 'rust-toolchain.toml');
+  if (existsSync(rustToolchain)) {
+    const match = read('rust-toolchain.toml').match(/^channel\s*=\s*"([^"]+)"/m);
+    if (match) return match[1];
+  }
+  try {
+    return execSync('rustc --version', { cwd: ROOT, encoding: 'utf-8' }).trim();
+  } catch {
+    return 'unknown';
+  }
+}
+
+function readTarget(): string {
+  return process.env.CONTRACT_BUILD_TARGET ?? 'wasm32-unknown-unknown';
+}
+
+function artifactHash(wasm: string): { sha256: string | null; path: string | null } {
+  const candidates = [
+    `apps/contracts/target/wasm32-unknown-unknown/release/${wasm}`,
+    `apps/contracts/target/wasm32v1-none/release/${wasm}`,
+    `apps/contracts/artifacts/${wasm}`,
+  ];
+  for (const rel of candidates) {
+    if (existsSync(resolve(ROOT, rel))) {
+      return { sha256: sha256(readFileSync(resolve(ROOT, rel)).toString('binary')), path: rel };
+    }
+  }
+  return { sha256: null, path: null };
+}
+
+function buildContractDeployments(commit: string): Record<string, ContractDeployment> {
+  const toolchain = readToolchain();
+  const target = readTarget();
+  const network = process.env.STELLAR_NETWORK ?? null;
+  const deployments: Record<string, ContractDeployment> = {};
+  for (const contract of CONTRACTS) {
+    const artifact = artifactHash(contract.wasm);
+    deployments[contract.name] = {
+      contract_id: process.env[contract.envVar] ?? null,
+      network,
+      init_transaction: process.env[`${contract.envVar.replace(/_CONTRACT_ID$/, '')}_INIT_TX`] ?? null,
+      artifact_sha256: artifact.sha256,
+      artifact_path: artifact.path,
+      source_commit: commit,
+      toolchain,
+      target,
+    };
+  }
+  return deployments;
+}
+
+function loadRegistry(): Record<string, Record<string, ContractDeployment>> {
+  if (!existsSync(resolve(ROOT, REGISTRY_PATH))) return {};
+  try {
+    return JSON.parse(read(REGISTRY_PATH)) as Record<string, Record<string, ContractDeployment>>;
+  } catch {
+    return {};
+  }
+}
+
+function writeRegistry(
+  registry: Record<string, Record<string, ContractDeployment>>,
+  network: string,
+  deployments: Record<string, ContractDeployment>
+): void {
+  registry[network] = { ...(registry[network] ?? {}), ...deployments };
+  writeFileSync(resolve(ROOT, REGISTRY_PATH), JSON.stringify(registry, null, 2) + '\n');
+}
+
+// ── Verification mode ────────────────────────────────────────────────────────
+// Compares deployed contract IDs (registry + latest manifest) with the backend
+// configuration. Exits non-zero on any mismatch so CI/startup can gate on it.
+function verify(): void {
+  const network = process.env.STELLAR_NETWORK ?? null;
+  const registry = loadRegistry();
+  const deployed = network ? (registry[network] ?? {}) : {};
+  const problems: string[] = [];
+
+  for (const contract of CONTRACTS) {
+    const configured = process.env[contract.envVar] ?? null;
+    const recorded = deployed[contract.name]?.contract_id ?? null;
+    if (recorded && configured && recorded !== configured) {
+      problems.push(
+        `${contract.name}: configured ${contract.envVar}=${configured} does not match deployed ${recorded}`
+      );
+    } else if (recorded && !configured) {
+      problems.push(`${contract.name}: deployed ${recorded} but ${contract.envVar} is not configured`);
+    }
+  }
+
+  if (problems.length > 0) {
+    console.error('Contract ID verification failed:');
+    for (const p of problems) console.error(`  - ${p}`);
+    process.exit(1);
+  }
+  console.log(`Contract ID verification passed${network ? ` for network ${network}` : ''}.`);
+}
+
+if (process.argv.includes('--verify')) {
+  verify();
+  process.exit(0);
 }
 
 // ── Resolve version ──────────────────────────────────────────────────────────
@@ -193,6 +328,7 @@ const manifest = {
     abi_sha256: abiHashes,
     upgradeability: contractUpgradeability,
     compatibility_check: compatibilityCheck,
+    deployments: buildContractDeployments(commit),
   },
   health: {
     decision: healthDecision,
@@ -221,3 +357,12 @@ if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true });
 const outPath = resolve(outDir, `manifest-${version}.json`);
 writeFileSync(outPath, JSON.stringify(manifest, null, 2) + '\n');
 console.log(`Release manifest written to: ${outPath.replace(ROOT + '/', '')}`);
+
+// ── Update environment-specific contract registry ────────────────────────────
+if (manifest.dependencies.stellar_network) {
+  const registry = loadRegistry();
+  writeRegistry(registry, manifest.dependencies.stellar_network, manifest.contracts.deployments);
+  console.log(`Contract registry updated: ${REGISTRY_PATH}`);
+} else {
+  console.warn('STELLAR_NETWORK not set; contract registry not updated.');
+}

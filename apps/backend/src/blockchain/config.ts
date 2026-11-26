@@ -44,6 +44,27 @@ export const BLOCKCHAIN_FEATURES_ENABLED =
   process.env.BLOCKCHAIN_FEATURES_ENABLED === 'true';
 
 /**
+ * Path or URL to the signed deployment manifest describing the deployed
+ * contract IDs, network, source commit and artifact hashes for this release.
+ */
+export const DEPLOYMENT_MANIFEST_PATH =
+  process.env.DEPLOYMENT_MANIFEST_PATH ?? '';
+
+/**
+ * Network the deployment manifest is expected to describe (e.g. "testnet").
+ * When set, the manifest must match this network.
+ */
+export const DEPLOYMENT_MANIFEST_NETWORK =
+  process.env.DEPLOYMENT_MANIFEST_NETWORK ?? '';
+
+/**
+ * When true, backend startup verifies that the configured contract IDs match
+ * the deployment manifest (if one is available) and fails on mismatch.
+ */
+export const VERIFY_DEPLOYMENT_MANIFEST_ON_STARTUP =
+  process.env.VERIFY_DEPLOYMENT_MANIFEST_ON_STARTUP === 'true';
+
+/**
  * Resolve the configured network name from the passphrase. Returns null when
  * the passphrase does not match any supported network.
  */
@@ -131,6 +152,15 @@ function isValidUrl(url: string): boolean {
   }
 }
 
+function isManifestLocationValid(location: string): boolean {
+  if (!location) return false;
+  if (location.startsWith('http://') || location.startsWith('https://')) {
+    return isValidUrl(location);
+  }
+  // Treat anything else as a filesystem path.
+  return location.trim().length > 0;
+}
+
 export function validateBlockchainConfig(): ConfigValidationError[] {
   const errors: ConfigValidationError[] = [];
 
@@ -179,6 +209,29 @@ export function validateBlockchainConfig(): ConfigValidationError[] {
       errors.push({
         field: 'STELLAR_ADMIN_SECRET',
         message: 'Admin secret key is required when blockchain features are enabled',
+      });
+    }
+  }
+
+  if (VERIFY_DEPLOYMENT_MANIFEST_ON_STARTUP) {
+    if (!DEPLOYMENT_MANIFEST_PATH) {
+      errors.push({
+        field: 'DEPLOYMENT_MANIFEST_PATH',
+        message:
+          'DEPLOYMENT_MANIFEST_PATH is required when VERIFY_DEPLOYMENT_MANIFEST_ON_STARTUP is enabled',
+      });
+    } else if (!isManifestLocationValid(DEPLOYMENT_MANIFEST_PATH)) {
+      errors.push({
+        field: 'DEPLOYMENT_MANIFEST_PATH',
+        message: `Invalid deployment manifest location: ${DEPLOYMENT_MANIFEST_PATH}`,
+      });
+    }
+
+    if (!DEPLOYMENT_MANIFEST_NETWORK) {
+      errors.push({
+        field: 'DEPLOYMENT_MANIFEST_NETWORK',
+        message:
+          'DEPLOYMENT_MANIFEST_NETWORK is required when VERIFY_DEPLOYMENT_MANIFEST_ON_STARTUP is enabled',
       });
     }
   }

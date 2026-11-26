@@ -124,6 +124,119 @@ mod tests {
         assert_eq!(ids.len(), 0);
     }
 
+    // ─── Pagination Tests ─────────────────────────────────────────────────────
+
+    /// Paginated reads return stable, ordered pages with no duplicates or gaps
+    /// even when the reviewee has more reviews than fit in a single page.
+    #[test]
+    fn test_get_reviews_for_user_paginated() {
+        let (env, cid) = make_env();
+        let client = ReviewContractClient::new(&env, &cid);
+        let reviewee = Address::generate(&env);
+
+        // Submit more reviews than one page holds.
+        let total: u32 = crate::MAX_PAGE_SIZE + 7;
+        let mut submitted = soroban_sdk::Vec::new(&env);
+        for _ in 0..total {
+            let reviewer = Address::generate(&env);
+            let id = client.submit_review(
+                &reviewer,
+                &reviewee,
+                &5_u32,
+                &String::from_str(&env, "paged"),
+            );
+            submitted.push_back(id);
+        }
+
+        // Walk the pages using keyset cursors.
+        let mut collected = soroban_sdk::Vec::new(&env);
+        let mut cursor: Option<u64> = None;
+        let mut pages = 0_u32;
+        loop {
+            let page = client.get_reviews_for_user_page(
+                &reviewee,
+                &cursor,
+                &crate::MAX_PAGE_SIZE,
+            );
+            if page.is_empty() {
+                break;
+            }
+            assert!(
+                page.len() <= crate::MAX_PAGE_SIZE,
+                "page exceeded MAX_PAGE_SIZE"
+            );
+            for id in page.iter() {
+                collected.push_back(id);
+            }
+            cursor = Some(collected.get(collected.len() - 1).unwrap());
+            pages += 1;
+            assert!(pages <= total + 1, "pagination did not terminate");
+        }
+
+        // Complete history retrieved, in order, without duplicates or gaps.
+        assert_eq!(collected.len(), total);
+        for i in 0..total {
+            assert_eq!(collected.get(i).unwrap(), submitted.get(i).unwrap());
+        }
+        assert!(pages >= 2, "expected more than one page");
+    }
+
+    /// Requesting a page size above the maximum is clamped, not rejected.
+    #[test]
+    fn test_get_reviews_for_user_page_clamps_limit() {
+        let (env, cid) = make_env();
+        let client = ReviewContractClient::new(&env, &cid);
+        let reviewee = Address::generate(&env);
+
+        let total: u32 = crate::MAX_PAGE_SIZE + 3;
+        for _ in 0..total {
+            let reviewer = Address::generate(&env);
+            client.submit_review(&reviewer, &reviewee, &4_u32, &String::from_str(&env, "x"));
+        }
+
+        let page = client.get_reviews_for_user_page(&reviewee, &None, &u32::MAX);
+        assert_eq!(page.len(), crate::MAX_PAGE_SIZE);
+    }
+
+    /// Paginated reads for an unknown user return an empty page.
+    #[test]
+    fn test_get_reviews_for_user_page_empty() {
+        let (env, cid) = make_env();
+        let client = ReviewContractClient::new(&env, &cid);
+        let nobody = Address::generate(&env);
+        let page = client.get_reviews_for_user_page(&nobody, &None, &crate::MAX_PAGE_SIZE);
+        assert_eq!(page.len(), 0);
+    }
+
+    /// Paginated reads stay within documented resource limits.
+    #[test]
+    fn test_get_reviews_for_user_page_resource_usage() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.budget().reset_unlimited();
+
+        let contract_id = env.register_contract(None, ReviewContract);
+        let client = ReviewContractClient::new(&env, &contract_id);
+        let reviewee = Address::generate(&env);
+
+        let total: u32 = crate::MAX_PAGE_SIZE * 2;
+        for _ in 0..total {
+            let reviewer = Address::generate(&env);
+            client.submit_review(&reviewer, &reviewee, &3_u32, &String::from_str(&env, "r"));
+        }
+
+        let before = env.budget().cpu_instruction_count();
+        let page = client.get_reviews_for_user_page(&reviewee, &None, &crate::MAX_PAGE_SIZE);
+        let used = env.budget().cpu_instruction_count() - before;
+
+        assert_eq!(page.len(), crate::MAX_PAGE_SIZE);
+        assert!(
+            used < 5_000_000,
+            "paged read used {} instructions, exceeding limit",
+            used
+        );
+    }
+
     /// get_reputation returns 0 for a user with no reviews.
     #[test]
     fn test_get_reputation_default() {

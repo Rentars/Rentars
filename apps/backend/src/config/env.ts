@@ -107,6 +107,35 @@ const envSchema = z.object({
   PROPERTY_LISTING_CONTRACT_ID: z.string().optional(),
   BOOKING_CONTRACT_ID: z.string().optional(),
 
+  // ── Contract deployment manifest verification ─────────────────────────────
+  // Path or URL to the integrity-checked deployment manifest produced by the
+  // release pipeline.  The manifest records commit hash, toolchain, target,
+  // artifact hash, network, contract IDs and initialization transaction for
+  // each deployed contract.  It must never contain wallet secret material.
+  CONTRACT_MANIFEST_PATH: z.string().optional(),
+  CONTRACT_MANIFEST_URL: z.string().url().optional(),
+
+  // Network the manifest is expected to describe.  When set, startup
+  // verification fails if the manifest's network disagrees.
+  CONTRACT_MANIFEST_NETWORK: z
+    .enum(['testnet', 'mainnet'])
+    .optional(),
+
+  // Set to "true" to verify configured contract IDs against the deployment
+  // manifest at startup.  Verification is skipped (with a warning) when no
+  // manifest source is configured.
+  CONTRACT_MANIFEST_VERIFY: z
+    .string()
+    .default('false')
+    .transform((v) => v === 'true'),
+
+  // Optional detached signature (hex) over the manifest digest.  Signing keys
+  // live outside CI; only the public verification material is configured here.
+  CONTRACT_MANIFEST_SIGNATURE: z
+    .string()
+    .regex(/^[0-9a-fA-F]+$/, 'CONTRACT_MANIFEST_SIGNATURE must be a hex string')
+    .optional(),
+
   // ── Stellar transaction confirmation ──────────────────────────────────────
   // Bounded polling/backoff for ledger confirmation.  A timeout here is
   // treated as "pending / ambiguous" and routed to reconciliation — it is
@@ -141,6 +170,44 @@ const envSchema = z.object({
   // ── Trustless Work (escrow) ────────────────────────────────────────────────
   TRUSTLESS_WORK_API_URL: z.string().url().optional(),
   TRUSTLESS_WORK_API_KEY: z.string().optional(),
+
+  // ── Escrow state ownership / evidence ─────────────────────────────────────
+  // Escrow transitions to terminal states (released / refunded) require
+  // authenticated, verified on-chain event evidence.  When "true" (default)
+  // any transition lacking verified evidence is rejected.
+  ESCROW_REQUIRE_VERIFIED_EVENTS: z
+    .string()
+    .default('true')
+    .transform((v) => v === 'true'),
+
+  // Maximum age (in seconds) of an on-chain event accepted as evidence for a
+  // terminal escrow transition.  Guards against replaying stale events.
+  ESCROW_EVENT_MAX_AGE_SECONDS: z
+    .string()
+    .default('86400')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 1) throw new Error('ESCROW_EVENT_MAX_AGE_SECONDS must be a positive integer');
+      return n;
+    }),
+
+  // Number of ledgers within which a previously consumed event ID is treated
+  // as a replay attempt.  Default: 120 ledgers (~10 minutes on Stellar).
+  ESCROW_EVENT_REPLAY_WINDOW_LEDGERS: z
+    .string()
+    .default('120')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 1) throw new Error('ESCROW_EVENT_REPLAY_WINDOW_LEDGERS must be a positive integer');
+      return n;
+    }),
+
+  // When "true", on-chain / provider state disagreement is surfaced as an
+  // alert and blocks silent resolution.  Default: true.
+  ESCROW_SURFACE_STATE_MISMATCH: z
+    .string()
+    .default('true')
+    .transform((v) => v === 'true'),
 
   // ── Geocoding ─────────────────────────────────────────────────────────────
   GEOCODING_API_KEY: z.string().optional(),
@@ -404,6 +471,26 @@ const envSchema = z.object({
       return n;
     }),
 }).superRefine((value, ctx) => {
+  // ── Deployment manifest guards ────────────────────────────────────────────
+  // Verification needs a manifest source; fail fast rather than silently
+  // skipping integrity checks in production.
+  if (value.CONTRACT_MANIFEST_VERIFY && !value.CONTRACT_MANIFEST_PATH && !value.CONTRACT_MANIFEST_URL) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['CONTRACT_MANIFEST_VERIFY'],
+      message: 'CONTRACT_MANIFEST_VERIFY requires CONTRACT_MANIFEST_PATH or CONTRACT_MANIFEST_URL',
+    });
+  }
+
+  // A signature without a manifest to verify is meaningless.
+  if (value.CONTRACT_MANIFEST_SIGNATURE && !value.CONTRACT_MANIFEST_PATH && !value.CONTRACT_MANIFEST_URL) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['CONTRACT_MANIFEST_SIGNATURE'],
+      message: 'CONTRACT_MANIFEST_SIGNATURE requires CONTRACT_MANIFEST_PATH or CONTRACT_MANIFEST_URL',
+    });
+  }
+
   // ── Stellar network consistency ─────────────────────────────────────────
   // The passphrase is derived from STELLAR_NETWORK.  If an explicit
   // passphrase is supplied it must agree, so a mainnet/testnet mismatch is
@@ -434,6 +521,32 @@ const envSchema = z.object({
   // Production must name its browser origins explicitly. The development default
   // (localhost) must never become the production allowlist by omission.
   if (value.NODE_ENV !== 'production') return;
+
+  // Production must verify contract IDs against a manifest when one is
+  // configured, and must never run with escrow evidence checks disabled.
+  if (!value.ESCROW_REQUIRE_VERIFIED_EVENTS) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['ESCROW_REQUIRE_VERIFIED_EVENTS'],
+      message: 'ESCROW_REQUIRE_VERIFIED_EVENTS must not be disabled in production',
+    });
+  }
+
+  if (!value.ESCROW_SURFACE_STATE_MISMATCH) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['ESCROW_SURFACE_STATE_MISMATCH'],
+      message: 'ESCROW_SURFACE_STATE_MISMATCH must not be disabled in production',
+    });
+  }
+
+  if (value.CONTRACT_MANIFEST_NETWORK && value.CONTRACT_MANIFEST_NETWORK !== value.STELLAR_NETWORK) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['CONTRACT_MANIFEST_NETWORK'],
+      message: `CONTRACT_MANIFEST_NETWORK ('${value.CONTRACT_MANIFEST_NETWORK}') must match STELLAR_NETWORK ('${value.STELLAR_NETWORK}')`,
+    });
+  }
 
   if (!process.env.CORS_ORIGIN?.trim()) {
     ctx.addIssue({

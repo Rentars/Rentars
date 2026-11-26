@@ -164,16 +164,55 @@ export async function syncBookingFromChain(
   }
 }
 
+// ─── #1008 Bounded page iteration ────────────────────────────────────────────
+
 /**
- * Sync every on-chain property listing to Supabase in sequential order.
- * Iterates from ID 1 to the current listing count.
- *
- * @returns ServiceResponse with counts of synced and failed properties
- * @example
- * const result = await syncAllProperties();
- * console.log(`Synced: ${result.data.synced}, Failed: ${result.data.failed}`);
+ * Maximum number of records fetched per contract page. Kept small enough that
+ * a single page read (and the resulting Supabase writes) stays well within
+ * Soroban transaction resource limits.
  */
-export async function syncAllProperties(): Promise<ServiceResponse<{ synced: number; failed: number }>> {
+export const MAX_SYNC_PAGE_SIZE = 50;
+
+/** Default page size used by the sync-all helpers. */
+export const DEFAULT_SYNC_PAGE_SIZE = 25;
+
+/**
+ * Cursor for a bounded contract collection read. `afterId` is the last ID
+ * already processed (exclusive lower bound); `pageSize` is clamped to
+ * MAX_SYNC_PAGE_SIZE. Ordering is deterministic ascending by on-chain ID, so
+ * a client can page through the full history without duplicates or gaps.
+ */
+export interface SyncPageCursor {
+  afterId: bigint;
+  pageSize: number;
+}
+
+export interface SyncPageResult {
+  synced: number;
+  failed: number;
+  /** Cursor to pass to the next call, or null when the collection is exhausted. */
+  nextCursor: SyncPageCursor | null;
+}
+
+function clampPageSize(pageSize: number | undefined): number {
+  if (!pageSize || !Number.isFinite(pageSize) || pageSize <= 0) {
+    return DEFAULT_SYNC_PAGE_SIZE;
+  }
+  return Math.min(Math.floor(pageSize), MAX_SYNC_PAGE_SIZE);
+}
+
+/**
+ * Sync one bounded page of on-chain property listings to Supabase.
+ *
+ * Reads IDs in the half-open range `(afterId, afterId + pageSize]`, stopping at
+ * the current listing count. Never iterates an unbounded collection.
+ *
+ * @param cursor - `afterId` (exclusive) and requested `pageSize`
+ * @returns ServiceResponse with counts and the next cursor (null when done)
+ */
+export async function syncPropertyPage(
+  cursor: SyncPageCursor,
+): Promise<ServiceResponse<SyncPageResult>> {
   if (!PROPERTY_LISTING_CONTRACT_ID) {
     return { success: false, error: 'PROPERTY_LISTING_CONTRACT_ID is not configured' };
   }
@@ -181,13 +220,103 @@ export async function syncAllProperties(): Promise<ServiceResponse<{ synced: num
   try {
     const client = buildPropertyClient();
     const count = await client.listingCount();
+    const pageSize = clampPageSize(cursor.pageSize);
+    const start = cursor.afterId + 1n;
+    const end = cursor.afterId + BigInt(pageSize);
 
     let synced = 0;
     let failed = 0;
+    let lastProcessed = cursor.afterId;
 
-    for (let i = 1n; i <= count; i++) {
+    for (let i = start; i <= end && i <= count; i++) {
       const result = await syncPropertyFromChain(String(i));
       result.success ? synced++ : failed++;
+      lastProcessed = i;
+    }
+
+    const nextCursor: SyncPageCursor | null =
+      lastProcessed < count ? { afterId: lastProcessed, pageSize } : null;
+
+    return { success: true, data: { synced, failed, nextCursor } };
+  } catch (err) {
+    return { success: false, error: (err as Error).message };
+  }
+}
+
+/**
+ * Sync one bounded page of on-chain bookings to Supabase.
+ *
+ * Reads IDs in the half-open range `(afterId, afterId + pageSize]`, stopping at
+ * the current booking count. Never iterates an unbounded collection.
+ *
+ * @param cursor - `afterId` (exclusive) and requested `pageSize`
+ * @returns ServiceResponse with counts and the next cursor (null when done)
+ */
+export async function syncBookingPage(
+  cursor: SyncPageCursor,
+): Promise<ServiceResponse<SyncPageResult>> {
+  if (!BOOKING_CONTRACT_ID) {
+    return { success: false, error: 'BOOKING_CONTRACT_ID is not configured' };
+  }
+
+  try {
+    const client = buildBookingClient();
+    const count = await client.bookingCount();
+    const pageSize = clampPageSize(cursor.pageSize);
+    const start = cursor.afterId + 1n;
+    const end = cursor.afterId + BigInt(pageSize);
+
+    let synced = 0;
+    let failed = 0;
+    let lastProcessed = cursor.afterId;
+
+    for (let i = start; i <= end && i <= count; i++) {
+      const result = await syncBookingFromChain(String(i));
+      result.success ? synced++ : failed++;
+      lastProcessed = i;
+    }
+
+    const nextCursor: SyncPageCursor | null =
+      lastProcessed < count ? { afterId: lastProcessed, pageSize } : null;
+
+    return { success: true, data: { synced, failed, nextCursor } };
+  } catch (err) {
+    return { success: false, error: (err as Error).message };
+  }
+}
+
+/**
+ * Sync every on-chain property listing to Supabase using bounded pages.
+ *
+ * Iterates page-by-page via {@link syncPropertyPage} rather than reading the
+ * whole collection at once. Callers that need to resume can drive
+ * `syncPropertyPage` directly with a persisted cursor.
+ *
+ * @returns ServiceResponse with counts of synced and failed properties
+ * @example
+ * const result = await syncAllProperties();
+ * console.log(`Synced: ${result.data.synced}, Failed: ${result.data.failed}`);
+ */
+export async function syncAllProperties(
+  pageSize: number = DEFAULT_SYNC_PAGE_SIZE,
+): Promise<ServiceResponse<{ synced: number; failed: number }>> {
+  if (!PROPERTY_LISTING_CONTRACT_ID) {
+    return { success: false, error: 'PROPERTY_LISTING_CONTRACT_ID is not configured' };
+  }
+
+  let synced = 0;
+  let failed = 0;
+  let cursor: SyncPageCursor | null = { afterId: 0n, pageSize: clampPageSize(pageSize) };
+
+  try {
+    while (cursor) {
+      const page = await syncPropertyPage(cursor);
+      if (!page.success || !page.data) {
+        return { success: false, error: page.error ?? 'Failed to sync property page' };
+      }
+      synced += page.data.synced;
+      failed += page.data.failed;
+      cursor = page.data.nextCursor;
     }
 
     return { success: true, data: { synced, failed } };
@@ -197,26 +326,33 @@ export async function syncAllProperties(): Promise<ServiceResponse<{ synced: num
 }
 
 /**
- * Sync every on-chain booking to Supabase in sequential order.
- * Iterates from ID 1 to the current booking count.
+ * Sync every on-chain booking to Supabase using bounded pages.
+ *
+ * Iterates page-by-page via {@link syncBookingPage} rather than reading the
+ * whole collection at once.
  *
  * @returns ServiceResponse with counts of synced and failed bookings
  */
-export async function syncAllBookings(): Promise<ServiceResponse<{ synced: number; failed: number }>> {
+export async function syncAllBookings(
+  pageSize: number = DEFAULT_SYNC_PAGE_SIZE,
+): Promise<ServiceResponse<{ synced: number; failed: number }>> {
   if (!BOOKING_CONTRACT_ID) {
     return { success: false, error: 'BOOKING_CONTRACT_ID is not configured' };
   }
 
+  let synced = 0;
+  let failed = 0;
+  let cursor: SyncPageCursor | null = { afterId: 0n, pageSize: clampPageSize(pageSize) };
+
   try {
-    const client = buildBookingClient();
-    const count = await client.bookingCount();
-
-    let synced = 0;
-    let failed = 0;
-
-    for (let i = 1n; i <= count; i++) {
-      const result = await syncBookingFromChain(String(i));
-      result.success ? synced++ : failed++;
+    while (cursor) {
+      const page = await syncBookingPage(cursor);
+      if (!page.success || !page.data) {
+        return { success: false, error: page.error ?? 'Failed to sync booking page' };
+      }
+      synced += page.data.synced;
+      failed += page.data.failed;
+      cursor = page.data.nextCursor;
     }
 
     return { success: true, data: { synced, failed } };

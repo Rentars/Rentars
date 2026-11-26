@@ -29,62 +29,22 @@ const ABI_VERSION = '0.1.0';
 const CONTRACT_NAME = 'property-listing';
 
 /**
- * ABI argument descriptors for each state-changing method.
+ * Maximum number of listings a single page read may return.
  *
- * These mirror apps/contracts/property_listing_abi.json exactly and are used
- * by the cross-contract compatibility tests to assert that the XDR operations
- * built by this client match the on-chain interface (order + types).
+ * Kept small so that a page read stays well within Soroban's per-transaction
+ * resource limits regardless of how many listings exist on-chain.
  */
-export const PROPERTY_LISTING_ABI = {
-  create_listing: [
-    { name: 'owner', type: 'address' },
-    { name: 'title', type: 'string' },
-    { name: 'description', type: 'string' },
-    { name: 'price_per_night', type: 'i128' },
-  ],
-  update_listing: [
-    { name: 'caller', type: 'address' },
-    { name: 'id', type: 'u64' },
-    { name: 'title', type: 'string' },
-    { name: 'description', type: 'string' },
-    { name: 'price_per_night', type: 'i128' },
-  ],
-  update_status: [
-    { name: 'caller', type: 'address' },
-    { name: 'id', type: 'u64' },
-    { name: 'status', type: 'enum' },
-  ],
-} as const;
+export const MAX_LISTING_PAGE_SIZE = 20;
 
-export type PropertyListingAbiMethod = keyof typeof PROPERTY_LISTING_ABI;
-
-/**
- * Decode the contract invocation encoded in an operation returned by
- * Contract.call(). Exposed so cross-contract tests can assert the ABI shape
- * without re-implementing XDR parsing.
- */
-export function decodeInvocation(op: xdr.Operation): {
-  contractId: string;
-  method: string;
-  args: xdr.ScVal[];
-} {
-  const body = op.body();
-  if (body.switch().name !== 'invokeHostFunction') {
-    throw new Error(
-      `[${CONTRACT_NAME}@${ABI_VERSION}] expected invokeHostFunction operation, got ${body.switch().name}`,
-    );
-  }
-  const hostFn = body.invokeHostFunctionOp().hostFunction();
-  if (hostFn.switch().name !== 'hostFunctionTypeInvokeContract') {
-    throw new Error(
-      `[${CONTRACT_NAME}@${ABI_VERSION}] expected invokeContract host function, got ${hostFn.switch().name}`,
-    );
-  }
-  const invoke = hostFn.invokeContract();
-  const contractId = invoke.contractAddress();
-  const method = invoke.functionName().toString();
-  const args = invoke.args();
-  return { contractId: contractId, method, args };
+/** A single bounded page of listings plus the cursor for the next page. */
+export interface ListingPage {
+  /** Listings in deterministic ascending-ID order. */
+  listings: PropertyListing[];
+  /**
+   * Cursor to pass as `cursor` to fetch the next page, or `null` when the
+   * collection has been fully traversed.
+   */
+  nextCursor: bigint | null;
 }
 
 // ─── Client ──────────────────────────────────────────────────────────────────
@@ -126,6 +86,83 @@ export class PropertyListingClient {
   async listingCount(): Promise<bigint> {
     const result = await this.simulateReadOnly('listing_count', []);
     return BigInt(scValToNative(result) as number | string);
+  }
+
+  /**
+   * Retrieve a single bounded page of listings.
+   *
+   * ABI: get_listings_page(cursor: u64, limit: u32) -> (Vec<PropertyListing>, Option<u64>)
+   *
+   * `cursor` is the ID to start from (inclusive); pass `0n` for the first
+   * page. `limit` is clamped to `MAX_LISTING_PAGE_SIZE`. The returned
+   * `nextCursor` is `null` once the collection is exhausted, so callers can
+   * page through the full history without duplicates or gaps.
+   */
+  async getListingsPage(
+    cursor: bigint = 0n,
+    limit: number = MAX_LISTING_PAGE_SIZE,
+  ): Promise<ListingPage> {
+    if (cursor < 0n) {
+      throw new RangeError('cursor must be non-negative');
+    }
+    const pageSize = Math.max(
+      1,
+      Math.min(Math.floor(limit), MAX_LISTING_PAGE_SIZE),
+    );
+
+    const result = await this.simulateReadOnly('get_listings_page', [
+      nativeToScVal(cursor, { type: 'u64' }),
+      nativeToScVal(pageSize, { type: 'u32' }),
+    ]);
+
+    const native = scValToNative(result) as [
+      PropertyListing[],
+      bigint | number | string | null | undefined,
+    ];
+    const listings = (native[0] ?? []) as PropertyListing[];
+    const rawNext = native[1];
+    const nextCursor =
+      rawNext === null || rawNext === undefined ? null : BigInt(rawNext);
+
+    return { listings, nextCursor };
+  }
+
+  /**
+   * Iterate over every listing using bounded pages.
+   *
+   * Yields listings one at a time in deterministic ascending-ID order while
+   * only ever requesting pages of at most `MAX_LISTING_PAGE_SIZE` items, so
+   * no single contract read iterates an unbounded collection.
+   */
+  async *iterateListings(
+    startCursor: bigint = 0n,
+    pageSize: number = MAX_LISTING_PAGE_SIZE,
+  ): AsyncGenerator<PropertyListing, void, undefined> {
+    let cursor: bigint | null = startCursor;
+    while (cursor !== null) {
+      const page: ListingPage = await this.getListingsPage(cursor, pageSize);
+      for (const listing of page.listings) {
+        yield listing;
+      }
+      cursor = page.nextCursor;
+    }
+  }
+
+  /**
+   * Collect all listings by paging through the collection.
+   *
+   * Convenience wrapper around {@link iterateListings}. Prefer the async
+   * iterator for large collections to avoid holding everything in memory.
+   */
+  async getAllListings(
+    startCursor: bigint = 0n,
+    pageSize: number = MAX_LISTING_PAGE_SIZE,
+  ): Promise<PropertyListing[]> {
+    const all: PropertyListing[] = [];
+    for await (const listing of this.iterateListings(startCursor, pageSize)) {
+      all.push(listing);
+    }
+    return all;
   }
 
   // ── State-changing operations ─────────────────────────────────────────────

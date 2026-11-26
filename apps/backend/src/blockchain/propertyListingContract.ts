@@ -8,6 +8,13 @@
  *   update_property_listing(id: String, data_hash: String, owner: Address)
  *   get_property_listing(id: String) -> { owner: Address, data_hash: String, status: Symbol }
  *   update_property_status(id: String, owner: Address, status: Symbol)
+ *   get_property_listings_page(cursor: Option<String>, limit: u32)
+ *     -> { items: Vec<{ id: String, owner: Address, data_hash: String, status: Symbol }>,
+ *          next_cursor: Option<String> }
+ *
+ * Listing enumeration is keyset-paginated: the cursor is the last id returned
+ * on the previous page, and the contract returns ids in ascending order. This
+ * keeps every read bounded regardless of how many listings exist.
  */
 
 import { createHash } from 'crypto';
@@ -33,6 +40,26 @@ export interface OnChainPropertyData {
   data_hash: string;
   status: ListingStatus;
 }
+
+export interface OnChainPropertyListing extends OnChainPropertyData {
+  id: string;
+}
+
+export interface PropertyListingPage {
+  items: OnChainPropertyListing[];
+  /** Cursor to pass as `cursor` for the next page, or null when exhausted. */
+  next_cursor: string | null;
+}
+
+/**
+ * Maximum number of listings the contract will return in a single page.
+ * Mirrors the contract-side cap so clients never request more than the
+ * contract is willing to serve (and never exceed Soroban resource limits).
+ */
+export const MAX_PROPERTY_LISTING_PAGE_SIZE = 50;
+
+/** Default page size used when callers do not specify one. */
+export const DEFAULT_PROPERTY_LISTING_PAGE_SIZE = 20;
 
 // ─── Serialisation ────────────────────────────────────────────────────────────
 
@@ -114,6 +141,132 @@ export async function getPropertyListing(id: string): Promise<OnChainPropertyDat
     data_hash: native.data_hash,
     status: native.status as ListingStatus,
   };
+}
+
+/**
+ * Fetch a single bounded page of on-chain property listings.
+ *
+ * Ordering is deterministic (ascending by listing id) and the cursor is the
+ * last id of the previous page, so pages never overlap or skip records.
+ *
+ * @param cursor - Last id from the previous page, or null/undefined for the first page
+ * @param limit - Requested page size; clamped to [1, MAX_PROPERTY_LISTING_PAGE_SIZE]
+ * @returns A page of listings plus the cursor for the next page (null when done)
+ * @throws ContractError if PROPERTY_LISTING_CONTRACT_ID is not configured or the call fails
+ */
+export async function getPropertyListingsPage(
+  cursor?: string | null,
+  limit: number = DEFAULT_PROPERTY_LISTING_PAGE_SIZE,
+): Promise<PropertyListingPage> {
+  if (!PROPERTY_LISTING_CONTRACT_ID) {
+    throw new ContractError(
+      'PROPERTY_LISTING_CONTRACT_ID is not configured',
+      'get_property_listings_page',
+    );
+  }
+
+  const pageSize = Math.min(
+    Math.max(Math.trunc(limit) || 1, 1),
+    MAX_PROPERTY_LISTING_PAGE_SIZE,
+  );
+
+  const server = getSorobanServer();
+  const contract = new Contract(PROPERTY_LISTING_CONTRACT_ID);
+
+  const cursorScVal =
+    cursor === undefined || cursor === null
+      ? xdr.ScVal.scvVoid()
+      : nativeToScVal(cursor, { type: 'string' });
+
+  const sourceAccount = await server.getAccount(STELLAR_SOURCE_ACCOUNT);
+  const tx = new TransactionBuilder(sourceAccount, {
+    fee: '100',
+    networkPassphrase: NETWORK_PASSPHRASE,
+  })
+    .addOperation(
+      contract.call(
+        'get_property_listings_page',
+        cursorScVal,
+        nativeToScVal(pageSize, { type: 'u32' }),
+      ),
+    )
+    .setTimeout(30)
+    .build();
+
+  const retval = await simulateReadOnly(server, tx, 'get_property_listings_page');
+  const native = scValToNative(retval) as {
+    items: Array<{ id: string; owner: string; data_hash: string; status: string }>;
+    next_cursor: string | null | undefined;
+  };
+
+  const items = (native.items ?? []).map((item) => ({
+    id: item.id,
+    owner: item.owner,
+    data_hash: item.data_hash,
+    status: item.status as ListingStatus,
+  }));
+
+  return {
+    items,
+    next_cursor: native.next_cursor ?? null,
+  };
+}
+
+/**
+ * Iterate every on-chain listing through bounded pages.
+ *
+ * Prefer this over any "fetch all" helper: it never asks the contract for an
+ * unbounded collection, and it stops as soon as the contract reports no
+ * further cursor. A safety cap on the number of pages prevents runaway loops
+ * if the contract misbehaves.
+ *
+ * @param options.pageSize - Page size to request (clamped by the contract cap)
+ * @param options.maxPages - Hard limit on pages fetched (default 10_000)
+ * @param options.onPage - Optional callback invoked with each page as it arrives
+ * @returns All listings, in deterministic ascending-id order
+ * @throws ContractError if a page fetch fails or the page cap is exceeded
+ */
+export async function getAllPropertyListings(options?: {
+  pageSize?: number;
+  maxPages?: number;
+  onPage?: (page: PropertyListingPage) => void | Promise<void>;
+}): Promise<OnChainPropertyListing[]> {
+  const pageSize = options?.pageSize ?? MAX_PROPERTY_LISTING_PAGE_SIZE;
+  const maxPages = options?.maxPages ?? 10_000;
+
+  const all: OnChainPropertyListing[] = [];
+  let cursor: string | null = null;
+  let pages = 0;
+
+  do {
+    if (pages >= maxPages) {
+      throw new ContractError(
+        `Exceeded maximum of ${maxPages} pages while listing properties`,
+        'get_property_listings_page',
+      );
+    }
+
+    const page = await getPropertyListingsPage(cursor, pageSize);
+    pages += 1;
+
+    if (options?.onPage) {
+      await options.onPage(page);
+    }
+
+    all.push(...page.items);
+
+    // Guard against a contract that returns the same cursor forever.
+    if (page.next_cursor !== null && page.next_cursor === cursor) {
+      throw new ContractError(
+        'Contract returned a non-advancing pagination cursor',
+        'get_property_listings_page',
+      );
+    }
+
+    cursor = page.next_cursor;
+  } while (cursor !== null);
+
+  return all;
 }
 
 // ─── Write ────────────────────────────────────────────────────────────────────
