@@ -146,6 +146,34 @@ export interface LagReport {
     lag: bigint;
 }
 
+/**
+ * A single ledger event as delivered by the chain indexer.  `sequence` is a
+ * monotonically increasing, gap-free integer assigned by the indexer; it is
+ * the stable cursor used for keyset pagination.
+ */
+export interface LedgerEvent {
+    sequence: bigint;
+    event_key: string;
+    /** Raw event payload; escrow transitions must be derived from this only. */
+    payload: Record<string, unknown>;
+}
+
+export interface PageResult {
+    /** Events in ascending `sequence` order, at most `pageSize` entries. */
+    events: LedgerEvent[];
+    /** Cursor to persist after this page is fully projected. */
+    nextCursor: string;
+    /** True when no further events exist beyond this page. */
+    done: boolean;
+}
+
+/**
+ * Hard upper bound on events processed per page.  Kept small so a single
+ * worker tick stays well within Soroban/RPC resource limits and so a crash
+ * mid-page only ever replays a bounded amount of work.
+ */
+export const MAX_PAGE_SIZE = 50;
+
 // ─── Event Inbox ──────────────────────────────────────────────────────────────
 
 /**
@@ -464,6 +492,136 @@ export async function retryDeadLetterEvent(
     }
 
     return { success: true };
+}
+
+// ─── Bounded Page Processing ──────────────────────────────────────────────────
+
+/**
+ * Fetch one bounded page of ledger events strictly after `afterSequence`.
+ *
+ * Keyset (cursor) pagination — never offset-based — so concurrent inserts
+ * cannot cause duplicates or gaps.  `pageSize` is clamped to `MAX_PAGE_SIZE`.
+ */
+export async function fetchEventPage(
+    afterSequence: bigint,
+    pageSize: number = MAX_PAGE_SIZE,
+): Promise<ServiceResponse<PageResult>> {
+    const limit = Math.max(1, Math.min(pageSize, MAX_PAGE_SIZE));
+
+    const { data, error } = await supabase
+        .from('ledger_events')
+        .select('sequence, event_key, payload')
+        .gt('sequence', afterSequence.toString())
+        .order('sequence', { ascending: true })
+        .limit(limit);
+
+    if (error) {
+        return { success: false, error: `Failed to fetch event page: ${error.message}` };
+    }
+
+    const events: LedgerEvent[] = (data ?? []).map((row) => ({
+        sequence: BigInt(row.sequence as string),
+        event_key: row.event_key as string,
+        payload: (row.payload ?? {}) as Record<string, unknown>,
+    }));
+
+    const last = events.length > 0 ? events[events.length - 1].sequence : afterSequence;
+
+    return {
+        success: true,
+        data: {
+            events,
+            nextCursor: last.toString(),
+            done: events.length < limit,
+        },
+    };
+}
+
+/**
+ * Process ledger events in bounded pages, resuming from the persisted cursor.
+ *
+ * Guarantees:
+ *  - Each event is applied at most once (delegated to `processEventOnce`).
+ *  - The cursor only advances after a page is fully projected, so a crash
+ *    mid-page replays that page — duplicates are skipped by the inbox.
+ *  - Escrow transitions are only applied through `project`, which callers must
+ *    derive from verified ledger payloads (never from off-chain callbacks).
+ *
+ * @param cursorKey  - Worker identity, e.g. `"escrow_sync"`.
+ * @param project    - Applies domain side effects for one verified event.
+ * @param options.maxPages - Stop after this many pages (bounds a single tick).
+ */
+export async function processEventPages(
+    cursorKey: string,
+    project: (event: LedgerEvent) => Promise<void>,
+    {
+        maxPages = 10,
+        pageSize = MAX_PAGE_SIZE,
+        maxAttempts = 5,
+    }: { maxPages?: number; pageSize?: number; maxAttempts?: number } = {},
+): Promise<ServiceResponse<{ processed: number; deadLettered: number; cursor: string; done: boolean }>> {
+    const cursorResult = await loadCursor(cursorKey);
+    if (!cursorResult.success) {
+        return { success: false, error: cursorResult.error };
+    }
+
+    let cursor = BigInt(cursorResult.data ?? '0');
+    let processed = 0;
+    let deadLettered = 0;
+    let done = false;
+
+    for (let page = 0; page < maxPages; page++) {
+        const pageResult = await fetchEventPage(cursor, pageSize);
+        if (!pageResult.success) {
+            return { success: false, error: pageResult.error };
+        }
+
+        const { events, nextCursor, done: pageDone } = pageResult.data;
+        done = pageDone;
+
+        if (events.length === 0) {
+            break;
+        }
+
+        for (const event of events) {
+            const outcome = await processEventOnce(
+                { eventKey: event.event_key, workerId: cursorKey },
+                () => project(event),
+                { maxAttempts },
+            );
+
+            if (!outcome.success) {
+                // Stop the page; cursor is NOT advanced past this event so the
+                // next tick retries it rather than silently skipping it.
+                return {
+                    success: false,
+                    error: `Failed processing ${event.event_key}: ${outcome.error}`,
+                };
+            }
+
+            if (outcome.data.outcome === 'dead_letter') {
+                deadLettered++;
+            } else if (outcome.data.outcome === 'projected') {
+                processed++;
+            }
+        }
+
+        // Persist cursor only after the whole page is projected.
+        const saveResult = await saveCursor(cursorKey, nextCursor);
+        if (!saveResult.success) {
+            return { success: false, error: saveResult.error };
+        }
+        cursor = BigInt(nextCursor);
+
+        if (pageDone) {
+            break;
+        }
+    }
+
+    return {
+        success: true,
+        data: { processed, deadLettered, cursor: cursor.toString(), done },
+    };
 }
 
 // ─── Idempotent Projection Helper ─────────────────────────────────────────────

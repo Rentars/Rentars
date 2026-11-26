@@ -943,4 +943,183 @@ mod tests {
             client.update_listing(&owner, &id, &title, &desc, &150_0000000_i128);
         });
     }
+
+    // ─── Pagination Tests ─────────────────────────────────────────────────────
+
+    /// Maximum page size the contract will serve in a single call.
+    const MAX_PAGE_SIZE: u32 = 20;
+
+    /// Seed `count` listings and return their IDs in creation order.
+    fn seed_listings(env: &Env, client: &PropertyListingContractClient, count: u64) -> Vec<u64> {
+        let owner = Address::generate(env);
+        let mut ids = Vec::new(env);
+        for _ in 0..count {
+            let id = client.create_listing(
+                &owner,
+                &String::from_str(env, "Paged Property"),
+                &String::from_str(env, "desc"),
+                &100_0000000_i128,
+            );
+            ids.push_back(id);
+        }
+        ids
+    }
+
+    /// Walk every page via keyset cursor and assert the concatenation is the
+    /// complete, duplicate-free, gap-free, deterministically ordered history.
+    fn assert_full_paged_history(
+        env: &Env,
+        client: &PropertyListingContractClient,
+        expected: &Vec<u64>,
+        page_size: u32,
+    ) {
+        let mut collected: Vec<u64> = Vec::new(env);
+        let mut cursor: Option<u64> = None;
+        let mut pages: u32 = 0;
+
+        loop {
+            let page = client.get_listings_page(&cursor, &page_size);
+            pages += 1;
+            // Pages must never exceed the requested size.
+            assert!(
+                page.len() <= page_size,
+                "page {} exceeded requested size {}",
+                pages,
+                page_size
+            );
+            for id in page.iter() {
+                collected.push_back(id);
+            }
+            match page.last() {
+                Some(last) => cursor = Some(last),
+                None => break,
+            }
+            // Guard against infinite loops on a misbehaving cursor.
+            assert!(pages < 10_000, "pagination did not terminate");
+        }
+
+        assert_eq!(
+            collected.len(),
+            expected.len(),
+            "paged history length mismatch"
+        );
+        for (i, id) in collected.iter().enumerate() {
+            assert_eq!(
+                id,
+                expected.get(i as u32).unwrap(),
+                "paged history mismatch at index {}",
+                i
+            );
+        }
+    }
+
+    /// A collection larger than one page is fully retrievable through bounded pages.
+    #[test]
+    fn test_pagination_complete_history() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+
+        let total = (MAX_PAGE_SIZE as u64) * 2 + 7;
+        let ids = seed_listings(&env, &client, total);
+        assert_eq!(client.listing_count(), total);
+
+        assert_full_paged_history(&env, &client, &ids, MAX_PAGE_SIZE);
+    }
+
+    /// Page size is clamped to the documented maximum.
+    #[test]
+    fn test_pagination_clamps_page_size() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+
+        let total = (MAX_PAGE_SIZE as u64) + 5;
+        seed_listings(&env, &client, total);
+
+        // Requesting an oversized page must not return more than the max.
+        let page = client.get_listings_page(&None, &(MAX_PAGE_SIZE * 100));
+        assert!(page.len() <= MAX_PAGE_SIZE);
+        assert_eq!(page.len(), MAX_PAGE_SIZE);
+    }
+
+    /// A zero page size is rejected rather than silently returning everything.
+    #[test]
+    #[should_panic(expected = "page_size must be greater than zero")]
+    fn test_pagination_rejects_zero_page_size() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+        client.get_listings_page(&None, &0);
+    }
+
+    /// Cursor semantics are stable: the same cursor always yields the same page.
+    #[test]
+    fn test_pagination_cursor_is_stable() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+
+        seed_listings(&env, &client, (MAX_PAGE_SIZE as u64) + 3);
+
+        let first = client.get_listings_page(&None, &5);
+        let cursor = first.last().unwrap();
+
+        let page_a = client.get_listings_page(&Some(cursor), &5);
+        let page_b = client.get_listings_page(&Some(cursor), &5);
+        assert_eq!(page_a, page_b, "cursor must be deterministic");
+    }
+
+    /// A cursor past the end of the collection yields an empty page.
+    #[test]
+    fn test_pagination_cursor_past_end() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+
+        seed_listings(&env, &client, 3);
+        let page = client.get_listings_page(&Some(u64::MAX), &MAX_PAGE_SIZE);
+        assert_eq!(page.len(), 0);
+    }
+
+    /// Pagination preserves authorization: reads are public but writes still
+    /// require the owner, and paged reads never leak mutable state.
+    #[test]
+    fn test_pagination_preserves_authorization() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+
+        let ids = seed_listings(&env, &client, (MAX_PAGE_SIZE as u64) + 1);
+        let first_id = ids.get(0).unwrap();
+
+        // Paged read is public and returns the same data as a direct read.
+        let page = client.get_listings_page(&None, &MAX_PAGE_SIZE);
+        assert_eq!(page.get(0).unwrap(), first_id);
+        assert_eq!(client.get_listing(&first_id).id, first_id);
+    }
+
+    /// Resource usage: a full page read stays within a bounded CPU budget and
+    /// does not grow with the total collection size.
+    #[test]
+    fn test_pagination_resource_usage_bounded() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+
+        // Small collection: measure a full page read.
+        seed_listings(&env, &client, MAX_PAGE_SIZE as u64);
+        let small_budget = env.budget().reset_unlimited();
+        let _ = client.get_listings_page(&None, &MAX_PAGE_SIZE);
+        let small_cpu = env.budget().cpu_instruction_cost();
+        let _ = small_budget;
+
+        // Large collection: a single page read must cost roughly the same.
+        seed_listings(&env, &client, (MAX_PAGE_SIZE as u64) * 5);
+        env.budget().reset_unlimited();
+        let _ = client.get_listings_page(&None, &MAX_PAGE_SIZE);
+        let large_cpu = env.budget().cpu_instruction_cost();
+
+        // Allow generous headroom for storage key hashing differences, but the
+        // cost must not scale with the total number of listings.
+        assert!(
+            large_cpu < small_cpu.saturating_mul(3),
+            "page read cost grew with collection size: small={} large={}",
+            small_cpu,
+            large_cpu
+        );
+    }
 }

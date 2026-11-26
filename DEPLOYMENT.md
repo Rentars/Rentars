@@ -293,6 +293,119 @@ STELLAR_RPC_URL=https://soroban-testnet.stellar.org
 
 If the frontend needs any contract metadata or network endpoints, ensure it is configured through the backend API or Vercel environment values.
 
+### 3.6 Deployment manifests and the contract registry
+
+Every contract deployment must be recorded in a **deployment manifest** so that
+each deployed contract ID can be traced back to a reproducible source artifact
+and network. Manifests are committed to the repository under
+`deployments/<network>/` (for example `deployments/testnet/` and
+`deployments/mainnet/`), and the environment-specific **contract registry**
+(`deployments/<network>/registry.json`) is the single source of truth for the
+contract IDs that the backend and frontend are expected to use.
+
+#### 3.6.1 What a manifest records
+
+Each release produces one manifest per network. A manifest records, at minimum:
+
+| Field | Description |
+|---|---|
+| `commit` | Full Git commit hash of the source tree that produced the artifacts |
+| `toolchain` | `rustc` version, `cargo` version, `stellar-cli` version, and the `wasm32-unknown-unknown` target |
+| `target` | Build target (`wasm32-unknown-unknown`) and build profile (`release`) |
+| `artifacts` | For each contract: the WASM file name and its SHA-256 hash |
+| `network` | `testnet` or `mainnet`, plus the Soroban RPC URL used |
+| `contracts` | For each contract: the deployed contract ID |
+| `initialization` | The initialization transaction hash (and ledger) for contracts that require initialization |
+| `integrity` | A checksum over the manifest body, and optionally a detached signature |
+
+Manifests **must never** contain secret seeds, wallet secret keys, mnemonics, or
+any other signing material. Only public addresses, contract IDs, and transaction
+hashes are recorded.
+
+#### 3.6.2 Generating a manifest
+
+Generate the manifest immediately after building and deploying, from the same
+checkout that produced the artifacts:
+
+```bash
+cd apps/contracts
+cargo build --target wasm32-unknown-unknown --release
+
+# Record the exact source and toolchain used for the build
+git rev-parse HEAD
+rustc --version
+cargo --version
+stellar --version
+
+# Record artifact hashes for every deployed WASM
+sha256sum target/wasm32-unknown-unknown/release/*.wasm
+```
+
+Then write the manifest to `deployments/<network>/<commit>.json` using the
+fields listed in 3.6.1, including the contract IDs returned by
+`stellar contract deploy` and the initialization transaction hash returned by
+`stellar contract invoke`. Update `deployments/<network>/registry.json` to point
+at the new manifest and the contract IDs it contains.
+
+#### 3.6.3 Integrity checking
+
+Every manifest carries an integrity checksum computed over its body. Verify it
+before the manifest is used for any deployment or promotion:
+
+```bash
+# Recompute the checksum and compare with the recorded integrity value
+node scripts/verify-deployment-manifest.ts --manifest deployments/testnet/<commit>.json
+```
+
+The verification command fails (non-zero exit) if:
+
+- the recorded checksum does not match the manifest body,
+- a recorded artifact hash does not match the WASM file on disk,
+- the manifest contains any field that looks like secret material, or
+- the manifest's network does not match the registry it is referenced from.
+
+#### 3.6.4 Signing and operator approval
+
+Signing keys are **never** stored in CI. Manifests are signed by an operator on
+a trusted workstation, and the detached signature is committed alongside the
+manifest:
+
+```bash
+# Run on an operator workstation with the signing key available locally
+node scripts/sign-deployment-manifest.ts \
+  --manifest deployments/mainnet/<commit>.json \
+  --key-ref <key-reference-in-secrets-manager>
+```
+
+Production promotion requires **explicit operator approval**:
+
+- Testnet manifests may be merged after integrity verification passes.
+- Mainnet manifests require a valid signature from an authorized operator and a
+  recorded approval (for example a pull-request approval from a release
+  approver) before they are merged.
+- CI only verifies signatures and checksums; it never holds signing keys and
+  never generates signatures.
+
+#### 3.6.5 Verifying deployed IDs against backend configuration
+
+After deploying the backend, verify that the configured contract IDs match the
+registry for the target network:
+
+```bash
+# Compares backend configuration with deployments/<network>/registry.json
+node scripts/verify-deployment-manifest.ts \
+  --network "$STELLAR_NETWORK" \
+  --registry deployments/"$STELLAR_NETWORK"/registry.json \
+  --check-backend-env apps/backend/.env
+```
+
+The command compares `PROPERTY_LISTING_CONTRACT_ID`, `BOOKING_CONTRACT_ID`, and
+`REVIEW_CONTRACT_ID` against the registry and exits non-zero on any mismatch.
+Backend startup performs the same comparison when a registry is available, so a
+mismatched configured ID is detected at boot rather than at first invocation.
+When no registry is available for the configured network, startup logs a warning
+and continues.
+
 ---
 
 ## 4. Backend Deployment
@@ -555,6 +668,8 @@ Before switching from testnet to mainnet, complete this checklist:
 - [ ] Update `NEXT_PUBLIC_SOROBAN_RPC_URL` to `https://soroban-mainnet.stellar.org`
 - [ ] Deploy and fund a mainnet Stellar admin account
 - [ ] Deploy contracts and capture mainnet contract IDs
+- [ ] Generate, integrity-check, and operator-sign the mainnet deployment manifest
+- [ ] Update `deployments/mainnet/registry.json` and confirm backend IDs match it
 - [ ] Validate backend and frontend integration in a staging environment
 - [ ] Confirm backup and rollback procedures are tested
 
@@ -564,6 +679,8 @@ Before switching from testnet to mainnet, complete this checklist:
 - Use dedicated Stellar accounts for contract deployment and administration.
 - Never expose the secret seed in Git or logs.
 - Restrict access to production secrets in your secrets manager.
+- Keep manifest signing keys outside CI; CI only verifies signatures and checksums.
+- Never write secret seeds, wallet secret keys, or mnemonics into deployment manifests.
 
 ### 6.2 Security and audit
 
@@ -608,6 +725,9 @@ contract defect is one of:
   migrate state if a migration entry point exists, then update
   `PROPERTY_LISTING_CONTRACT_ID`, `BOOKING_CONTRACT_ID`, and `REVIEW_CONTRACT_ID`
   in the backend.
+- Generate, integrity-check, and (for mainnet) operator-sign a new deployment manifest
+- Update `deployments/<network>/registry.json` to reference the new manifest and contract IDs
+- Run the manifest verification command to confirm backend IDs match the registry
 - Verify cross-contract calls and initialization again.
 
 If contract addresses are updated, also update any frontend endpoints or settings that rely on them.
@@ -1289,6 +1409,10 @@ To confirm this guide is accurate, verify:
 14. ✅ Dependency exceptions are documented with expiration dates and reviewed quarterly
 15. ✅ RPO/RTO targets and owners are documented for database, storage, and configuration
 16. ✅ A restore drill into an isolated, sanitized environment has been completed and recorded
+17. ✅ Each deployed contract is traceable to a commit, toolchain, artifact hash, network, and contract ID via a deployment manifest
+18. ✅ Manifests are integrity-checked, and mainnet manifests are operator-signed with keys kept outside CI
+19. ✅ Backend startup and the verification command detect mismatched configured contract IDs
+20. ✅ Deployment manifests never contain wallet secret material
 
 If all checks are satisfied, deployment automation is production-ready for
 staging/testnet. Mainnet remains gated behind the approval process in section 6
