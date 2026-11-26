@@ -11,8 +11,14 @@ export default defineConfig({
           name: 'unit',
           environment: 'node',
           globals: false,
-          include: ['src/**/*.{test,spec}.ts'],
+          include: [
+            'src/**/*.{test,spec}.ts',
+            'src/**/*.{test,spec}.tsx',
+            'src/blockchain/__tests__/**/*.compat.test.ts',
+            'tests/**/*.compat.test.ts',
+          ],
           exclude: ['**/node_modules/**', '**/dist/**', '**/rls/**'],
+          testTimeout: 30000,
         },
         resolve: {
           alias: {

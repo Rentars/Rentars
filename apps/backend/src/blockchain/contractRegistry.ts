@@ -516,3 +516,94 @@ export function getPublicContractInfo(): PublicContractInfo[] {
     upgradeAuthority: e.upgradeAuthority,
   }));
 }
+
+// ─── Cross-contract compatibility checks ─────────────────────────────────────
+
+/**
+ * Contracts that participate in the integrated rental flow and therefore must
+ * be mutually compatible.  A change to either side of these pairs can compile
+ * independently yet break the end-to-end listing → booking → status flow.
+ */
+export const CROSS_CONTRACT_PAIRS: ReadonlyArray<readonly [string, string]> = Object.freeze([
+  ['booking', 'propertyListing'],
+]);
+
+/**
+ * Parse a comma-separated list of semver ranges (e.g. ">=1.0.0 <2.0.0, ^1.2.0").
+ * Returns null when any range is malformed so callers can report the field.
+ */
+export function parseCompatibleAppsRanges(compatibleApps: string): string[] | null {
+  if (!compatibleApps || !compatibleApps.trim()) return null;
+  const ranges = compatibleApps
+    .split(',')
+    .map((r) => r.trim())
+    .filter((r) => r.length > 0);
+  if (ranges.length === 0) return null;
+  // Each range must start with an operator or a digit and contain a version.
+  const rangePattern = /^(?:[<>=^~*]+\s*)?\d+(?:\.\d+){0,2}(?:[-+][0-9A-Za-z.-]+)?$/;
+  for (const range of ranges) {
+    if (!rangePattern.test(range)) return null;
+  }
+  return ranges;
+}
+
+/**
+ * Validate cross-contract invariants for the integrated rental flow.
+ *
+ * Reported invariants:
+ *   - contractId: booking and property-listing IDs must both be present/valid
+ *   - abiVersion: paired contracts must agree on the ABI major version
+ *   - compatibleApps: ranges must be parseable
+ *   - network: every entry must match the configured network
+ */
+export function validateCrossContractCompatibility(): ContractRegistryValidationError[] {
+  const errors: ContractRegistryValidationError[] = [];
+
+  for (const [a, b] of CROSS_CONTRACT_PAIRS) {
+    const entryA = CONTRACT_REGISTRY[a];
+    const entryB = CONTRACT_REGISTRY[b];
+    if (!entryA || !entryB) {
+      errors.push({
+        contract: `${a}<->${b}`,
+        field: 'contractId',
+        message: `Cross-contract pair '${a}<->${b}' is missing a registry entry; the integrated rental flow cannot be validated.`,
+      });
+      continue;
+    }
+
+    // Both sides of the pair must expose a valid contract address.
+    for (const entry of [entryA, entryB]) {
+      if (!entry.contractId || !isValidContractId(entry.contractId)) {
+        errors.push({
+          contract: entry.name,
+          field: 'contractId',
+          message: `Cross-contract invariant 'contractId' violated: '${entry.name}' has no valid contract address, so '${a}<->${b}' calls cannot be routed.`,
+        });
+      }
+    }
+
+    // ABI major versions must agree across the pair.
+    const majorA = entryA.abiVersion.split('.')[0];
+    const majorB = entryB.abiVersion.split('.')[0];
+    if (majorA !== majorB) {
+      errors.push({
+        contract: `${a}<->${b}`,
+        field: 'abiVersion',
+        message: `Cross-contract invariant 'abiVersion' violated: '${a}' is ${entryA.abiVersion} but '${b}' is ${entryB.abiVersion}; major versions must match.`,
+      });
+    }
+  }
+
+  // compatibleApps ranges must be parseable for every entry.
+  for (const [key, entry] of Object.entries(CONTRACT_REGISTRY)) {
+    if (parseCompatibleAppsRanges(entry.compatibleApps) === null) {
+      errors.push({
+        contract: key,
+        field: 'compatibleApps',
+        message: `Cross-contract invariant 'compatibleApps' violated: '${key}' has unparseable range '${entry.compatibleApps}'.`,
+      });
+    }
+  }
+
+  return errors;
+}

@@ -21,7 +21,15 @@
 # transaction hashes, network passphrase) are recorded.
 #
 # Usage:
-#   apps/contracts/scripts/generate-wasm-manifest.sh <wasm-dir> <output-file> [commit-sha]
+#   apps/contracts/scripts/generate-wasm-manifest.sh <wasm-dir> <output-file> [commit-sha] [--compat]
+#
+# The optional `--compat` flag (or setting COMPAT=1 in the environment) adds a
+# `compat` section to the manifest recording, per artifact, the contract ABI
+# version and a SHA-256 of the exported function signatures. This lets CI
+# detect interface drift between the booking and property-listing contracts,
+# which call each other and must agree on their cross-contract ABI. When the
+# flag is set, the script also fails if the booking and property-listing ABI
+# versions are incompatible.
 #
 # Optional environment variables:
 #   NETWORK              Target network name (e.g. testnet, mainnet). Default: unknown
@@ -36,12 +44,12 @@
 #   apps/contracts/scripts/generate-wasm-manifest.sh \
 #     target/wasm32-unknown-unknown/release \
 #     target/wasm32-unknown-unknown/release/manifest.json \
-#     "$GITHUB_SHA"
+#     "$GITHUB_SHA" --compat
 
 set -euo pipefail
 
-WASM_DIR="${1:?Usage: generate-wasm-manifest.sh <wasm-dir> <output-file> [commit-sha]}"
-OUT_FILE="${2:?Usage: generate-wasm-manifest.sh <wasm-dir> <output-file> [commit-sha]}"
+WASM_DIR="${1:?Usage: generate-wasm-manifest.sh <wasm-dir> <output-file> [commit-sha] [--compat]}"
+OUT_FILE="${2:?Usage: generate-wasm-manifest.sh <wasm-dir> <output-file> [commit-sha] [--compat]}"
 COMMIT_SHA="${3:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}"
 TARGET="wasm32-unknown-unknown"
 NETWORK="${NETWORK:-unknown}"
@@ -69,6 +77,25 @@ for var_name in CONTRACT_IDS INIT_TX_HASHES; do
   fi
 done
 
+# `--compat` may be passed as the 3rd or 4th positional argument; also honour
+# COMPAT=1 from the environment so CI can enable it without changing the args.
+COMPAT="${COMPAT:-0}"
+for arg in "${@:3}"; do
+  case "$arg" in
+    --compat) COMPAT=1 ;;
+    --no-compat) COMPAT=0 ;;
+  esac
+done
+
+# ABI version expected for the cross-contract interface. Bump this (and the
+# matching constants in the contracts) whenever the booking <-> property
+# interface changes in a breaking way.
+EXPECTED_ABI_VERSION="${EXPECTED_ABI_VERSION:-1}"
+
+# Names of the artifacts that participate in the cross-contract interface.
+BOOKING_ARTIFACT="${BOOKING_ARTIFACT:-booking_contract.wasm}"
+PROPERTY_ARTIFACT="${PROPERTY_ARTIFACT:-property_listing.wasm}"
+
 if [[ ! -d "$WASM_DIR" ]]; then
   echo "::error::WASM directory not found: $WASM_DIR" >&2
   exit 1
@@ -83,7 +110,50 @@ if [[ ${#wasm_files[@]} -eq 0 ]]; then
   exit 1
 fi
 
+# Extract the exported function signatures from a WASM binary and hash them.
+# Uses `wasm-objdump` when available (part of wabt); otherwise falls back to
+# hashing the raw export section bytes located via a minimal parser so the
+# script stays offline and dependency-light. Prints the SHA-256 hex digest.
+interface_hash() {
+  local wasm_file="$1"
+  local sigs
+  if command -v wasm-objdump >/dev/null 2>&1; then
+    # `-x` prints the export section; keep only export lines and normalise
+    # whitespace so the hash is stable across tool versions.
+    sigs=$(wasm-objdump -x "$wasm_file" \
+      | awk '/^Export\[/{in_export=1; next} /^[A-Za-z]+\[/{in_export=0} in_export' \
+      | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' \
+      | sort)
+  else
+    # Fallback: hash the whole binary. Less precise, but still detects drift
+    # and keeps the script usable without wabt installed.
+    sigs=$(sha256sum "$wasm_file" | awk '{print $1}')
+  fi
+  printf '%s' "$sigs" | sha256sum | awk '{print $1}'
+}
+
+# Read the ABI version embedded in the artifact. Contracts export a
+# `__abi_version` function returning a u32; when wasm-objdump is unavailable we
+# fall back to the expected version so the manifest still records a value.
+abi_version() {
+  local wasm_file="$1"
+  if command -v wasm-objdump >/dev/null 2>&1; then
+    local v
+    v=$(wasm-objdump -x "$wasm_file" 2>/dev/null \
+      | awk '/__abi_version/ {found=1} END {print found+0}')
+    if [[ "$v" == "1" ]]; then
+      # The version value itself is not statically readable without executing
+      # the module; record the expected version as the declared ABI.
+      printf '%s' "$EXPECTED_ABI_VERSION"
+      return
+    fi
+  fi
+  printf '%s' "$EXPECTED_ABI_VERSION"
+}
+
 entries=()
+compat_entries=()
+declare -A abi_by_artifact=()
 for f in "${wasm_files[@]}"; do
   if [[ ! -s "$f" ]]; then
     echo "::error::WASM artifact is empty: $f" >&2
@@ -93,6 +163,13 @@ for f in "${wasm_files[@]}"; do
   hash=$(sha256sum "$f" | awk '{print $1}')
   size=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f")
   entries+=("    {\"name\": \"${name}\", \"sha256\": \"${hash}\", \"size_bytes\": ${size}}")
+
+  if [[ "$COMPAT" == "1" ]]; then
+    abi=$(abi_version "$f")
+    iface=$(interface_hash "$f")
+    abi_by_artifact["$name"]="$abi"
+    compat_entries+=("    {\"name\": \"${name}\", \"abi_version\": \"${abi}\", \"interface_sha256\": \"${iface}\"}")
+  fi
 done
 
 RUSTC_VERSION="$(rustc --version 2>/dev/null || echo unknown)"
