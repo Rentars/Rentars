@@ -1,38 +1,71 @@
-version: '3.8'
+# ─────────────────────────────────────────────────────────────────────────────
+# Rentars Backend — development Compose (backend services only)
+#
+# PURPOSE: Spin up only the API + Redis for backend development or testing
+#          when you do not need the Next.js frontend.
+#
+# USAGE:
+#   cp .env.example .env
+#   # Edit .env — fill in SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, JWT_SECRET
+#   docker compose up
+#
+# PROFILE VARIANTS (see also docs/COMPOSE_PROFILES.md):
+#   default (this file alone)   → api + redis
+#   Full-stack dev              → use root docker-compose.yml instead
+#   Staging/prod-like           → use infra/docker-compose.staging.yml
+#
+# PORTS (host → container):
+#   3000 → api
+#   6379 → redis (dev only; not exposed in staging/prod)
+#
+# HEALTH CHECKS:
+#   api   — GET /health must return 200 within 10 s
+#   redis — redis-cli ping must return PONG
+#   api depends_on redis (healthy), so a failed Redis produces a clear
+#   service state rather than a misleading "api healthy" result.
+# ─────────────────────────────────────────────────────────────────────────────
 
 services:
+
   api:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     ports:
       - "3000:3000"
+    env_file:
+      - .env
     environment:
-      - PORT=3000
-      - SUPABASE_URL=${SUPABASE_URL}
-      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
-      - JWT_SECRET=${JWT_SECRET}
-      - REDIS_URL=redis://redis:6379
-      - CORS_ORIGIN=http://localhost:3001
-      - STELLAR_NETWORK=${STELLAR_NETWORK:-testnet}
-      - STELLAR_RPC_URL=${STELLAR_RPC_URL}
-      - PROPERTY_LISTING_CONTRACT_ID=${PROPERTY_LISTING_CONTRACT_ID}
-      - BOOKING_CONTRACT_ID=${BOOKING_CONTRACT_ID}
-      - TRUSTLESS_WORK_API_URL=${TRUSTLESS_WORK_API_URL}
-      - TRUSTLESS_WORK_API_KEY=${TRUSTLESS_WORK_API_KEY}
+      PORT: "3000"
+      NODE_ENV: development
+      # Service-to-service Redis URL — always use the internal service name
+      REDIS_URL: redis://redis:6379
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3001}
     depends_on:
-      - redis
-    volumes:
-      - .:/app
-      - /app/node_modules
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
     networks:
-      - rentars
+      - rentars-backend
 
   redis:
-    image: redis:7-alpine
+    image: redis:7.4-alpine
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
     networks:
-      - rentars
+      - rentars-backend
 
 networks:
-  rentars:
+  rentars-backend:
     driver: bridge

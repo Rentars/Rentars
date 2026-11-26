@@ -33,6 +33,46 @@ export const REDIS_MAX_TTL_SECONDS = Number(process.env.REDIS_MAX_TTL_SECONDS ??
 export type RedisDomain = 'cache' | 'ratelimit' | 'queue' | 'session' | 'temp';
 
 /**
+ * Rate-limit endpoint classes. Each class has its own budget so that, e.g.,
+ * login attempts cannot exhaust the search budget and vice versa.
+ */
+export type RateLimitEndpoint = 'login' | 'search' | 'upload' | 'messaging' | 'expensive';
+
+/**
+ * Rate-limit identity classes.
+ *   - user:      authenticated caller, keyed by stable user id.
+ *   - anonymous: unauthenticated caller, keyed by the trusted client IP
+ *                (resolved from the trusted proxy chain, never from raw
+ *                spoofable forwarding headers).
+ */
+export type RateLimitIdentity = 'user' | 'anonymous';
+
+/**
+ * Build a namespaced rate-limit key shared by every backend instance.
+ *
+ * The key is derived only from the endpoint class, identity class, and the
+ * resolved identity value, so all instances in a deployment compute the same
+ * key for the same caller and therefore share one counter.
+ *
+ * @example
+ *   rateLimitKey('login', 'anonymous', '203.0.113.7')
+ *   // production:rentars:ratelimit:login:anonymous:203.0.113.7
+ *   rateLimitKey('search', 'user', 'user-abc')
+ *   // production:rentars:ratelimit:search:user:user-abc
+ */
+export function rateLimitKey(
+  endpoint: RateLimitEndpoint,
+  identity: RateLimitIdentity,
+  value: string | number,
+): string {
+  const id = sanitize(String(value));
+  if (!id) {
+    throw new Error('redis: rate-limit identity value must be non-empty');
+  }
+  return redisKey('ratelimit', endpoint, identity, id);
+}
+
+/**
  * Build a fully-namespaced Redis key.
  *
  * @example redisKey('cache', 'property', id) // production:rentars:cache:property:<id>

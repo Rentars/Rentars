@@ -22,18 +22,32 @@
  */
 
 import type { NextFunction, Request, Response } from 'express';
+import { randomUUID } from 'node:crypto';
 import jwt from 'jsonwebtoken';
 import {
   type AdminScope,
   DUAL_APPROVAL_REQUIRED,
   roleHasScope,
 } from '@/config/adminScopes.js';
+import { getOperationPolicy } from '@/config/adminPolicy.js';
 import { getJwtSecret } from '@/config/jwtSecret.js';
 import { auditLogger } from '@/services/auditLogger.service.js';
 
 export interface AdminRequest extends Request {
   adminId?: string;
   adminRole?: string;
+  requestId?: string;
+}
+
+/**
+ * Resolves (or generates) a request ID for correlation in audit logs.
+ */
+function resolveRequestId(req: AdminRequest): string {
+  const header = req.headers['x-request-id'];
+  if (typeof header === 'string' && header.trim() !== '') {
+    return header.trim();
+  }
+  return randomUUID();
 }
 
 // ── Step 1: authenticate ──────────────────────────────────────────────────────
@@ -89,15 +103,32 @@ export function requireScope(scope: AdminScope) {
   ): Promise<void> {
     const role = req.adminRole ?? '';
     const actorId = req.adminId ?? '';
+    const requestId = resolveRequestId(req);
+    req.requestId = requestId;
 
-    // ── Scope check ────────────────────────────────────────────────────────
-    if (!roleHasScope(role, scope)) {
+    // ── Centralized permission check ───────────────────────────────────────
+    // Look up the operation policy and verify the actor's role is explicitly
+    // allowed. Deny before any sensitive data access so resource existence is
+    // never leaked to unauthorized actors.
+    const policy = getOperationPolicy(scope);
+    const allowed = policy
+      ? policy.allowedRoles.includes(role as (typeof policy.allowedRoles)[number])
+      : roleHasScope(role, scope);
+
+    if (!allowed) {
       await auditLogger.log({
         actorId,
         action: 'admin.user_suspend', // closest available action for scope denial logging
         resourceType: 'admin',
         ip: req.ip,
-        meta: { scope, reason: 'scope_denied', role },
+        meta: {
+          request_id: requestId,
+          scope,
+          reason: 'scope_denied',
+          role,
+          endpoint: `${req.method} ${req.baseUrl ?? ''}${req.path ?? ''}`,
+          outcome: 'denied',
+        },
       });
       res.status(403).json({
         error: {
@@ -107,6 +138,22 @@ export function requireScope(scope: AdminScope) {
       });
       return;
     }
+
+    // Record the successful privileged authorization decision.
+    await auditLogger.log({
+      actorId,
+      action: 'admin.user_activate', // best available "authorized" marker
+      resourceType: 'admin',
+      ip: req.ip,
+      meta: {
+        request_id: requestId,
+        scope,
+        role,
+        endpoint: `${req.method} ${req.baseUrl ?? ''}${req.path ?? ''}`,
+        outcome: 'allowed',
+        resource_id: req.params.id ?? null,
+      },
+    });
 
     // ── Dual-approval check (HIGH-RISK actions) ────────────────────────────
     if (DUAL_APPROVAL_REQUIRED.has(scope)) {
@@ -145,10 +192,13 @@ export function requireScope(scope: AdminScope) {
         resourceType: 'admin',
         ip: req.ip,
         meta: {
+          request_id: requestId,
           scope,
+          role,
           approval_actor: approvalActorId,
           dual_approval: true,
           resource_id: req.params.id ?? null,
+          outcome: 'dual_approved',
         },
       });
 

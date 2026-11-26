@@ -30,6 +30,7 @@ import {
   getTopQueriesHandler,
   getZeroResultQueriesHandler,
   getSearchVolumeHandler,
+  getRawAnalyticsHandler,
   // User management
   listUsers,
   getUserDetail,
@@ -114,14 +115,35 @@ router.post('/disputes/:id/resolve', requireScope('admin:disputes:resolve'), res
 // Scope: admin:ratelimits:read → admin, support
 router.get('/rate-limits', requireScope('admin:ratelimits:read'), getRateLimitSummary);
 
-// ── Search analytics ──────────────────────────────────────────────────────────
+// ── Search analytics (aggregate-only) ─────────────────────────────────────────
 // Scope: admin:analytics:read → admin, moderator
+//
+// Privacy contract (#983 / Issue 088):
+//   - These endpoints return AGGREGATE data only. Cohorts below the approved
+//     minimum aggregation size are suppressed by the analytics service.
+//   - Responses must never include raw IPs, exact coordinates, or full query
+//     strings; only normalized/aggregated fields are exposed.
+//   - Time windows are bounded by the service (no unbounded historical scans).
+//   - Raw event data is NOT served here. It is only reachable through the
+//     documented elevated process (see /analytics/raw below), which requires a
+//     separate high-risk scope and dual approval.
 router.get('/analytics/search/top-queries', requireScope('admin:analytics:read'), getTopQueriesHandler);
 router.get('/analytics/search/zero-results', requireScope('admin:analytics:read'), getZeroResultQueriesHandler);
 router.get('/analytics/search/volume', requireScope('admin:analytics:read'), getSearchVolumeHandler);
 
+// ── Raw analytics events (ELEVATED — documented process only) ─────────────────
+// Scope: admin:analytics:raw → admin only (HIGH-RISK — dual approval required)
+//
+// This is the ONLY route that may return user-level event data. Access is
+// gated by a dedicated high-risk scope (dual approval via X-Approval-Actor),
+// every request is written to the audit log, and the handler enforces a
+// bounded time window plus a documented-purpose requirement. Do not widen
+// this scope to moderator/support/finance roles.
+router.get('/analytics/raw', requireScope('admin:analytics:raw'), getRawAnalyticsHandler);
+
 // ── Audit log ─────────────────────────────────────────────────────────────────
-// Scope: admin:audit:read → admin, moderator, support, finance
+// Scope: admin:audit:read → admin only (narrow role; audit records are sensitive)
+// Ordinary update/delete routes are intentionally absent — audit is append-only.
 router.get('/audit-logs', requireScope('admin:audit:read'), getAuditLogsHandler);
 
 // ── Refund approval (finance) ─────────────────────────────────────────────────
@@ -134,18 +156,22 @@ router.post('/refunds/approve', requireScope('admin:refunds:approve'), approveRe
 // ── Email delivery tracking ───────────────────────────────────────────────────
 // Scoped sub-router — all routes inside require admin:email:read
 // Mounted at /api/v1/admin/email/*
-router.use('/email', emailAdminRoutes);
+// Defense in depth: the mount itself also enforces the scope so a sub-router
+// that forgets a per-route check cannot be reached by an under-privileged role.
+router.use('/email', requireScope('admin:email:read'), emailAdminRoutes);
 
 // ── Notification monitoring ───────────────────────────────────────────────────
 // Scoped sub-router — all routes inside require admin:notifications:read
 // Mounted at /api/v1/admin/notifications/*
-router.use('/notifications', notificationMonitorRoutes);
+router.use('/notifications', requireScope('admin:notifications:read'), notificationMonitorRoutes);
 
 // ── Reconciliation operations (#772) ─────────────────────────────────────────
 // Scoped sub-router — read requires admin:reconciliation:read,
 //                     write requires admin:reconciliation:write
 // Mounted at /api/v1/admin/reconciliation/*
+// Defense in depth: the mount enforces the read scope; the sub-router enforces
+// the write scope on mutating routes.
 import reconciliationRoutes from './reconciliation.routes.js';
-router.use('/reconciliation', reconciliationRoutes);
+router.use('/reconciliation', requireScope('admin:reconciliation:read'), reconciliationRoutes);
 
 export default router;

@@ -1,23 +1,50 @@
-# Development overrides — applied automatically with `docker compose up`
+# ─────────────────────────────────────────────────────────────────────────────
+# Rentars — development overrides
+#
+# Applied automatically by `docker compose up` when you run from the repo root.
+# Extends docker-compose.yml with:
+#   - Source-code volume mounts for hot-reload
+#   - Watch-mode start commands
+#   - Node.js inspector port for the API (9229)
+#   - Longer health-check start_period to accommodate cold npm/bun installs
+#
+# Do NOT use this file in staging or production.
+# See infra/docker-compose.staging.yml for the production-like stack.
+# ─────────────────────────────────────────────────────────────────────────────
+
 services:
-  web:
-    volumes:
-      - ./apps/web:/app
-      - /app/node_modules
-      - /app/.next
-    command: npm run dev -- -p 3001
 
   api:
     volumes:
       - ./apps/backend:/app
-      - /app/node_modules
+      - backend_node_modules:/app/node_modules
     command: bun run --watch src/index.ts
-    ports:
-      - '3000:3000'
-      - '9229:9229'
     environment:
-      - NODE_ENV=development
+      NODE_ENV: development
+    ports:
+      - "3000:3000"
+      - "9229:9229"   # Node.js / Bun inspector for debugger attach
+    healthcheck:
+      # Give the watcher extra time to compile on first start
+      start_period: 30s
+
+  web:
+    volumes:
+      - ./apps/web:/app
+      - web_node_modules:/app/node_modules
+      - web_next_cache:/app/.next
+    command: sh -c "npm install && npm run dev -- -p 3001"
+    environment:
+      WATCHPACK_POLLING: "true"
+    healthcheck:
+      # Next.js dev-mode compilation can be slow on cold start
+      start_period: 90s
 
   redis:
     ports:
-      - '6379:6379'
+      - "6379:6379"
+
+volumes:
+  backend_node_modules:
+  web_node_modules:
+  web_next_cache:

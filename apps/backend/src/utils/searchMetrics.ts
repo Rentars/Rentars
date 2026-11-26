@@ -22,6 +22,63 @@ export function hashSearchQuery(query: string): string {
 }
 
 /**
+ * Convert a raw search query into a privacy-safe, aggregateable token (issue #935).
+ * Emails, phone numbers, street numbers and long digit strings are redacted,
+ * whitespace is normalised and the value is truncated so free-text cannot be
+ * used to reconstruct an individual's search history.
+ */
+export function normalizeSearchQuery(query: string): string {
+  return query
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .replace(/[^\s@]+@[^\s@]+\.[^\s@]+/g, '[email]')
+    .replace(/(?:\+?\d[\d\s().-]{6,}\d)/g, '[number]')
+    .replace(/\b\d{4,}\b/g, '[number]')
+    .slice(0, 80)
+    .trim();
+}
+
+/** Filter keys that are safe to keep for aggregate reporting. */
+const SAFE_ANALYTICS_FILTER_KEYS = [
+  'min_price',
+  'max_price',
+  'bedrooms',
+  'bathrooms',
+  'property_type',
+  'amenities',
+  'city',
+  'country',
+] as const;
+
+/**
+ * Keep only broad, aggregateable filter values. Exact coordinates, IP/user
+ * identifiers, free-text notes and unknown keys are removed entirely.
+ */
+export function redactAnalyticsFilters(
+  filters?: Record<string, unknown> | null,
+): Record<string, unknown> | undefined {
+  if (!filters || typeof filters !== 'object') return undefined;
+
+  const safe: Record<string, unknown> = {};
+  for (const key of SAFE_ANALYTICS_FILTER_KEYS) {
+    const value = filters[key];
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      safe[key] = value;
+    } else if (typeof value === 'string' && value.length <= 80) {
+      safe[key] = normalizeSearchQuery(value);
+    } else if (
+      Array.isArray(value) &&
+      value.length <= 20 &&
+      value.every((item) => typeof item === 'string' && item.length <= 40)
+    ) {
+      safe[key] = value.map((item) => normalizeSearchQuery(item));
+    }
+  }
+  return Object.keys(safe).length > 0 ? safe : undefined;
+}
+
+/**
  * Nearest-rank percentile of a list of numbers. Returns 0 for an empty list so
  * dashboards show a flat zero instead of NaN.
  */

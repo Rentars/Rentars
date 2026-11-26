@@ -110,16 +110,20 @@ describe('PropertyMapPin', () => {
   it('renders a focusable pin named after the property', () => {
     render(<PropertyMapPin property={property} />);
 
-    const pin = screen.getByRole('button', { name: 'Beach House' });
+    const pin = screen.getByRole('button', {
+      name: 'Beach House, $100 per night, Malibu, CA',
+    });
     expect(pin).toHaveAttribute('tabindex', '0');
-    expect(pin).toHaveAttribute('aria-label', 'Beach House');
+    expect(pin).toHaveAttribute('aria-label', 'Beach House, $100 per night, Malibu, CA');
   });
 
   it('uses the generic fallback label when the title is unusable', () => {
     render(<PropertyMapPin property={{ ...property, title: '   ' }} />);
 
-    const pin = screen.getByRole('button', { name: PIN_FALLBACK_LABEL });
-    expect(pin).toHaveAttribute('aria-label', PIN_FALLBACK_LABEL);
+    const pin = screen.getByRole('button', {
+      name: `${PIN_FALLBACK_LABEL}, $100 per night, Malibu, CA`,
+    });
+    expect(pin).toHaveAttribute('aria-label', `${PIN_FALLBACK_LABEL}, $100 per night, Malibu, CA`);
   });
 
   it('exposes the selected state via aria-pressed', () => {

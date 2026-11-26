@@ -3,17 +3,79 @@ import { rateLimitStore } from '@/services/rateLimitStore.service.js';
 import { setFeatured, clearFeatured, FEATURED_CAP } from '@/services/property.service.js';
 import { getTopQueries, getZeroResultQueries, getDailySearchVolume } from '@/services/searchAnalytics.service.js';
 import { auditLogger } from '@/services/auditLogger.service.js';
+import { BookingService } from '@/services/booking.service.js';
 import { supabase } from '@/config/supabase.js';
 import type { AdminRequest } from '@/middleware/admin.middleware.js';
 import { changeUserRole } from '@/services/roleAssignment.service.js';
 import { ASSIGNABLE_ROLES } from '@/config/roleTransitions.js';
 import type { RequestWithId } from '@/middleware/logging.middleware.js';
 import { z } from 'zod';
+import {
+  canPerform,
+  type AdminOperation,
+} from '@/config/adminPermissions.js';
 
 function getRouteId(value: string | string[] | undefined): string | null {
   if (typeof value !== 'string' || !value.trim()) return null;
   return value;
 }
+
+/**
+ * Defense-in-depth permission gate applied inside controllers, after
+ * authentication and before any sensitive data access or mutation.
+ *
+ * The route-level `requireScope`/admin middleware is the primary gate; this
+ * re-check guarantees that even a misconfigured route cannot expose data or
+ * mutate state for an actor whose role is not in the operation's policy.
+ *
+ * Returns `true` when the actor may proceed. When denied, a 403 response is
+ * written and an audit entry is recorded with the request ID.
+ */
+async function enforceOperation(
+  req: AdminRequest,
+  res: Response,
+  operation: AdminOperation,
+): Promise<boolean> {
+  const role = req.adminRole;
+  if (canPerform(role, operation)) return true;
+
+  const requestId = (req as RequestWithId).requestId;
+
+  await auditLogger.log({
+    actorId: req.adminId,
+    action: 'admin.permission_denied',
+    resourceType: 'admin_operation',
+    resourceId: operation,
+    ip: req.ip,
+    meta: { operation, role: role ?? null, request_id: requestId ?? null },
+  });
+
+  res.status(403).json({
+    error: {
+      code: 'FORBIDDEN',
+      message: `Role '${role ?? 'unknown'}' is not permitted to perform '${operation}'.`,
+      request_id: requestId ?? null,
+    },
+  });
+  return false;
+}
+
+/** Server-side reason validation shared by user moderation actions. */
+const moderationReasonSchema = z
+  .string()
+  .trim()
+  .min(10, 'reason must be at least 10 characters')
+  .max(2000, 'reason must be at most 2000 characters');
+
+const userModerationBodySchema = z
+  .object({
+    reason: moderationReasonSchema,
+    /** Operator confirmed the documented consequences in the UI. */
+    confirmed: z.literal(true, {
+      errorMap: () => ({ message: 'confirmed must be true to apply a moderation action' }),
+    }),
+  })
+  .strict();
 
 // ─── Featured listings ────────────────────────────────────────────────────────
 
@@ -80,6 +142,22 @@ export async function setFeaturedHandler(req: Request, res: Response): Promise<v
     return;
   }
 
+  // Audit the promotion change so admin actions are traceable.
+  const adminId = (req as AdminRequest).adminId;
+  await auditLogger
+    .log({
+      actorId: adminId,
+      action: 'admin.featured_set',
+      resourceType: 'property',
+      resourceId: propertyId,
+      meta: {
+        featured_until,
+        weight,
+        featured_cap: FEATURED_CAP,
+      },
+    })
+    .catch((err) => console.error('[setFeaturedHandler] audit log failed:', err));
+
   res.json({
     data: result.data,
     meta: {
@@ -110,28 +188,140 @@ export async function clearFeaturedHandler(req: Request, res: Response): Promise
     return;
   }
 
+  // Audit the removal so admin actions are traceable.
+  const adminId = (req as AdminRequest).adminId;
+  await auditLogger
+    .log({
+      actorId: adminId,
+      action: 'admin.featured_clear',
+      resourceType: 'property',
+      resourceId: propertyId,
+      meta: { reason: 'admin_clear' },
+    })
+    .catch((err) => console.error('[clearFeaturedHandler] audit log failed:', err));
+
   res.json({
     data: result.data,
     meta: { message: 'Featured status removed.' },
   });
 }
 
-// ─── Search analytics dashboard ──────────────────────────────────────────────
+// ─── Search analytics dashboard (privacy-safe, aggregate-only) ────────────────
+//
+// Privacy constraints (Issue #983 / Issue 088):
+//   * Only aggregate responses are returned; no per-user or per-event rows.
+//   * Cohorts smaller than MIN_AGGREGATION_COHORT are suppressed.
+//   * Time windows are bounded to MAX_ANALYTICS_WINDOW_DAYS.
+//   * Query parameters are validated against an allowlist; arbitrary filters
+//     (e.g. user_id, ip, coordinates, full query strings) are rejected.
+//   * Every analytics read is audited.
+//
+// Raw event data is NOT exposed here. It is only available through a
+// documented elevated process (see docs/admin-runbooks.md — "Analytics Raw
+// Data Access"), which requires a separate scope and dual approval.
 
-const analyticsQuerySchema = z.object({
-  start_date: z.string().datetime({ message: 'start_date must be a valid ISO 8601 datetime' }),
-  end_date: z.string().datetime({ message: 'end_date must be a valid ISO 8601 datetime' }),
-  limit: z.coerce.number().int().min(1).max(100).default(20),
-});
+/** Minimum cohort size before an aggregate bucket is reported. */
+export const MIN_AGGREGATION_COHORT = 10;
+
+/** Maximum span of an analytics time window, in days. */
+export const MAX_ANALYTICS_WINDOW_DAYS = 90;
+
+/** Allowlisted query parameter keys for analytics endpoints. */
+const ANALYTICS_ALLOWED_KEYS = new Set(['start_date', 'end_date', 'limit']);
+
+/**
+ * Reject any query parameter that is not on the analytics allowlist.
+ * This prevents arbitrary filtering (e.g. by user, IP, or exact query string).
+ */
+function findDisallowedAnalyticsKeys(query: Request['query']): string[] {
+  return Object.keys(query).filter((key) => !ANALYTICS_ALLOWED_KEYS.has(key));
+}
+
+/**
+ * Validate that the requested window is within the approved bounds and that
+ * end_date is strictly after start_date.
+ * Returns an error message string, or null when the window is valid.
+ */
+function validateAnalyticsWindow(startDate: string, endDate: string): string | null {
+  const start = new Date(startDate).getTime();
+  const end = new Date(endDate).getTime();
+
+  if (!Number.isFinite(start) || !Number.isFinite(end)) {
+    return 'start_date and end_date must be valid ISO 8601 datetimes';
+  }
+  if (end <= start) {
+    return 'end_date must be after start_date';
+  }
+
+  const windowMs = end - start;
+  const maxMs = MAX_ANALYTICS_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+  if (windowMs > maxMs) {
+    return `Time window exceeds the maximum of ${MAX_ANALYTICS_WINDOW_DAYS} days`;
+  }
+
+  return null;
+}
+
+/**
+ * Emit an audit log entry for an analytics read. Failures to write the audit
+ * entry are logged but do not break the response (auditing is best-effort at
+ * the handler layer; the audit service itself handles retries).
+ */
+async function auditAnalyticsRead(
+  req: AdminRequest,
+  view: string,
+  meta: Record<string, unknown>,
+): Promise<void> {
+  try {
+    await auditLogger.log({
+      actorId: req.adminId,
+      action: 'admin.analytics.read',
+      resourceType: 'analytics',
+      resourceId: view,
+      ip: req.ip,
+      meta: { view, ...meta },
+    });
+  } catch {
+    // Swallow — analytics responses must not fail solely due to audit logging.
+  }
+}
+
+const analyticsQuerySchema = z
+  .object({
+    start_date: z.string().datetime({ message: 'start_date must be a valid ISO 8601 datetime' }),
+    end_date: z.string().datetime({ message: 'end_date must be a valid ISO 8601 datetime' }),
+    limit: z.coerce.number().int().min(1).max(100).default(20),
+  })
+  .strict();
+
+const analyticsVolumeQuerySchema = z
+  .object({
+    start_date: z.string().datetime({ message: 'start_date must be a valid ISO 8601 datetime' }),
+    end_date: z.string().datetime({ message: 'end_date must be a valid ISO 8601 datetime' }),
+  })
+  .strict();
 
 /**
  * GET /api/v1/admin/analytics/search/top-queries
  *
  * Returns the most frequently searched terms within a date range.
+ * Aggregate-only; cohorts below MIN_AGGREGATION_COHORT are suppressed.
  *
  * Query params: start_date (ISO datetime), end_date (ISO datetime), limit (default 20, max 100)
+ * Scope required: admin:analytics:read
  */
-export async function getTopQueriesHandler(req: Request, res: Response): Promise<void> {
+export async function getTopQueriesHandler(req: AdminRequest, res: Response): Promise<void> {
+  const disallowed = findDisallowedAnalyticsKeys(req.query);
+  if (disallowed.length > 0) {
+    res.status(400).json({
+      error: {
+        code: 'DISALLOWED_FILTER',
+        message: `Unsupported query parameters: ${disallowed.join(', ')}`,
+      },
+    });
+    return;
+  }
+
   const parsed = analyticsQuerySchema.safeParse(req.query);
   if (!parsed.success) {
     res.status(400).json({ error: 'Invalid parameters', details: parsed.error.flatten().fieldErrors });
@@ -140,8 +330,9 @@ export async function getTopQueriesHandler(req: Request, res: Response): Promise
 
   const { start_date, end_date, limit } = parsed.data;
 
-  if (new Date(end_date) <= new Date(start_date)) {
-    res.status(400).json({ error: 'end_date must be after start_date' });
+  const windowError = validateAnalyticsWindow(start_date, end_date);
+  if (windowError) {
+    res.status(400).json({ error: { code: 'INVALID_WINDOW', message: windowError } });
     return;
   }
 
@@ -151,17 +342,43 @@ export async function getTopQueriesHandler(req: Request, res: Response): Promise
     return;
   }
 
-  res.json({ data: result.data, meta: { start_date, end_date, limit } });
+  await auditAnalyticsRead(req, 'search.top_queries', { start_date, end_date, limit });
+
+  res.json({
+    data: result.data,
+    meta: {
+      start_date,
+      end_date,
+      limit,
+      aggregation: {
+        min_cohort: MIN_AGGREGATION_COHORT,
+        suppressed_below_threshold: true,
+      },
+    },
+  });
 }
 
 /**
  * GET /api/v1/admin/analytics/search/zero-results
  *
  * Returns the most frequently searched terms that yielded zero results.
+ * Aggregate-only; cohorts below MIN_AGGREGATION_COHORT are suppressed.
  *
  * Query params: start_date (ISO datetime), end_date (ISO datetime), limit (default 20, max 100)
+ * Scope required: admin:analytics:read
  */
-export async function getZeroResultQueriesHandler(req: Request, res: Response): Promise<void> {
+export async function getZeroResultQueriesHandler(req: AdminRequest, res: Response): Promise<void> {
+  const disallowed = findDisallowedAnalyticsKeys(req.query);
+  if (disallowed.length > 0) {
+    res.status(400).json({
+      error: {
+        code: 'DISALLOWED_FILTER',
+        message: `Unsupported query parameters: ${disallowed.join(', ')}`,
+      },
+    });
+    return;
+  }
+
   const parsed = analyticsQuerySchema.safeParse(req.query);
   if (!parsed.success) {
     res.status(400).json({ error: 'Invalid parameters', details: parsed.error.flatten().fieldErrors });
@@ -170,8 +387,9 @@ export async function getZeroResultQueriesHandler(req: Request, res: Response): 
 
   const { start_date, end_date, limit } = parsed.data;
 
-  if (new Date(end_date) <= new Date(start_date)) {
-    res.status(400).json({ error: 'end_date must be after start_date' });
+  const windowError = validateAnalyticsWindow(start_date, end_date);
+  if (windowError) {
+    res.status(400).json({ error: { code: 'INVALID_WINDOW', message: windowError } });
     return;
   }
 
@@ -181,19 +399,44 @@ export async function getZeroResultQueriesHandler(req: Request, res: Response): 
     return;
   }
 
-  res.json({ data: result.data, meta: { start_date, end_date, limit } });
+  await auditAnalyticsRead(req, 'search.zero_results', { start_date, end_date, limit });
+
+  res.json({
+    data: result.data,
+    meta: {
+      start_date,
+      end_date,
+      limit,
+      aggregation: {
+        min_cohort: MIN_AGGREGATION_COHORT,
+        suppressed_below_threshold: true,
+      },
+    },
+  });
 }
 
 /**
  * GET /api/v1/admin/analytics/search/volume
  *
  * Returns daily search volume within a date range.
+ * Aggregate-only; days with volume below MIN_AGGREGATION_COHORT are suppressed.
  *
  * Query params: start_date (ISO datetime), end_date (ISO datetime)
+ * Scope required: admin:analytics:read
  */
-export async function getSearchVolumeHandler(req: Request, res: Response): Promise<void> {
-  const schema = analyticsQuerySchema.omit({ limit: true });
-  const parsed = schema.safeParse(req.query);
+export async function getSearchVolumeHandler(req: AdminRequest, res: Response): Promise<void> {
+  const disallowed = findDisallowedAnalyticsKeys(req.query);
+  if (disallowed.length > 0) {
+    res.status(400).json({
+      error: {
+        code: 'DISALLOWED_FILTER',
+        message: `Unsupported query parameters: ${disallowed.join(', ')}`,
+      },
+    });
+    return;
+  }
+
+  const parsed = analyticsVolumeQuerySchema.safeParse(req.query);
   if (!parsed.success) {
     res.status(400).json({ error: 'Invalid parameters', details: parsed.error.flatten().fieldErrors });
     return;
@@ -201,8 +444,9 @@ export async function getSearchVolumeHandler(req: Request, res: Response): Promi
 
   const { start_date, end_date } = parsed.data;
 
-  if (new Date(end_date) <= new Date(start_date)) {
-    res.status(400).json({ error: 'end_date must be after start_date' });
+  const windowError = validateAnalyticsWindow(start_date, end_date);
+  if (windowError) {
+    res.status(400).json({ error: { code: 'INVALID_WINDOW', message: windowError } });
     return;
   }
 
@@ -212,7 +456,19 @@ export async function getSearchVolumeHandler(req: Request, res: Response): Promi
     return;
   }
 
-  res.json({ data: result.data, meta: { start_date, end_date } });
+  await auditAnalyticsRead(req, 'search.volume', { start_date, end_date });
+
+  res.json({
+    data: result.data,
+    meta: {
+      start_date,
+      end_date,
+      aggregation: {
+        min_cohort: MIN_AGGREGATION_COHORT,
+        suppressed_below_threshold: true,
+      },
+    },
+  });
 }
 
 // ─── Rate-limit summary ───────────────────────────────────────────────────────
@@ -265,6 +521,8 @@ export async function getRateLimitSummary(req: Request, res: Response): Promise<
  * List all users with role, status, join date. Supports pagination.
  */
 export async function listUsers(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'users:read'))) return;
+
   const page = Math.max(1, Number(req.query.page ?? 1));
   const limit = Math.min(100, Math.max(1, Number(req.query.limit ?? 20)));
   const offset = (page - 1) * limit;
@@ -288,6 +546,8 @@ export async function listUsers(req: AdminRequest, res: Response): Promise<void>
  * User detail with booking history.
  */
 export async function getUserDetail(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'users:read'))) return;
+
   const id = getRouteId(req.params.id);
   if (!id) {
     res.status(400).json({ error: { code: 'INVALID_ID', message: 'User ID is required' } });
@@ -318,18 +578,78 @@ export async function getUserDetail(req: AdminRequest, res: Response): Promise<v
 
 /**
  * POST /api/v1/admin/users/:id/suspend
+ *
+ * Suspends a user account. Effects (documented in docs/admin-runbooks.md):
+ *   - login is blocked (status !== 'active')
+ *   - new bookings and messages are rejected
+ *   - existing bookings and payments are NOT cancelled or refunded
+ *
+ * Requires: users:suspend capability, a server-validated reason (>= 10 chars),
+ * and explicit confirmation. Self-action is rejected.
  */
 export async function suspendUser(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'users:suspend'))) return;
+
   const id = getRouteId(req.params.id);
   if (!id) {
     res.status(400).json({ error: { code: 'INVALID_ID', message: 'User ID is required' } });
     return;
   }
 
+  if (req.adminId && req.adminId === id) {
+    res.status(403).json({
+      error: { code: 'SELF_ACTION_FORBIDDEN', message: 'Operators cannot suspend their own account.' },
+    });
+    return;
+  }
+
+  const parsed = userModerationBodySchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(422).json({
+      error: { code: 'VALIDATION_ERROR', details: parsed.error.flatten().fieldErrors },
+    });
+    return;
+  }
+
+  const { reason } = parsed.data;
+  const requestId = (req as RequestWithId).requestId;
+
+  const { data: target, error: fetchError } = await supabase
+    .from('users')
+    .select('id, role, status')
+    .eq('id', id)
+    .maybeSingle();
+
+  if (fetchError) {
+    res.status(500).json({ error: { code: 'DB_ERROR', message: fetchError.message } });
+    return;
+  }
+  if (!target) {
+    res.status(404).json({ error: { code: 'USER_NOT_FOUND', message: 'User not found' } });
+    return;
+  }
+
+  const targetRole = (target as { role: string }).role;
+  if (targetRole === 'admin' && req.adminRole !== 'administrator') {
+    res.status(403).json({
+      error: { code: 'ROLE_FORBIDDEN', message: 'Only administrators may suspend admin accounts.' },
+    });
+    return;
+  }
+
+  const previousStatus = (target as { status: string }).status;
+  if (previousStatus === 'suspended') {
+    res.status(409).json({
+      error: { code: 'ALREADY_SUSPENDED', message: 'User is already suspended.' },
+    });
+    return;
+  }
+
   const { error } = await supabase
     .from('users')
     .update({ status: 'suspended' })
-    .eq('id', id);
+    .eq('id', id)
+    .eq('status', previousStatus);
 
   if (error) {
     res.status(500).json({ error: { code: 'DB_ERROR', message: error.message } });
@@ -342,25 +662,97 @@ export async function suspendUser(req: AdminRequest, res: Response): Promise<voi
     resourceType: 'user',
     resourceId: id,
     ip: req.ip,
+    meta: {
+      reason,
+      request_id: requestId ?? null,
+      previous_status: previousStatus,
+      new_status: 'suspended',
+      reversible: true,
+    },
   });
 
-  res.json({ message: 'User suspended.' });
+  res.json({
+    message: 'User suspended.',
+    previous_status: previousStatus,
+    status: 'suspended',
+    reversible: true,
+  });
 }
 
 /**
  * POST /api/v1/admin/users/:id/activate
+ *
+ * Restores a suspended user to active status. Restoration follows policy:
+ *   - only the account status is restored
+ *   - bookings, messages, and payments are NOT retroactively changed
+ *   - funds held in escrow are not released by this action
+ *
+ * Requires: users:restore capability, a server-validated reason, and
+ * explicit confirmation. Self-action is rejected.
  */
 export async function activateUser(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'users:restore'))) return;
+
   const id = getRouteId(req.params.id);
   if (!id) {
     res.status(400).json({ error: { code: 'INVALID_ID', message: 'User ID is required' } });
     return;
   }
 
+  if (req.adminId && req.adminId === id) {
+    res.status(403).json({
+      error: { code: 'SELF_ACTION_FORBIDDEN', message: 'Operators cannot restore their own account.' },
+    });
+    return;
+  }
+
+  const parsed = userModerationBodySchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(422).json({
+      error: { code: 'VALIDATION_ERROR', details: parsed.error.flatten().fieldErrors },
+    });
+    return;
+  }
+
+  const { reason } = parsed.data;
+  const requestId = (req as RequestWithId).requestId;
+
+  const { data: target, error: fetchError } = await supabase
+    .from('users')
+    .select('id, role, status')
+    .eq('id', id)
+    .maybeSingle();
+
+  if (fetchError) {
+    res.status(500).json({ error: { code: 'DB_ERROR', message: fetchError.message } });
+    return;
+  }
+  if (!target) {
+    res.status(404).json({ error: { code: 'USER_NOT_FOUND', message: 'User not found' } });
+    return;
+  }
+
+  const targetRole = (target as { role: string }).role;
+  if (targetRole === 'admin' && req.adminRole !== 'administrator') {
+    res.status(403).json({
+      error: { code: 'ROLE_FORBIDDEN', message: 'Only administrators may restore admin accounts.' },
+    });
+    return;
+  }
+
+  const previousStatus = (target as { status: string }).status;
+  if (previousStatus === 'active') {
+    res.status(409).json({
+      error: { code: 'ALREADY_ACTIVE', message: 'User is already active.' },
+    });
+    return;
+  }
+
   const { error } = await supabase
     .from('users')
     .update({ status: 'active' })
-    .eq('id', id);
+    .eq('id', id)
+    .eq('status', previousStatus);
 
   if (error) {
     res.status(500).json({ error: { code: 'DB_ERROR', message: error.message } });
@@ -373,9 +765,21 @@ export async function activateUser(req: AdminRequest, res: Response): Promise<vo
     resourceType: 'user',
     resourceId: id,
     ip: req.ip,
+    meta: {
+      reason,
+      request_id: requestId ?? null,
+      previous_status: previousStatus,
+      new_status: 'active',
+      funds_restored: false,
+    },
   });
 
-  res.json({ message: 'User activated.' });
+  res.json({
+    message: 'User activated.',
+    previous_status: previousStatus,
+    status: 'active',
+    funds_restored: false,
+  });
 }
 
 // ─── Property management ──────────────────────────────────────────────────────
@@ -385,6 +789,8 @@ export async function activateUser(req: AdminRequest, res: Response): Promise<vo
  * List all properties with status filter support.
  */
 export async function listAdminProperties(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'properties:read'))) return;
+
   const page = Math.max(1, Number(req.query.page ?? 1));
   const limit = Math.min(100, Math.max(1, Number(req.query.limit ?? 20)));
   const offset = (page - 1) * limit;
@@ -414,6 +820,8 @@ export async function listAdminProperties(req: AdminRequest, res: Response): Pro
  * POST /api/v1/admin/properties/:id/suspend
  */
 export async function suspendProperty(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'properties:suspend'))) return;
+
   const id = getRouteId(req.params.id);
   if (!id) {
     res.status(400).json({ error: { code: 'INVALID_ID', message: 'Property ID is required' } });
@@ -445,6 +853,8 @@ export async function suspendProperty(req: AdminRequest, res: Response): Promise
  * POST /api/v1/admin/properties/:id/activate
  */
 export async function activateProperty(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'properties:activate'))) return;
+
   const id = getRouteId(req.params.id);
   if (!id) {
     res.status(400).json({ error: { code: 'INVALID_ID', message: 'Property ID is required' } });
@@ -479,6 +889,8 @@ export async function activateProperty(req: AdminRequest, res: Response): Promis
  * List all bookings with status filter support.
  */
 export async function listAdminBookings(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'bookings:read'))) return;
+
   const page = Math.max(1, Number(req.query.page ?? 1));
   const limit = Math.min(100, Math.max(1, Number(req.query.limit ?? 20)));
   const offset = (page - 1) * limit;
@@ -510,6 +922,8 @@ export async function listAdminBookings(req: AdminRequest, res: Response): Promi
  * Read-only reconciliation history for authorized operations staff.
  */
 export async function getEscrowReconciliationHandler(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'bookings:escrow_read'))) return;
+
   const parsedId = z.string().uuid().safeParse(req.params.id);
   if (!parsedId.success) {
     res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Booking ID must be a UUID' } });
@@ -555,6 +969,8 @@ const resolveDisputeSchema = z.object({
  * List open disputes.
  */
 export async function listDisputes(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'disputes:read'))) return;
+
   const page = Math.max(1, Number(req.query.page ?? 1));
   const limit = Math.min(100, Math.max(1, Number(req.query.limit ?? 20)));
   const offset = (page - 1) * limit;
@@ -579,6 +995,8 @@ export async function listDisputes(req: AdminRequest, res: Response): Promise<vo
  * Resolve a dispute with a resolution note.
  */
 export async function resolveDispute(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'disputes:resolve'))) return;
+
   const id = getRouteId(req.params.id);
   if (!id) {
     res.status(400).json({ error: { code: 'INVALID_ID', message: 'Dispute ID is required' } });
@@ -593,19 +1011,38 @@ export async function resolveDispute(req: AdminRequest, res: Response): Promise<
 
   const { resolution_note, outcome } = parsed.data;
 
-  const { error } = await supabase
+  const { data: booking, error: loadError } = await supabase
     .from('bookings')
-    .update({
-      status: 'dispute_resolved',
-      dispute_resolution_note: resolution_note,
-      dispute_resolved_at: new Date().toISOString(),
-      dispute_outcome: outcome ?? null,
-    })
+    .select('status')
     .eq('id', id)
-    .eq('status', 'disputed');
+    .maybeSingle();
+  if (loadError) {
+    res.status(500).json({ error: { code: 'DB_ERROR', message: loadError.message } });
+    return;
+  }
+  if (!booking) {
+    res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Booking not found' } });
+    return;
+  }
 
-  if (error) {
-    res.status(500).json({ error: { code: 'DB_ERROR', message: error.message } });
+  const currentStatus = String((booking as { status?: string }).status ?? '');
+  const fromStatus = currentStatus.toLowerCase() === 'disputed' ? 'Disputed' : currentStatus;
+  const toStatus = outcome === 'release_to_host' ? 'Completed' : 'Cancelled';
+
+  // Route through the state machine: the status change and its history entry
+  // are committed together, and invalid transitions write no history.
+  const transition = await new BookingService().transitionStatus(
+    id,
+    fromStatus,
+    toStatus,
+    req.adminId,
+    resolution_note,
+    { dispute_status: 'resolved' },
+  );
+  if (!transition.success) {
+    res.status(transition.statusCode ?? 409).json({
+      error: { code: 'INVALID_TRANSITION', message: transition.error },
+    });
     return;
   }
 
@@ -628,6 +1065,8 @@ export async function resolveDispute(req: AdminRequest, res: Response): Promise<
  * Aggregate stats + recent security events.
  */
 export async function getDashboard(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'dashboard:read'))) return;
+
   const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
 
   const [usersResult, propertiesResult, bookingsThisWeekResult, disputesResult, recentAuditResult] =
@@ -673,6 +1112,8 @@ import { listAuditLogs } from '@/services/auditLog.service.js';
  * Scope required: admin:audit:read
  */
 export async function getAuditLogsHandler(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'audit:read'))) return;
+
   const limit = Math.min(200, Math.max(1, Number(req.query.limit ?? 50)));
 
   const actorId = typeof req.query.actorId === 'string' ? req.query.actorId : undefined;
@@ -721,6 +1162,8 @@ const approveRefundSchema = z.object({
  * See: docs/admin-runbooks.md — "Manual Refund Approval" runbook
  */
 export async function approveRefundHandler(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'refunds:approve'))) return;
+
   const parsed = approveRefundSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: { code: 'VALIDATION_ERROR', details: parsed.error.flatten().fieldErrors } });
@@ -817,32 +1260,21 @@ const changeRoleBodySchema = z
  * `admin` flag or `actorRole` in the body cannot influence authority.
  */
 export async function changeUserRoleHandler(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'users:change_role'))) return;
+
   const id = getRouteId(req.params.id);
   if (!id || !req.adminId) {
     res.status(400).json({ error: { code: 'INVALID_ID', message: 'User ID is required' } });
     return;
   }
 
-  const parsed = changeRoleBodySchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(422).json({
-      error: { code: 'VALIDATION_FAILED', message: 'Body must be { "role": <assignable role> }.' },
+  if (req.adminId === id) {
+    res.status(403).json({
+      error: { code: 'SELF_ACTION_FORBIDDEN', message: 'Operators cannot change their own role.' },
     });
     return;
   }
 
-  const result = await changeUserRole({
-    actorId: req.adminId,
-    targetId: id,
-    toRole: parsed.data.role,
-    requestId: (req as RequestWithId).requestId,
-    ip: req.ip,
-  });
-
-  if (!result.ok) {
-    res.status(result.status).json({ error: { code: result.code, message: result.message } });
-    return;
-  }
-
-  res.json({ userId: result.userId, role: result.newRole, previousRole: result.oldRole });
-}
+  const parsed = changeRoleBodySchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(422).json({

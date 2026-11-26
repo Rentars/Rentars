@@ -3,9 +3,10 @@
 import { useRouter, useSearchParams } from 'next/navigation';
 import { useDashboard, type BookingStatus, type BookingSort, type BookingOrder } from '@/hooks/useDashboard';
 import BookingHistory from '@/components/dashboard/BookingHistory';
+import { getBookingActions, type BookingActionContext } from '@/lib/bookingActionMatrix';
 import Analytics from '@/components/dashboard/Analytics';
 import NotificationSystem from '@/components/dashboard/NotificationSystem';
-import { BookingListSkeleton, ErrorState, SkeletonRegion } from '@/components/ui';
+import { BookingListSkeleton, EmptyState, ErrorState, SkeletonRegion } from '@/components/ui';
 import WalletTransaction from './components/WalletTransaction';
 import BookingPreferences from './components/BookingPreferences';
 import ExportBookingsButton from './components/ExportBookingsButton';
@@ -19,6 +20,9 @@ export default function TenantDashboard() {
   const order = (searchParams.get('order') as BookingOrder) ?? 'desc';
 
   const { bookings, isLoading, error, refetch } = useDashboard(20, statusFilter, sort, order);
+
+  const hasActiveFilters = statusFilter !== null;
+  const hasBookings = bookings.length > 0;
 
   function updateParam(key: string, value: string | null) {
     const params = new URLSearchParams(searchParams.toString());
@@ -47,23 +51,37 @@ export default function TenantDashboard() {
     },
   ];
 
-  const formattedBookings = bookings.map((booking) => ({
-    id: booking.id,
-    propertyTitle: 'Property Name',
-    location: 'City, State',
-    checkIn: new Date(booking.check_in),
-    checkOut: new Date(booking.check_out),
-    totalPrice: booking.total_price,
-    status: booking.status.toLowerCase() as
+  const formattedBookings = bookings.map((booking) => {
+    const status = booking.status.toLowerCase() as
       | 'pending'
       | 'confirmed'
       | 'completed'
       | 'cancelled'
-      | 'escrow_reconcile_failed',
-    escrowStatus: booking.status.toLowerCase() === 'escrow_reconcile_failed'
-      ? 'manual_review'
-      : booking.escrow_status,
-  }));
+      | 'escrow_reconcile_failed';
+    const escrowStatus =
+      status === 'escrow_reconcile_failed' ? 'manual_review' : booking.escrow_status;
+
+    // Action availability comes from the shared matrix so every surface
+    // (cards, detail pages, action components) agrees for the same state.
+    // Authorization stays in the backend; this is presentation only.
+    const actionContext: BookingActionContext = {
+      role: 'tenant',
+      status,
+      escrowStatus,
+    };
+
+    return {
+      id: booking.id,
+      propertyTitle: 'Property Name',
+      location: 'City, State',
+      checkIn: new Date(booking.check_in),
+      checkOut: new Date(booking.check_out),
+      totalPrice: booking.total_price,
+      status,
+      escrowStatus,
+      actions: getBookingActions(actionContext),
+    };
+  });
 
   return (
     <main className="min-h-screen bg-gray-50 py-8">
@@ -107,15 +125,34 @@ export default function TenantDashboard() {
             {/* Booking History with filters */}
             <div>
               <h2 className="text-2xl font-bold text-gray-900 mb-4">Your Bookings</h2>
-              <BookingHistory
-                bookings={formattedBookings}
-                statusFilter={statusFilter}
-                sort={sort}
-                order={order}
-                onStatusChange={(s) => updateParam('status', s)}
-                onSortChange={(s) => updateParam('sort', s)}
-                onOrderChange={(o) => updateParam('order', o)}
-              />
+              {/* Empty State — a confirmed successful response with zero rows.
+                  Distinguished from the error state above; active filters are
+                  preserved and surfaced so users can widen their search. */}
+              {!hasBookings ? (
+                <EmptyState
+                  title={hasActiveFilters ? 'No bookings match your filters' : 'No bookings yet'}
+                  description={
+                    hasActiveFilters
+                      ? 'Try clearing the status filter to see all of your bookings.'
+                      : 'Once you book a stay, it will appear here.'
+                  }
+                  action={
+                    hasActiveFilters
+                      ? { label: 'Clear filters', onClick: () => updateParam('status', null) }
+                      : undefined
+                  }
+                />
+              ) : (
+                <BookingHistory
+                  bookings={formattedBookings}
+                  statusFilter={statusFilter}
+                  sort={sort}
+                  order={order}
+                  onStatusChange={(s) => updateParam('status', s)}
+                  onSortChange={(s) => updateParam('sort', s)}
+                  onOrderChange={(o) => updateParam('order', o)}
+                />
+              )}
             </div>
 
             {/* Analytics and Transactions */}

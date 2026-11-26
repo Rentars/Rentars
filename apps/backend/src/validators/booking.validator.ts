@@ -14,6 +14,8 @@ export const createBookingSchema = z
       .string({ required_error: 'property_id is required' })
       .uuid('property_id must be a valid UUID'),
 
+    tenant_id: z.string().optional(),
+
     check_in: z
       .string({ required_error: 'check_in is required' })
       .date('check_in must be a valid ISO date (YYYY-MM-DD)'),
@@ -50,6 +52,17 @@ export const createBookingSchema = z
       .number({ invalid_type_error: 'total_price must be a number' })
       .positive('total_price must be positive')
       .optional(),
+
+    /** Server-generated quote identity and acceptance, required before a booking is created. */
+    quote_id: z
+      .string({ required_error: 'quote_id is required' })
+      .uuid('quote_id must be a valid UUID'),
+    quote_token: z
+      .string({ required_error: 'quote_token is required' })
+      .min(1, 'quote_token must not be empty'),
+    quote_accepted_at: z
+      .string({ required_error: 'quote_accepted_at is required' })
+      .datetime('quote_accepted_at must be a valid ISO 8601 datetime'),
 
     stellar_address: z
       .string()

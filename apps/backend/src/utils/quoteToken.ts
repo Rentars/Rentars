@@ -28,6 +28,8 @@ export interface QuoteTokenClaims {
    * tokens issued before it was added, in which case the check is skipped.
    */
   qv?: string;
+  /** Stable quote identifier; echoed back by the client when accepting the quote. */
+  qid?: string;
   /** Expiry instant (ISO 8601). */
   exp: string;
   /** Guest count the quote was issued for; absent on tokens issued without occupancy. */

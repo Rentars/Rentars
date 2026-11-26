@@ -57,19 +57,157 @@ const envSchema = z.object({
   // ── Redis (optional) ───────────────────────────────────────────────────────
   REDIS_URL: z.string().url().optional(),
 
+  // ── Trusted proxy topology ─────────────────────────────────────────────────
+  // Number of reverse-proxy hops in front of the app that are trusted to set
+  // X-Forwarded-For.  Express' `trust proxy` is configured from this value so
+  // the client IP is derived only from the trusted edge, never from
+  // client-supplied forwarding headers.  Default: 0 (no proxy — use the socket
+  // address).  Must be a non-negative integer.
+  TRUSTED_PROXY_HOPS: z
+    .string()
+    .default('0')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 0) {
+        throw new Error('TRUSTED_PROXY_HOPS must be a non-negative integer');
+      }
+      return n;
+    }),
+
+  // Optional comma-separated list of trusted proxy CIDRs / IPs.  When set,
+  // only requests arriving from these addresses may contribute to the
+  // forwarded-for chain.  Example: "10.0.0.0/8,192.168.0.0/16"
+  TRUSTED_PROXY_CIDRS: z
+    .string()
+    .optional()
+    .transform((v) =>
+      (v ?? '')
+        .split(',')
+        .map((c) => c.trim())
+        .filter(Boolean),
+    ),
+
   // ── Stellar / Soroban ─────────────────────────────────────────────────────
+  // The active network is the single source of truth for the network
+  // passphrase, RPC endpoint and contract IDs.  The passphrase is derived
+  // from this value (never supplied free-form) so a mismatched passphrase
+  // cannot be configured by accident.
   STELLAR_NETWORK: z
     .enum(['testnet', 'mainnet'])
     .default('testnet'),
 
+  // Optional override of the default RPC endpoint for the active network.
+  // When unset, the network's canonical public RPC URL is used.
   STELLAR_RPC_URL: z.string().url().optional(),
+
+  // Optional explicit network passphrase.  When provided it MUST match the
+  // passphrase derived from STELLAR_NETWORK, otherwise startup fails.
+  STELLAR_NETWORK_PASSPHRASE: z.string().optional(),
 
   PROPERTY_LISTING_CONTRACT_ID: z.string().optional(),
   BOOKING_CONTRACT_ID: z.string().optional(),
 
+  // ── Contract deployment manifest verification ─────────────────────────────
+  // Path or URL to the integrity-checked deployment manifest produced by the
+  // release pipeline.  The manifest records commit hash, toolchain, target,
+  // artifact hash, network, contract IDs and initialization transaction for
+  // each deployed contract.  It must never contain wallet secret material.
+  CONTRACT_MANIFEST_PATH: z.string().optional(),
+  CONTRACT_MANIFEST_URL: z.string().url().optional(),
+
+  // Network the manifest is expected to describe.  When set, startup
+  // verification fails if the manifest's network disagrees.
+  CONTRACT_MANIFEST_NETWORK: z
+    .enum(['testnet', 'mainnet'])
+    .optional(),
+
+  // Set to "true" to verify configured contract IDs against the deployment
+  // manifest at startup.  Verification is skipped (with a warning) when no
+  // manifest source is configured.
+  CONTRACT_MANIFEST_VERIFY: z
+    .string()
+    .default('false')
+    .transform((v) => v === 'true'),
+
+  // Optional detached signature (hex) over the manifest digest.  Signing keys
+  // live outside CI; only the public verification material is configured here.
+  CONTRACT_MANIFEST_SIGNATURE: z
+    .string()
+    .regex(/^[0-9a-fA-F]+$/, 'CONTRACT_MANIFEST_SIGNATURE must be a hex string')
+    .optional(),
+
+  // ── Stellar transaction confirmation ──────────────────────────────────────
+  // Bounded polling/backoff for ledger confirmation.  A timeout here is
+  // treated as "pending / ambiguous" and routed to reconciliation — it is
+  // never reported as a final failure.
+  STELLAR_TX_MAX_POLL_ATTEMPTS: z
+    .string()
+    .default('10')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 1) throw new Error('STELLAR_TX_MAX_POLL_ATTEMPTS must be a positive integer');
+      return n;
+    }),
+
+  STELLAR_TX_POLL_BASE_DELAY_MS: z
+    .string()
+    .default('1000')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 1) throw new Error('STELLAR_TX_POLL_BASE_DELAY_MS must be a positive integer');
+      return n;
+    }),
+
+  STELLAR_TX_POLL_MAX_DELAY_MS: z
+    .string()
+    .default('15000')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 1) throw new Error('STELLAR_TX_POLL_MAX_DELAY_MS must be a positive integer');
+      return n;
+    }),
+
   // ── Trustless Work (escrow) ────────────────────────────────────────────────
   TRUSTLESS_WORK_API_URL: z.string().url().optional(),
   TRUSTLESS_WORK_API_KEY: z.string().optional(),
+
+  // ── Escrow state ownership / evidence ─────────────────────────────────────
+  // Escrow transitions to terminal states (released / refunded) require
+  // authenticated, verified on-chain event evidence.  When "true" (default)
+  // any transition lacking verified evidence is rejected.
+  ESCROW_REQUIRE_VERIFIED_EVENTS: z
+    .string()
+    .default('true')
+    .transform((v) => v === 'true'),
+
+  // Maximum age (in seconds) of an on-chain event accepted as evidence for a
+  // terminal escrow transition.  Guards against replaying stale events.
+  ESCROW_EVENT_MAX_AGE_SECONDS: z
+    .string()
+    .default('86400')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 1) throw new Error('ESCROW_EVENT_MAX_AGE_SECONDS must be a positive integer');
+      return n;
+    }),
+
+  // Number of ledgers within which a previously consumed event ID is treated
+  // as a replay attempt.  Default: 120 ledgers (~10 minutes on Stellar).
+  ESCROW_EVENT_REPLAY_WINDOW_LEDGERS: z
+    .string()
+    .default('120')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 1) throw new Error('ESCROW_EVENT_REPLAY_WINDOW_LEDGERS must be a positive integer');
+      return n;
+    }),
+
+  // When "true", on-chain / provider state disagreement is surfaced as an
+  // alert and blocks silent resolution.  Default: true.
+  ESCROW_SURFACE_STATE_MISMATCH: z
+    .string()
+    .default('true')
+    .transform((v) => v === 'true'),
 
   // ── Geocoding ─────────────────────────────────────────────────────────────
   GEOCODING_API_KEY: z.string().optional(),
@@ -333,9 +471,82 @@ const envSchema = z.object({
       return n;
     }),
 }).superRefine((value, ctx) => {
+  // ── Deployment manifest guards ────────────────────────────────────────────
+  // Verification needs a manifest source; fail fast rather than silently
+  // skipping integrity checks in production.
+  if (value.CONTRACT_MANIFEST_VERIFY && !value.CONTRACT_MANIFEST_PATH && !value.CONTRACT_MANIFEST_URL) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['CONTRACT_MANIFEST_VERIFY'],
+      message: 'CONTRACT_MANIFEST_VERIFY requires CONTRACT_MANIFEST_PATH or CONTRACT_MANIFEST_URL',
+    });
+  }
+
+  // A signature without a manifest to verify is meaningless.
+  if (value.CONTRACT_MANIFEST_SIGNATURE && !value.CONTRACT_MANIFEST_PATH && !value.CONTRACT_MANIFEST_URL) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['CONTRACT_MANIFEST_SIGNATURE'],
+      message: 'CONTRACT_MANIFEST_SIGNATURE requires CONTRACT_MANIFEST_PATH or CONTRACT_MANIFEST_URL',
+    });
+  }
+
+  // ── Stellar network consistency ─────────────────────────────────────────
+  // The passphrase is derived from STELLAR_NETWORK.  If an explicit
+  // passphrase is supplied it must agree, so a mainnet/testnet mismatch is
+  // rejected at startup rather than producing unusable transactions.
+  const derivedPassphrase = STELLAR_NETWORK_PASSPHRASES[value.STELLAR_NETWORK];
+  if (
+    value.STELLAR_NETWORK_PASSPHRASE !== undefined &&
+    value.STELLAR_NETWORK_PASSPHRASE !== derivedPassphrase
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['STELLAR_NETWORK_PASSPHRASE'],
+      message:
+        `STELLAR_NETWORK_PASSPHRASE does not match STELLAR_NETWORK='${value.STELLAR_NETWORK}' ` +
+        `(expected '${derivedPassphrase}')`,
+    });
+  }
+
+  // Polling backoff must be bounded and monotonic.
+  if (value.STELLAR_TX_POLL_MAX_DELAY_MS < value.STELLAR_TX_POLL_BASE_DELAY_MS) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['STELLAR_TX_POLL_MAX_DELAY_MS'],
+      message: 'STELLAR_TX_POLL_MAX_DELAY_MS must be >= STELLAR_TX_POLL_BASE_DELAY_MS',
+    });
+  }
+
   // Production must name its browser origins explicitly. The development default
   // (localhost) must never become the production allowlist by omission.
   if (value.NODE_ENV !== 'production') return;
+
+  // Production must verify contract IDs against a manifest when one is
+  // configured, and must never run with escrow evidence checks disabled.
+  if (!value.ESCROW_REQUIRE_VERIFIED_EVENTS) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['ESCROW_REQUIRE_VERIFIED_EVENTS'],
+      message: 'ESCROW_REQUIRE_VERIFIED_EVENTS must not be disabled in production',
+    });
+  }
+
+  if (!value.ESCROW_SURFACE_STATE_MISMATCH) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['ESCROW_SURFACE_STATE_MISMATCH'],
+      message: 'ESCROW_SURFACE_STATE_MISMATCH must not be disabled in production',
+    });
+  }
+
+  if (value.CONTRACT_MANIFEST_NETWORK && value.CONTRACT_MANIFEST_NETWORK !== value.STELLAR_NETWORK) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['CONTRACT_MANIFEST_NETWORK'],
+      message: `CONTRACT_MANIFEST_NETWORK ('${value.CONTRACT_MANIFEST_NETWORK}') must match STELLAR_NETWORK ('${value.STELLAR_NETWORK}')`,
+    });
+  }
 
   if (!process.env.CORS_ORIGIN?.trim()) {
     ctx.addIssue({
@@ -355,7 +566,40 @@ const envSchema = z.object({
       });
     }
   }
+
+  // Production deployments sit behind at least one proxy (load balancer /
+  // ingress).  Running with zero trusted hops there would key rate limits on
+  // the proxy's address, grouping every client together — require an explicit
+  // topology instead of silently falling back to the default.
+  if (!process.env.TRUSTED_PROXY_HOPS?.trim() && value.TRUSTED_PROXY_CIDRS.length === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['TRUSTED_PROXY_HOPS'],
+      message:
+        'TRUSTED_PROXY_HOPS (or TRUSTED_PROXY_CIDRS) must be set explicitly in production so client IPs are derived from trusted hops only',
+    });
+  }
 });
+
+// ── Stellar network constants ─────────────────────────────────────────────────
+
+/**
+ * Canonical network passphrases keyed by the supported network names.
+ * These are the only valid passphrases — the active one is always derived
+ * from STELLAR_NETWORK.
+ */
+export const STELLAR_NETWORK_PASSPHRASES = {
+  testnet: 'Test SDF Network ; September 2015',
+  mainnet: 'Public Global Stellar Network ; September 2015',
+} as const;
+
+export type StellarNetwork = keyof typeof STELLAR_NETWORK_PASSPHRASES;
+
+/** Default public RPC (Soroban) endpoints per network. */
+export const STELLAR_DEFAULT_RPC_URLS: Record<StellarNetwork, string> = {
+  testnet: 'https://soroban-testnet.stellar.org',
+  mainnet: 'https://soroban.stellar.org',
+};
 
 // ── Type export ───────────────────────────────────────────────────────────────
 
@@ -389,3 +633,43 @@ function validateEnv(): Environment {
 }
 
 export const env: Readonly<Environment> = validateEnv();
+
+// ── Derived Stellar configuration ─────────────────────────────────────────────
+
+/**
+ * The active Stellar network configuration, derived from validated env.
+ *
+ * Consumers (wallet utilities, stellar.service.ts, payment service, sync)
+ * must read the network from here rather than from `process.env` directly so
+ * that the network, passphrase, RPC URL and contract IDs always agree.
+ */
+export interface StellarNetworkConfig {
+  /** Active network name. */
+  network: StellarNetwork;
+  /** Network passphrase derived from `network`. */
+  networkPassphrase: string;
+  /** RPC endpoint for the active network (override or canonical default). */
+  rpcUrl: string;
+  /** Contract IDs for the active network (may be undefined if unset). */
+  propertyListingContractId?: string;
+  bookingContractId?: string;
+  /** Bounded confirmation polling parameters. */
+  confirmation: {
+    maxPollAttempts: number;
+    baseDelayMs: number;
+    maxDelayMs: number;
+  };
+}
+
+export const stellarConfig: Readonly<StellarNetworkConfig> = Object.freeze({
+  network: env.STELLAR_NETWORK,
+  networkPassphrase: STELLAR_NETWORK_PASSPHRASES[env.STELLAR_NETWORK],
+  rpcUrl: env.STELLAR_RPC_URL ?? STELLAR_DEFAULT_RPC_URLS[env.STELLAR_NETWORK],
+  propertyListingContractId: env.PROPERTY_LISTING_CONTRACT_ID,
+  bookingContractId: env.BOOKING_CONTRACT_ID,
+  confirmation: Object.freeze({
+    maxPollAttempts: env.STELLAR_TX_MAX_POLL_ATTEMPTS,
+    baseDelayMs: env.STELLAR_TX_POLL_BASE_DELAY_MS,
+    maxDelayMs: env.STELLAR_TX_POLL_MAX_DELAY_MS,
+  }),
+});

@@ -21,6 +21,19 @@
  *       payment_failures_total        — payment / fund-transfer failures, labelled by reason
  *       client_errors_total           — browser-reported errors forwarded to /api/v1/client-errors
  *       auth_events_total             — login/logout/register events, labelled by event/outcome
+ *   - Business-critical workflow metrics (bounded labels only):
+ *       booking_workflow_total{stage,outcome}
+ *       booking_workflow_duration_seconds{stage}
+ *       payment_workflow_total{operation,outcome,provider_class}
+ *       payment_workflow_duration_seconds{operation}
+ *       notification_workflow_total{channel,outcome}
+ *       notification_backlog_size{channel}
+ *       sync_workflow_total{workflow,outcome}
+ *       sync_workflow_duration_seconds{workflow}
+ *       sync_retries_total{workflow}
+ *     Use recordWorkflowMetric() to emit these; label values are restricted to
+ *     WORKFLOW_LABELS and unknown values collapse to 'other'. Never pass user,
+ *     booking, or transaction IDs as labels.
  *
  * The /metrics endpoint is protected by an optional bearer token.
  * Set METRICS_TOKEN in the environment to enable token protection.
@@ -92,6 +105,21 @@ export function incCounter(counter: Counter, labels: Labels = {}, amount = 1): v
     existing.value += amount;
   } else {
     counter.values.set(key, { labels, value: amount });
+  }
+}
+
+/**
+ * Set a counter's value to an absolute amount (used for gauge-like backlog
+ * metrics exposed through the counter registry). Values never decrease below 0.
+ */
+export function setGaugeValue(counter: Counter, labels: Labels, value: number): void {
+  const key = labelKey(labels);
+  const safe = Number.isFinite(value) && value > 0 ? value : 0;
+  const existing = counter.values.get(key);
+  if (existing) {
+    existing.value = safe;
+  } else {
+    counter.values.set(key, { labels, value: safe });
   }
 }
 
@@ -376,6 +404,215 @@ export const clientErrorsTotal = createCounter(
   'client_errors_total',
   'Total number of client-side errors reported by the browser, labelled by context.',
 );
+
+// ── Business-critical workflow metrics ────────────────────────────────────────
+//
+// Bounded vocabulary for booking conversion, payment/escrow delay, notification
+// backlog, and sync/reconciliation. Labels are restricted to the enumerations
+// in WORKFLOW_LABELS; any unknown value collapses to 'other' via toBoundedLabel.
+// Never label these metrics with user, booking, or transaction IDs.
+
+export const WORKFLOW_LABELS = {
+  /** Booking funnel stages. */
+  bookingStage: [
+    'initiated',
+    'payment_pending',
+    'payment_confirmed',
+    'confirmed',
+    'cancelled',
+    'completed',
+  ],
+  /** Generic workflow outcome. */
+  outcome: ['success', 'failure', 'retry', 'timeout', 'cancelled'],
+  /** Payment / escrow operations. */
+  paymentOperation: ['create', 'release', 'refund', 'dispute', 'transfer'],
+  /** Coarse provider class — never a specific account or address. */
+  providerClass: ['stellar', 'soroban', 'internal', 'external'],
+  /** Notification delivery channels. */
+  notificationChannel: ['email', 'sms', 'push', 'in_app'],
+  /** Sync / reconciliation workflows. */
+  syncWorkflow: ['booking_sync', 'payment_reconciliation', 'escrow_reconciliation', 'notification_sync'],
+} as const;
+
+export type WorkflowLabelGroup = keyof typeof WORKFLOW_LABELS;
+
+const OTHER = 'other';
+
+/**
+ * Collapse an arbitrary label value to a bounded member of the given group.
+ * Unknown, empty, or non-string values become 'other'.
+ */
+export function toBoundedLabel(group: WorkflowLabelGroup, value: unknown): string {
+  const allowed: readonly string[] = WORKFLOW_LABELS[group];
+  if (typeof value === 'string' && allowed.includes(value)) return value;
+  return OTHER;
+}
+
+/**
+ * Booking workflow outcomes.
+ * Labels: stage (see WORKFLOW_LABELS.bookingStage), outcome (see WORKFLOW_LABELS.outcome)
+ */
+export const bookingWorkflowTotal = createCounter(
+  'booking_workflow_total',
+  'Total number of booking workflow transitions, labelled by stage and outcome.',
+);
+
+/**
+ * Booking workflow stage duration.
+ * Labels: stage
+ */
+export const bookingWorkflowDurationSeconds = createHistogram(
+  'booking_workflow_duration_seconds',
+  'Booking workflow stage duration in seconds, labelled by stage.',
+  [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300],
+);
+
+/**
+ * Payment / escrow workflow outcomes.
+ * Labels: operation (see WORKFLOW_LABELS.paymentOperation),
+ *         outcome (see WORKFLOW_LABELS.outcome),
+ *         provider_class (see WORKFLOW_LABELS.providerClass)
+ */
+export const paymentWorkflowTotal = createCounter(
+  'payment_workflow_total',
+  'Total number of payment/escrow workflow outcomes, labelled by operation, outcome, and provider class.',
+);
+
+/**
+ * Payment / escrow workflow duration (captures escrow delay).
+ * Labels: operation
+ */
+export const paymentWorkflowDurationSeconds = createHistogram(
+  'payment_workflow_duration_seconds',
+  'Payment/escrow workflow duration in seconds, labelled by operation.',
+  [0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300, 900],
+);
+
+/**
+ * Notification workflow outcomes.
+ * Labels: channel (see WORKFLOW_LABELS.notificationChannel),
+ *         outcome (see WORKFLOW_LABELS.outcome)
+ */
+export const notificationWorkflowTotal = createCounter(
+  'notification_workflow_total',
+  'Total number of notification workflow outcomes, labelled by channel and outcome.',
+);
+
+/**
+ * Current notification backlog size (pending deliveries).
+ * Labels: channel
+ */
+export const notificationBacklogSize = createCounter(
+  'notification_backlog_size',
+  'Current number of pending notifications, labelled by channel.',
+);
+
+/**
+ * Sync / reconciliation workflow outcomes.
+ * Labels: workflow (see WORKFLOW_LABELS.syncWorkflow),
+ *         outcome (see WORKFLOW_LABELS.outcome)
+ */
+export const syncWorkflowTotal = createCounter(
+  'sync_workflow_total',
+  'Total number of sync/reconciliation workflow outcomes, labelled by workflow and outcome.',
+);
+
+/**
+ * Sync / reconciliation workflow duration.
+ * Labels: workflow
+ */
+export const syncWorkflowDurationSeconds = createHistogram(
+  'sync_workflow_duration_seconds',
+  'Sync/reconciliation workflow duration in seconds, labelled by workflow.',
+  [0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 300, 900],
+);
+
+/**
+ * Sync / reconciliation retries.
+ * Labels: workflow
+ */
+export const syncRetriesTotal = createCounter(
+  'sync_retries_total',
+  'Total number of sync/reconciliation retries, labelled by workflow.',
+);
+
+export type WorkflowMetricKind =
+  | 'booking'
+  | 'payment'
+  | 'notification'
+  | 'sync';
+
+export interface WorkflowMetricEvent {
+  kind: WorkflowMetricKind;
+  /** Duration in seconds; when provided, the matching histogram is observed. */
+  durationSeconds?: number;
+  /** Booking stage (kind=booking). */
+  stage?: string;
+  /** Payment operation (kind=payment). */
+  operation?: string;
+  /** Provider class (kind=payment). */
+  providerClass?: string;
+  /** Notification channel (kind=notification). */
+  channel?: string;
+  /** Sync workflow name (kind=sync). */
+  workflow?: string;
+  /** Outcome for counter increments. */
+  outcome?: string;
+  /** When true, increments sync_retries_total (kind=sync). */
+  retry?: boolean;
+  /** Absolute backlog size to set (kind=notification). */
+  backlogSize?: number;
+}
+
+/**
+ * Record a business-critical workflow event using only bounded labels.
+ * Unknown label values collapse to 'other'; IDs are never accepted.
+ */
+export function recordWorkflowMetric(event: WorkflowMetricEvent): void {
+  const outcome = toBoundedLabel('outcome', event.outcome);
+
+  switch (event.kind) {
+    case 'booking': {
+      const stage = toBoundedLabel('bookingStage', event.stage);
+      incCounter(bookingWorkflowTotal, { stage, outcome });
+      if (typeof event.durationSeconds === 'number') {
+        observeHistogram(bookingWorkflowDurationSeconds, { stage }, event.durationSeconds);
+      }
+      break;
+    }
+    case 'payment': {
+      const operation = toBoundedLabel('paymentOperation', event.operation);
+      const providerClass = toBoundedLabel('providerClass', event.providerClass);
+      incCounter(paymentWorkflowTotal, { operation, outcome, provider_class: providerClass });
+      if (typeof event.durationSeconds === 'number') {
+        observeHistogram(paymentWorkflowDurationSeconds, { operation }, event.durationSeconds);
+      }
+      break;
+    }
+    case 'notification': {
+      const channel = toBoundedLabel('notificationChannel', event.channel);
+      incCounter(notificationWorkflowTotal, { channel, outcome });
+      if (typeof event.backlogSize === 'number') {
+        // Backlog is a gauge-like value; expose as an absolute set via counter reset.
+        setGaugeValue(notificationBacklogSize, { channel }, event.backlogSize);
+      }
+      break;
+    }
+    case 'sync': {
+      const workflow = toBoundedLabel('syncWorkflow', event.workflow);
+      incCounter(syncWorkflowTotal, { workflow, outcome });
+      if (typeof event.durationSeconds === 'number') {
+        observeHistogram(syncWorkflowDurationSeconds, { workflow }, event.durationSeconds);
+      }
+      if (event.retry) {
+        incCounter(syncRetriesTotal, { workflow });
+      }
+      break;
+    }
+    default:
+      break;
+  }
+}
 
 // ── Synthetic monitoring probes ─────────────────────────────────────────────────
 

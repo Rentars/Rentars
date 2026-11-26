@@ -819,4 +819,525 @@ mod tests {
             &-500_i128,
         );
     }
+
+    // ─── Cross-Contract Integration Tests ─────────────────────────────────────
+    //
+    // These tests deploy both the PropertyListing contract and the Booking
+    // contract into a single `Env` so that the integrated rental flow is
+    // exercised end-to-end. They mirror the harness used on the booking side
+    // and assert that the property-listing interface (`get_listing`,
+    // `set_rented`, `update_status`) reports state that the booking contract's
+    // eligibility checks observe consistently.
+    //
+    // Invariants under test:
+    //   * A booking is only eligible while the listing status is `Active`.
+    //   * `set_rented` is only callable while the listing is `Active`.
+    //   * A failed booking attempt leaves the listing status unchanged
+    //     (no partial writes across the contract boundary).
+
+    mod cross_contract {
+        use super::*;
+        use soroban_sdk::testutils::Address as _;
+
+        /// Deploy both contracts into one environment and return the two
+        /// clients plus the listing owner address.
+        ///
+        /// The booking contract is referenced through its public client so the
+        /// test compiles against the same interface backend clients encode.
+        fn deploy_both(
+            env: &Env,
+        ) -> (
+            PropertyListingContractClient<'_>,
+            booking::BookingContractClient<'_>,
+            Address,
+        ) {
+            env.mock_all_auths();
+
+            let property_id = env.register_contract(None, PropertyListingContract);
+            let booking_id = env.register_contract(None, booking::BookingContract);
+
+            let property = PropertyListingContractClient::new(env, &property_id);
+            let booking = booking::BookingContractClient::new(env, &booking_id);
+
+            let owner = Address::generate(env);
+            (property, booking, owner)
+        }
+
+        /// Create a listing through the property contract and return its id.
+        fn seed_listing(
+            env: &Env,
+            property: &PropertyListingContractClient<'_>,
+            owner: &Address,
+        ) -> u64 {
+            property.create_listing(
+                owner,
+                &String::from_str(env, "Cross-Contract Cabin"),
+                &String::from_str(env, "Listing used by integration tests"),
+                &50_0000000_i128,
+            )
+        }
+
+        /// The booking contract observes an `Active` listing as eligible.
+        #[test]
+        fn test_booking_eligible_while_listing_active() {
+            let env = Env::default();
+            let (property, booking, owner) = deploy_both(&env);
+            let listing_id = seed_listing(&env, &property, &owner);
+
+            assert_eq!(
+                property.get_listing(&listing_id).status,
+                ListingStatus::Active,
+                "property-listing::get_listing must report Active for a freshly created listing"
+            );
+
+            assert!(
+                booking.is_listing_eligible(&listing_id),
+                "cross-contract invariant: booking::is_listing_eligible must be true while \
+                 property-listing::get_listing reports Active"
+            );
+        }
+
+        /// After `set_rented`, the booking contract no longer sees the listing
+        /// as eligible — the Active -> Rented transition is observed across the
+        /// contract boundary.
+        #[test]
+        fn test_set_rented_observed_by_booking_eligibility() {
+            let env = Env::default();
+            let (property, booking, owner) = deploy_both(&env);
+            let listing_id = seed_listing(&env, &property, &owner);
+
+            property.set_rented(&listing_id);
+
+            assert_eq!(
+                property.get_listing(&listing_id).status,
+                ListingStatus::Rented,
+                "property-listing::set_rented must transition status Active -> Rented"
+            );
+            assert!(
+                !booking.is_listing_eligible(&listing_id),
+                "cross-contract invariant: booking::is_listing_eligible must be false after \
+                 property-listing::set_rented marks the listing Rented"
+            );
+        }
+
+        /// After the owner marks a listing `Inactive`, the booking contract
+        /// observes it as ineligible.
+        #[test]
+        fn test_inactive_listing_observed_by_booking_eligibility() {
+            let env = Env::default();
+            let (property, booking, owner) = deploy_both(&env);
+            let listing_id = seed_listing(&env, &property, &owner);
+
+            property.update_status(&owner, &listing_id, &ListingStatus::Inactive);
+
+            assert_eq!(
+                property.get_listing(&listing_id).status,
+                ListingStatus::Inactive,
+                "property-listing::update_status must transition status Active -> Inactive"
+            );
+            assert!(
+                !booking.is_listing_eligible(&listing_id),
+                "cross-contract invariant: booking::is_listing_eligible must be false while \
+                 property-listing::get_listing reports Inactive"
+            );
+        }
+
+        /// `set_rented` is only callable while the listing is `Active`; calling
+        /// it on an `Inactive` listing must fail and leave the status unchanged.
+        #[test]
+        fn test_set_rented_requires_active_listing() {
+            let env = Env::default();
+            let (property, booking, owner) = deploy_both(&env);
+            let listing_id = seed_listing(&env, &property, &owner);
+
+            property.update_status(&owner, &listing_id, &ListingStatus::Inactive);
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                property.set_rented(&listing_id);
+            }));
+            assert!(
+                result.is_err(),
+                "property-listing::set_rented must reject a listing that is not Active"
+            );
+
+            assert_eq!(
+                property.get_listing(&listing_id).status,
+                ListingStatus::Inactive,
+                "cross-contract invariant: a failed property-listing::set_rented must not \
+                 mutate the listing status"
+            );
+            assert!(
+                !booking.is_listing_eligible(&listing_id),
+                "cross-contract invariant: booking::is_listing_eligible must remain false after \
+                 a failed property-listing::set_rented"
+            );
+        }
+
+        /// A failed booking attempt (listing not eligible) must not leave any
+        /// partial writes: the listing status stays `Active` and the booking
+        /// contract records no reservation.
+        #[test]
+        fn test_failed_booking_leaves_listing_unchanged() {
+            let env = Env::default();
+            let (property, booking, owner) = deploy_both(&env);
+            let listing_id = seed_listing(&env, &property, &owner);
+
+            // Make the listing ineligible, then attempt a booking.
+            property.update_status(&owner, &listing_id, &ListingStatus::Inactive);
+
+            let guest = Address::generate(&env);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                booking.book_listing(&guest, &listing_id);
+            }));
+            assert!(
+                result.is_err(),
+                "booking::book_listing must fail when property-listing reports an ineligible \
+                 listing"
+            );
+
+            assert_eq!(
+                property.get_listing(&listing_id).status,
+                ListingStatus::Inactive,
+                "cross-contract invariant: a failed booking must not mutate the listing status \
+                 reported by property-listing::get_listing"
+            );
+            assert!(
+                !booking.has_reservation(&listing_id),
+                "cross-contract invariant: a failed booking must not persist a reservation in \
+                 the booking contract"
+            );
+        }
+
+        /// A booking against a listing id that does not exist in the property
+        /// contract must fail without creating any state.
+        #[test]
+        fn test_booking_missing_listing_fails() {
+            let env = Env::default();
+            let (property, booking, _owner) = deploy_both(&env);
+
+            let guest = Address::generate(&env);
+            let missing_id = 9999_u64;
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                booking.book_listing(&guest, &missing_id);
+            }));
+            assert!(
+                result.is_err(),
+                "booking::book_listing must fail when property-listing::get_listing reports \
+                 the listing is missing"
+            );
+            assert!(
+                !booking.has_reservation(&missing_id),
+                "cross-contract invariant: a failed booking for a missing listing must not \
+                 persist a reservation"
+            );
+            assert!(
+                !property.listing_exists(&missing_id),
+                "property-listing::listing_exists must remain false for a missing listing"
+            );
+        }
+    }
+
+    // ─── Resource / Cost Regression Measurements (Issue 119) ─────────────────
+    //
+    // These tests measure Soroban CPU instruction and memory consumption for
+    // representative property-listing operations and emit one
+    // `RESOURCE_METRIC {json}` line per measurement. The CI comparison script
+    // (`scripts/check-resource-budget.sh`) parses those lines and fails the
+    // build when a metric exceeds the configured budget.
+    //
+    // The measurements are fully reproducible: they use the in-memory Soroban
+    // test host with a pinned toolchain and require no production credentials.
+    //
+    // To intentionally change a budget, update
+    // `scripts/resource-budgets.json` and document the reason in
+    // `docs/resource-budgets.md`.
+
+    /// Maximum title length exercised by the resource tests (bytes).
+    const MAX_TITLE_LEN: u32 = 128;
+    /// Maximum description length exercised by the resource tests (bytes).
+    const MAX_DESC_LEN: u32 = 512;
+
+    /// Build a string of `len` ASCII bytes (all 'a') for max-size scenarios.
+    fn max_len_string(env: &Env, len: u32) -> String {
+        let mut buf = [b'a'; 512];
+        let slice = &mut buf[..len as usize];
+        String::from_bytes(env, slice)
+    }
+
+    /// Emit a single machine-readable resource metric line.
+    fn emit_metric(operation: &str, cpu: u64, mem: u64) {
+        // Keep the format stable and easy to parse from shell/CI.
+        std::println!(
+            "RESOURCE_METRIC {{\"contract\":\"property-listing\",\"operation\":\"{}\",\"cpu_instructions\":{},\"memory_bytes\":{}}}",
+            operation, cpu, mem
+        );
+    }
+
+    /// Measure a closure's resource usage and emit the metric.
+    fn measure<F: FnOnce()>(env: &Env, operation: &str, f: F) {
+        env.budget().reset_unlimited();
+        f();
+        let cpu = env.budget().cpu_instruction_cost();
+        let mem = env.budget().memory_bytes_cost();
+        emit_metric(operation, cpu, mem);
+    }
+
+    /// Resource measurement: create a listing with typical-size fields.
+    #[test]
+    fn test_resource_create_listing() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        measure(&env, "create_listing", || {
+            client.create_listing(
+                &owner,
+                &String::from_str(&env, "Mountain Cabin"),
+                &String::from_str(&env, "Peaceful retreat in the Alps"),
+                &50_0000000_i128,
+            );
+        });
+    }
+
+    /// Resource measurement: create a listing with maximum-size title/description.
+    #[test]
+    fn test_resource_create_listing_max_size() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        let title = max_len_string(&env, MAX_TITLE_LEN);
+        let desc = max_len_string(&env, MAX_DESC_LEN);
+
+        measure(&env, "create_listing_max_size", || {
+            client.create_listing(&owner, &title, &desc, &50_0000000_i128);
+        });
+    }
+
+    /// Resource measurement: update a listing with typical-size fields.
+    #[test]
+    fn test_resource_update_listing() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        let id = client.create_listing(
+            &owner,
+            &String::from_str(&env, "Cozy Beach House"),
+            &String::from_str(&env, "A lovely place by the sea"),
+            &100_0000000_i128,
+        );
+
+        measure(&env, "update_listing", || {
+            client.update_listing(
+                &owner,
+                &id,
+                &String::from_str(&env, "Updated Beach House"),
+                &String::from_str(&env, "Renovated with ocean view"),
+                &150_0000000_i128,
+            );
+        });
+    }
+
+    /// Resource measurement: update a listing with maximum-size title/description.
+    #[test]
+    fn test_resource_update_listing_max_size() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        let id = client.create_listing(
+            &owner,
+            &String::from_str(&env, "Cozy Beach House"),
+            &String::from_str(&env, "A lovely place by the sea"),
+            &100_0000000_i128,
+        );
+
+        let title = max_len_string(&env, MAX_TITLE_LEN);
+        let desc = max_len_string(&env, MAX_DESC_LEN);
+
+        measure(&env, "update_listing_max_size", || {
+            client.update_listing(&owner, &id, &title, &desc, &150_0000000_i128);
+        });
+    }
+
+    // ─── Pagination Tests ─────────────────────────────────────────────────────
+
+    /// Maximum page size the contract will serve in a single call.
+    const MAX_PAGE_SIZE: u32 = 20;
+
+    /// Seed `count` listings and return their IDs in creation order.
+    fn seed_listings(env: &Env, client: &PropertyListingContractClient, count: u64) -> Vec<u64> {
+        let owner = Address::generate(env);
+        let mut ids = Vec::new(env);
+        for _ in 0..count {
+            let id = client.create_listing(
+                &owner,
+                &String::from_str(env, "Paged Property"),
+                &String::from_str(env, "desc"),
+                &100_0000000_i128,
+            );
+            ids.push_back(id);
+        }
+        ids
+    }
+
+    /// Walk every page via keyset cursor and assert the concatenation is the
+    /// complete, duplicate-free, gap-free, deterministically ordered history.
+    fn assert_full_paged_history(
+        env: &Env,
+        client: &PropertyListingContractClient,
+        expected: &Vec<u64>,
+        page_size: u32,
+    ) {
+        let mut collected: Vec<u64> = Vec::new(env);
+        let mut cursor: Option<u64> = None;
+        let mut pages: u32 = 0;
+
+        loop {
+            let page = client.get_listings_page(&cursor, &page_size);
+            pages += 1;
+            // Pages must never exceed the requested size.
+            assert!(
+                page.len() <= page_size,
+                "page {} exceeded requested size {}",
+                pages,
+                page_size
+            );
+            for id in page.iter() {
+                collected.push_back(id);
+            }
+            match page.last() {
+                Some(last) => cursor = Some(last),
+                None => break,
+            }
+            // Guard against infinite loops on a misbehaving cursor.
+            assert!(pages < 10_000, "pagination did not terminate");
+        }
+
+        assert_eq!(
+            collected.len(),
+            expected.len(),
+            "paged history length mismatch"
+        );
+        for (i, id) in collected.iter().enumerate() {
+            assert_eq!(
+                id,
+                expected.get(i as u32).unwrap(),
+                "paged history mismatch at index {}",
+                i
+            );
+        }
+    }
+
+    /// A collection larger than one page is fully retrievable through bounded pages.
+    #[test]
+    fn test_pagination_complete_history() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+
+        let total = (MAX_PAGE_SIZE as u64) * 2 + 7;
+        let ids = seed_listings(&env, &client, total);
+        assert_eq!(client.listing_count(), total);
+
+        assert_full_paged_history(&env, &client, &ids, MAX_PAGE_SIZE);
+    }
+
+    /// Page size is clamped to the documented maximum.
+    #[test]
+    fn test_pagination_clamps_page_size() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+
+        let total = (MAX_PAGE_SIZE as u64) + 5;
+        seed_listings(&env, &client, total);
+
+        // Requesting an oversized page must not return more than the max.
+        let page = client.get_listings_page(&None, &(MAX_PAGE_SIZE * 100));
+        assert!(page.len() <= MAX_PAGE_SIZE);
+        assert_eq!(page.len(), MAX_PAGE_SIZE);
+    }
+
+    /// A zero page size is rejected rather than silently returning everything.
+    #[test]
+    #[should_panic(expected = "page_size must be greater than zero")]
+    fn test_pagination_rejects_zero_page_size() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+        client.get_listings_page(&None, &0);
+    }
+
+    /// Cursor semantics are stable: the same cursor always yields the same page.
+    #[test]
+    fn test_pagination_cursor_is_stable() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+
+        seed_listings(&env, &client, (MAX_PAGE_SIZE as u64) + 3);
+
+        let first = client.get_listings_page(&None, &5);
+        let cursor = first.last().unwrap();
+
+        let page_a = client.get_listings_page(&Some(cursor), &5);
+        let page_b = client.get_listings_page(&Some(cursor), &5);
+        assert_eq!(page_a, page_b, "cursor must be deterministic");
+    }
+
+    /// A cursor past the end of the collection yields an empty page.
+    #[test]
+    fn test_pagination_cursor_past_end() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+
+        seed_listings(&env, &client, 3);
+        let page = client.get_listings_page(&Some(u64::MAX), &MAX_PAGE_SIZE);
+        assert_eq!(page.len(), 0);
+    }
+
+    /// Pagination preserves authorization: reads are public but writes still
+    /// require the owner, and paged reads never leak mutable state.
+    #[test]
+    fn test_pagination_preserves_authorization() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+
+        let ids = seed_listings(&env, &client, (MAX_PAGE_SIZE as u64) + 1);
+        let first_id = ids.get(0).unwrap();
+
+        // Paged read is public and returns the same data as a direct read.
+        let page = client.get_listings_page(&None, &MAX_PAGE_SIZE);
+        assert_eq!(page.get(0).unwrap(), first_id);
+        assert_eq!(client.get_listing(&first_id).id, first_id);
+    }
+
+    /// Resource usage: a full page read stays within a bounded CPU budget and
+    /// does not grow with the total collection size.
+    #[test]
+    fn test_pagination_resource_usage_bounded() {
+        let (env, cid) = make_env();
+        let client = PropertyListingContractClient::new(&env, &cid);
+
+        // Small collection: measure a full page read.
+        seed_listings(&env, &client, MAX_PAGE_SIZE as u64);
+        let small_budget = env.budget().reset_unlimited();
+        let _ = client.get_listings_page(&None, &MAX_PAGE_SIZE);
+        let small_cpu = env.budget().cpu_instruction_cost();
+        let _ = small_budget;
+
+        // Large collection: a single page read must cost roughly the same.
+        seed_listings(&env, &client, (MAX_PAGE_SIZE as u64) * 5);
+        env.budget().reset_unlimited();
+        let _ = client.get_listings_page(&None, &MAX_PAGE_SIZE);
+        let large_cpu = env.budget().cpu_instruction_cost();
+
+        // Allow generous headroom for storage key hashing differences, but the
+        // cost must not scale with the total number of listings.
+        assert!(
+            large_cpu < small_cpu.saturating_mul(3),
+            "page read cost grew with collection size: small={} large={}",
+            small_cpu,
+            large_cpu
+        );
+    }
 }

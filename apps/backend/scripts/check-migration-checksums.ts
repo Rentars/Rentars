@@ -34,9 +34,37 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS_DIR = path.resolve(HERE, '../database/migrations');
 const LOCK_FILE = path.resolve(HERE, '../database/migrations.lock.json');
 const WRITE = process.argv.includes('--write');
+const JSON_OUTPUT = process.argv.includes('--json');
 
 interface LockFile {
   [filename: string]: string; // sha256 hex
+}
+
+/**
+ * Machine-readable summary of migration state, consumed by the release
+ * manifest generator to record migration state in the deployment health
+ * record (#1018). Emitted to stdout as a single JSON line when `--json` is
+ * passed, and always written to MIGRATION_STATE_FILE when that env var is set.
+ */
+interface MigrationStateSummary {
+  ok: boolean;
+  lockedCount: number;
+  currentCount: number;
+  newFiles: string[];
+  drifted: Array<{ file: string; locked: string; actual: string }>;
+  generatedAt: string;
+}
+
+const MIGRATION_STATE_FILE = process.env.MIGRATION_STATE_FILE;
+
+function emitSummary(summary: MigrationStateSummary): void {
+  const serialized = JSON.stringify(summary);
+  if (JSON_OUTPUT) {
+    console.log(serialized);
+  }
+  if (MIGRATION_STATE_FILE) {
+    fs.writeFileSync(MIGRATION_STATE_FILE, JSON.stringify(summary, null, 2) + '\n');
+  }
 }
 
 function hashFile(filePath: string): string {
@@ -67,6 +95,14 @@ function main(): void {
   if (WRITE) {
     fs.writeFileSync(LOCK_FILE, JSON.stringify(current, null, 2) + '\n');
     console.log(`Wrote ${Object.keys(current).length} checksum(s) to ${LOCK_FILE}`);
+    emitSummary({
+      ok: true,
+      lockedCount: Object.keys(current).length,
+      currentCount: Object.keys(current).length,
+      newFiles: [],
+      drifted: [],
+      generatedAt: new Date().toISOString(),
+    });
     return;
   }
 
@@ -107,10 +143,26 @@ function main(): void {
         '   If this edit is intentional and the migration has never run anywhere,\n' +
         '   re-run with --write to update the lock.\n',
     );
+    emitSummary({
+      ok: false,
+      lockedCount: Object.keys(lock).length,
+      currentCount: Object.keys(current).length,
+      newFiles,
+      drifted,
+      generatedAt: new Date().toISOString(),
+    });
     process.exit(1);
   }
 
   console.log('✅ No checksum drift detected on locked migration files.');
+  emitSummary({
+    ok: true,
+    lockedCount: Object.keys(lock).length,
+    currentCount: Object.keys(current).length,
+    newFiles,
+    drifted,
+    generatedAt: new Date().toISOString(),
+  });
 }
 
 main();

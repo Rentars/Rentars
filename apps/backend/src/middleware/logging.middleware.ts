@@ -2,7 +2,30 @@ import { randomUUID } from 'node:crypto';
 import { type Request, type Response, type NextFunction } from 'express';
 import { env } from '../config/env.js';
 import { getRequestContext, runWithRequestContext } from '../services/logging.service.js';
-import { getTraceContext } from '../config/tracing.js';
+import { redactLogFields, redactRequestHeaders } from '../utils/redact.js';
+
+// ── Correlation header names ──────────────────────────────────────────────────
+
+export const CORRELATION_HEADERS = {
+  requestId: 'x-request-id',
+  correlationId: 'x-correlation-id',
+  bookingId: 'x-booking-id',
+  operationId: 'x-operation-id',
+} as const;
+
+/**
+ * Read a single header value as a trimmed, length-bounded string.
+ * Returns undefined for missing, non-string, or empty values.
+ */
+function readHeader(req: Request, name: string): string | undefined {
+  const raw = req.headers[name];
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return undefined;
+  // Bound user-supplied identifiers so they cannot bloat log lines.
+  return trimmed.slice(0, 128);
+}
 
 // ── Log levels ────────────────────────────────────────────────────────────────
 
@@ -30,6 +53,9 @@ export interface LogEntry {
   service?: string;
   environment?: string;
   requestId?: string;
+  correlationId?: string;
+  bookingId?: string;
+  operationId?: string;
   userId?: string;
   traceId?: string;
   spanId?: string;
@@ -38,43 +64,62 @@ export interface LogEntry {
 }
 
 /**
+ * Well-known top-level schema keys that are safe to include verbatim.
+ * Every other key on a LogEntry is treated as an "extra" and passed through
+ * redactLogFields before serialisation so that a caller who accidentally
+ * includes a request body, provider response, or auth object cannot leak
+ * credentials into the log-aggregation pipeline.
+ */
+const SAFE_SCHEMA_KEYS = new Set([
+  'level', 'message', 'timestamp', 'requestId', 'userId',
+  'method', 'path', 'status', 'durationMs', 'ip',
+  'userAgent', 'route',
+]);
+
+/**
  * Emit a structured JSON log line.
- *
- * Fields are merged in this order (later values win):
- *   1. The caller-supplied `entry`
- *   2. `requestId` / `userId` from the per-request AsyncLocalStorage context
- *      (so deep service calls don't need to thread `req` everywhere)
- *   3. `traceId` / `spanId` from the W3C trace context AsyncLocalStorage
- *      (set by `tracingMiddleware` and propagated to workers via
- *      `runWithWorkerContext`)
- *   4. `service` and `environment` defaults if the caller didn't set them
  *
  * In development the line is pretty-printed; in production it is a single-line
  * JSON object suitable for Loki / CloudWatch / any structured log pipeline.
  *
  * The log is suppressed when its level falls below the configured LOG_LEVEL.
+ *
+ * Before serialisation any field that is not in SAFE_SCHEMA_KEYS is passed
+ * through redactLogFields, ensuring credentials and PII in arbitrary extra
+ * fields are stripped before they reach the log sink.
  */
 export function structuredLog(entry: LogEntry): void {
   const configuredLevel = getConfiguredLevel();
   if (LEVEL_PRIORITY[entry.level] < LEVEL_PRIORITY[configuredLevel]) return;
 
-  // Pull per-request correlation fields from AsyncLocalStorage so callers
-  // deep inside services don't need direct access to `req`.
-  const reqCtx = getRequestContext();
+  // Fall back to the AsyncLocalStorage-backed request context for any field
+  // the caller didn't set explicitly.
+  const context = getRequestContext();
 
-  // Pull trace context so every log line is linkable to a distributed trace.
-  const traceCtx = getTraceContext();
+  // Separate safe schema keys from arbitrary extras.
+  const safeFields: Record<string, unknown> = {};
+  const extraFields: Record<string, unknown> = {};
+
+  for (const [k, v] of Object.entries(entry)) {
+    if (SAFE_SCHEMA_KEYS.has(k)) {
+      safeFields[k] = v;
+    } else {
+      extraFields[k] = v;
+    }
+  }
+
+  // Redact extras in-place before merging into the final log line.
+  const redactedExtras = redactLogFields(extraFields) as Record<string, unknown>;
 
   const merged: LogEntry = {
     service: 'rentars-api',
     environment: env.NODE_ENV,
     ...entry,
-    // Request correlation — only override caller if they left it unset
-    requestId: entry.requestId ?? reqCtx?.requestId,
-    userId: entry.userId ?? reqCtx?.userId,
-    // Trace correlation — fold in traceId/spanId when the trace context exists
-    traceId: entry.traceId ?? traceCtx?.traceId,
-    spanId: entry.spanId ?? traceCtx?.spanId,
+    requestId: entry.requestId ?? context?.requestId,
+    correlationId: entry.correlationId ?? context?.correlationId,
+    bookingId: entry.bookingId ?? context?.bookingId,
+    operationId: entry.operationId ?? context?.operationId,
+    userId: entry.userId ?? context?.userId,
   };
 
   // Drop undefined fields so the JSON payload stays clean.
@@ -99,37 +144,66 @@ export function structuredLog(entry: LogEntry): void {
 // ── Request-ID injection ──────────────────────────────────────────────────────
 
 /**
- * Attach a unique request-ID to every incoming request so that all log
+ * Attach correlation identifiers to every incoming request so that all log
  * entries emitted during that request can be correlated in a dashboard.
  *
- * The ID is read from the `X-Request-Id` header if the upstream proxy already
- * set one; otherwise a fresh UUID v4 is generated.  The final ID is echoed
- * back to the caller in `X-Request-Id`.
+ * - `X-Request-Id` identifies the individual HTTP request. It is read from
+ *   the header if the upstream proxy already set one; otherwise a fresh
+ *   UUID v4 is generated.
+ * - `X-Correlation-Id` identifies the end-to-end user-visible operation and
+ *   is preserved across retries and restarts. It defaults to the request id.
+ * - `X-Booking-Id` / `X-Operation-Id` are optional identifiers supplied by
+ *   the caller (or an upstream service) to tie the request to a booking and
+ *   a deferred operation.
+ *
+ * The final request id and correlation id are echoed back to the caller.
  */
 export function requestIdMiddleware(
   req: Request,
   res: Response,
   next: NextFunction,
 ): void {
-  const incomingId = req.headers['x-request-id'];
-  const requestId =
-    typeof incomingId === 'string' && incomingId.length > 0
-      ? incomingId
-      : randomUUID();
+  const requestId = readHeader(req, CORRELATION_HEADERS.requestId) ?? randomUUID();
+  const correlationId =
+    readHeader(req, CORRELATION_HEADERS.correlationId) ?? requestId;
+  const bookingId = readHeader(req, CORRELATION_HEADERS.bookingId);
+  const operationId = readHeader(req, CORRELATION_HEADERS.operationId);
 
-  (req as RequestWithId).requestId = requestId;
+  // Attach to the request object for downstream middleware and controllers
+  const typedReq = req as RequestWithId;
+  typedReq.requestId = requestId;
+  typedReq.correlationId = correlationId;
+  typedReq.bookingId = bookingId;
+  typedReq.operationId = operationId;
+
+  // Echo back so the client can correlate responses
   res.setHeader('X-Request-Id', requestId);
+  res.setHeader('X-Correlation-Id', correlationId);
 
-  // Bind the correlation id (and method/path) to the async context for the
-  // rest of the request lifecycle so any log call made in controllers, services,
-  // blockchain/Supabase calls can pick it up via `getRequestContext()`.
-  runWithRequestContext({ requestId, method: req.method, path: req.path }, next);
+  // Bind the correlation ids (and method/path) to the async context for the
+  // rest of the request lifecycle, so any log call made further down the
+  // stack — controllers, services, blockchain/Supabase calls — can pick it
+  // up via `getRequestContext()` without `req` being passed around.
+  runWithRequestContext(
+    {
+      requestId,
+      correlationId,
+      bookingId,
+      operationId,
+      method: req.method,
+      path: req.path,
+    },
+    next,
+  );
 }
 
 // ── Typed request extension ───────────────────────────────────────────────────
 
 export interface RequestWithId extends Request {
   requestId?: string;
+  correlationId?: string;
+  bookingId?: string;
+  operationId?: string;
   userId?: string;
 }
 
@@ -140,14 +214,15 @@ export interface RequestWithId extends Request {
  *
  * Emits one structured log entry per request on response finish containing:
  *   - ISO timestamp
- *   - service + environment
- *   - requestId for HTTP-level correlation
- *   - traceId + spanId for distributed-trace linkage
+ *   - Request-ID, correlation-ID, booking-ID and operation-ID for correlation
  *   - HTTP method, normalised path, status code, duration
  *   - Authenticated user-ID (if present on req.userId)
  *   - outcome: 'success' | 'client_error' | 'server_error'
  *
- * Paths in SKIP_PATHS are not logged (health, metrics, favicon).
+ * Auth headers, cookies, request bodies and query strings are never logged so
+ * that tokens, wallet secrets and payment payloads cannot leak into logs.
+ *
+ * Paths matching SKIP_PATHS are not logged (e.g. /health, /metrics).
  */
 const SKIP_PATHS = new Set(['/health', '/metrics', '/favicon.ico']);
 
@@ -165,29 +240,31 @@ export function requestLoggingMiddleware(
   const typedReq = req as RequestWithId;
 
   res.on('finish', () => {
-    const durationMs = Date.now() - startMs;
+    const duration = Date.now() - startMs;
     const level: LogLevel =
       res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info';
 
-    const outcome =
-      res.statusCode >= 500
-        ? 'server_error'
-        : res.statusCode >= 400
-          ? 'client_error'
-          : 'success';
+    // Redact request headers so Authorization / Cookie can never appear in
+    // the access log even if they were forwarded by a misconfigured proxy.
+    const safeHeaders = redactRequestHeaders(
+      req.headers as Record<string, string | string[] | undefined>,
+    );
 
     structuredLog({
       level,
       message: `${req.method} ${req.path} ${res.statusCode}`,
       timestamp: new Date().toISOString(),
       requestId: typedReq.requestId,
+      correlationId: typedReq.correlationId,
+      bookingId: typedReq.bookingId,
+      operationId: typedReq.operationId,
       userId: typedReq.userId,
       method: req.method,
       path: req.path,
       status: res.statusCode,
-      durationMs,
-      outcome,
-      userAgent: req.headers['user-agent'],
+      durationMs: duration,
+      // userAgent sourced from the already-redacted header map (safe field)
+      userAgent: safeHeaders['user-agent'] as string | undefined,
       ip: req.ip,
     });
   });

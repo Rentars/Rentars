@@ -55,7 +55,8 @@ const corsOptions: CorsOptions = {
     'X-RateLimit-Limit',
     'X-RateLimit-Remaining',
     'X-RateLimit-Reset',
-    'Retry-After',
+    'X-RateLimit-Policy', // identifies the endpoint/identity budget that was applied
+    'Retry-After',        // safe retry interval (seconds) on 429 responses
   ],
 
   // Cache preflight for 10 minutes

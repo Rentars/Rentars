@@ -20,6 +20,7 @@ import {
   getDraftHandler,
   updateDraftHandler,
   publishDraftHandler,
+  getPublishReadinessHandler,
   getPropertyVersionsHandler,
   rollbackPropertyVersionHandler,
 } from '@/controllers/property.controller.js';
@@ -44,7 +45,7 @@ import {
 import { authenticate } from '@/middleware/auth.middleware.js';
 import { requireEmailVerified } from '@/middleware/emailVerified.middleware.js';
 import { upload } from '@/middleware/multer.js';
-import { createUserRateLimiter } from '@/middleware/rateLimiter.js';
+import { createUserRateLimiter, createEndpointRateLimiter } from '@/middleware/rateLimiter.js';
 import { geoSearchSchema, validateQuery } from '@/validators/property.validator.js';
 import { validatePagination } from '@/validators/pagination.validator.js';
 
@@ -57,26 +58,35 @@ const imageUploadLimiter = createUserRateLimiter({
   keyPrefix: 'rl:property-images:upload',
 });
 
+/**
+ * Search budget. Scoped by authenticated user when present, otherwise by the
+ * trusted-proxy-resolved client IP (never raw X-Forwarded-For).
+ */
+const searchLimiter = createEndpointRateLimiter('search');
+
+/** Expensive geospatial / aggregation operations get a tighter budget. */
+const expensiveSearchLimiter = createEndpointRateLimiter('expensive');
+
 // GET /api/v1/properties
 router.get('/', validatePagination, getProperties);
 
 // GET /api/v1/properties/search/advanced - Advanced search with filters
-router.get('/search/advanced', advancedSearchHandler);
+router.get('/search/advanced', searchLimiter, advancedSearchHandler);
 
 // GET /api/v1/properties/search/bounds - Map viewport bounding-box search
-router.get('/search/bounds', boundsSearchHandler);
+router.get('/search/bounds', expensiveSearchLimiter, boundsSearchHandler);
 
 // GET /api/v1/properties/search/nearby - Radius geospatial search ordered by distance
-router.get('/search/nearby', validateQuery(geoSearchSchema), searchNearbyEndpoint);
+router.get('/search/nearby', expensiveSearchLimiter, validateQuery(geoSearchSchema), searchNearbyEndpoint);
 
 // GET /api/v1/properties/search/suggestions - Search suggestions
-router.get('/search/suggestions', searchSuggestionsHandler);
+router.get('/search/suggestions', searchLimiter, searchSuggestionsHandler);
 
 // GET /api/v1/properties/search/trending - Trending searches
-router.get('/search/trending', trendingSearchesHandler);
+router.get('/search/trending', searchLimiter, trendingSearchesHandler);
 
 // POST /api/v1/properties/search/suggestion-accepted - Track suggestion acceptance
-router.post('/search/suggestion-accepted', trackSuggestionAcceptedHandler);
+router.post('/search/suggestion-accepted', searchLimiter, trackSuggestionAcceptedHandler);
 
 // GET /api/v1/properties/by-slug/:slug - Look up property by human-readable slug
 // Must be registered before /:id so "by-slug" is not treated as an id
@@ -116,6 +126,9 @@ router.patch('/:id/draft', authenticate, updateDraftHandler);
 
 // PATCH /api/v1/properties/:id/publish - publish draft to active (idempotent)
 router.patch('/:id/publish', authenticate, publishDraftHandler);
+
+// GET /api/v1/properties/:id/publish-readiness - publish readiness check (owner-only)
+router.get('/:id/publish-readiness', authenticate, getPublishReadinessHandler);
 
 // ── Property Management ────────────────────────────────────────────────────────
 

@@ -1,18 +1,48 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Rentars Web — development Compose (frontend only)
+#
+# PURPOSE: Run the Next.js dev server in isolation, proxying API calls to a
+#          separately running backend (host network or another Compose stack).
+#
+# USAGE:
+#   cp .env.example .env.local
+#   # Set NEXT_PUBLIC_API_URL to point at your running backend, e.g.:
+#   #   NEXT_PUBLIC_API_URL=http://localhost:3000
+#   docker compose up
+#
+# For a full local stack (web + api + redis together), use the root
+# docker-compose.yml instead:
+#   cd ../..
+#   docker compose up
+#
+# PORT: 3001 (matches the root stack and the CORS_ORIGIN in the backend .env)
+# ─────────────────────────────────────────────────────────────────────────────
+
 services:
   web:
-    image: node:20-alpine
+    image: node:20.19-alpine
     working_dir: /app
     ports:
-      - "3000:3000"
+      - "3001:3001"
     volumes:
       - .:/app
       - web_node_modules:/app/node_modules
-    environment:
-      - NODE_ENV=development
-      - WATCHPACK_POLLING=true
-    command: sh -c "npm install && npm run dev"
+      - web_next_cache:/app/.next
     env_file:
       - .env.local
+    environment:
+      NODE_ENV: development
+      PORT: "3001"
+      HOSTNAME: "0.0.0.0"
+      WATCHPACK_POLLING: "true"
+    command: sh -c "npm install && npm run dev -- -p 3001"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3001/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
 
 volumes:
   web_node_modules:
+  web_next_cache:

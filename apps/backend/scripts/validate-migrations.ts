@@ -20,6 +20,11 @@
  * Flags:
  *   --dry-run   Report all findings but always exit 0 (useful for local triage
  *               without blocking CI).
+ *   --json      Emit a machine-readable JSON summary (migration state) to stdout
+ *               instead of the human-readable report. Intended for the release
+ *               manifest generator to record migration state in the deployment
+ *               health record. When combined with --dry-run, the JSON is still
+ *               emitted and the exit code remains 0.
  */
 
 import * as fs from 'node:fs';
@@ -35,6 +40,7 @@ const argDir = (() => {
 })();
 
 const DRY_RUN = process.argv.includes('--dry-run');
+const JSON_OUTPUT = process.argv.includes('--json');
 
 const MIGRATIONS_DIR =
   argDir ??
@@ -57,6 +63,38 @@ interface ValidationResult {
   duplicates: Array<{ prefix: number; files: string[] }>;
   nonMonotonic: Array<{ file: string; prefix: number; prevFile: string; prevPrefix: number }>;
   unparseable: string[];
+}
+
+/**
+ * Machine-readable migration state consumed by the release manifest generator.
+ * This is a stable contract: field names must not change without updating the
+ * manifest generator and deployment health record schema.
+ */
+export interface MigrationStateSummary {
+  /** Absolute path of the directory that was validated. */
+  directory: string;
+  /** True when every check passed (no unparseable, duplicate, or ordering issues). */
+  valid: boolean;
+  /** Total number of .sql files discovered. */
+  totalFiles: number;
+  /** Number of files with a parseable numeric prefix. */
+  parsedFiles: number;
+  /** Highest numeric prefix observed (null when no parseable files). */
+  latestPrefix: number | null;
+  /** Zero-padded form of latestPrefix (null when no parseable files). */
+  latestPrefixRaw: string | null;
+  /** Filename of the migration with the highest prefix (null when none). */
+  latestFile: string | null;
+  /** Sorted list of all migration filenames discovered. */
+  files: string[];
+  /** Files lacking a parseable numeric prefix. */
+  unparseable: string[];
+  /** Duplicate prefix groups. */
+  duplicates: Array<{ prefix: number; prefixRaw: string; files: string[] }>;
+  /** Non-monotonic ordering findings. */
+  nonMonotonic: Array<{ file: string; prefix: number; prevFile: string; prevPrefix: number }>;
+  /** ISO timestamp of when the summary was produced. */
+  generatedAt: string;
 }
 
 // ─── Core logic ──────────────────────────────────────────────────────────────
@@ -126,6 +164,42 @@ export function validateMigrations(files: MigrationFile[]): ValidationResult {
   }
 
   return result;
+}
+
+/**
+ * Build the machine-readable migration state summary for the release manifest.
+ */
+export function buildMigrationStateSummary(
+  dir: string,
+  files: MigrationFile[],
+  result: ValidationResult,
+): MigrationStateSummary {
+  const sorted = [...files].sort((a, b) => a.prefix - b.prefix);
+  const latest = sorted.length > 0 ? sorted[sorted.length - 1] : null;
+
+  const hasErrors =
+    result.unparseable.length > 0 ||
+    result.duplicates.length > 0 ||
+    result.nonMonotonic.length > 0;
+
+  return {
+    directory: dir,
+    valid: !hasErrors,
+    totalFiles: files.length + result.unparseable.length,
+    parsedFiles: files.length,
+    latestPrefix: latest ? latest.prefix : null,
+    latestPrefixRaw: latest ? latest.raw : null,
+    latestFile: latest ? latest.filename : null,
+    files: [...files.map((f) => f.filename), ...result.unparseable].sort(),
+    unparseable: [...result.unparseable],
+    duplicates: result.duplicates.map((d) => ({
+      prefix: d.prefix,
+      prefixRaw: String(d.prefix).padStart(5, '0'),
+      files: [...d.files],
+    })),
+    nonMonotonic: result.nonMonotonic.map((nm) => ({ ...nm })),
+    generatedAt: new Date().toISOString(),
+  };
 }
 
 // ─── Reporter ─────────────────────────────────────────────────────────────────
@@ -204,7 +278,16 @@ function main(): void {
   }
 
   const result = validateMigrations(files);
-  const hasErrors = printReport(MIGRATIONS_DIR, files, { ...result, unparseable });
+  const merged: ValidationResult = { ...result, unparseable };
+
+  if (JSON_OUTPUT) {
+    const summary = buildMigrationStateSummary(MIGRATIONS_DIR, files, merged);
+    // Machine-readable output goes to stdout; diagnostics stay on stderr.
+    process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
+    process.exit(summary.valid || DRY_RUN ? 0 : 1);
+  }
+
+  const hasErrors = printReport(MIGRATIONS_DIR, files, merged);
 
   process.exit(hasErrors && !DRY_RUN ? 1 : 0);
 }

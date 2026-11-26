@@ -17,6 +17,37 @@ import {
   type ProbeResult,
   type ProbeResponse,
 } from '@/config/probes.js';
+import { observeHistogram } from '@/middleware/metrics.middleware.js';
+
+/**
+ * Suites that are part of the deployment health gate. They must never mutate
+ * production data or move real funds, so they are executed with read-only /
+ * mocked semantics and their failures are surfaced to the release gate.
+ */
+export const DEPLOYMENT_GATE_SUITES = [
+  'api_readiness',
+  'auth_metadata',
+  'property_read',
+  'payment_config',
+] as const;
+
+export type DeploymentGateSuite = (typeof DEPLOYMENT_GATE_SUITES)[number];
+
+export interface DeploymentGateOutcome {
+  suite: string;
+  success: boolean;
+  failedTargets: string[];
+  results: ProbeResult[];
+}
+
+export interface DeploymentGateReport {
+  deploymentVersion: string;
+  location: string;
+  passed: boolean;
+  outcomes: DeploymentGateOutcome[];
+  failedSuites: string[];
+  completedAt: string;
+}
 
 interface ProbeContext {
   token?: string;
@@ -150,6 +181,21 @@ async function runBookingWriteProbe(
   context: ProbeContext,
 ): Promise<ProbeResult[]> {
   const results: ProbeResult[] = [];
+
+  // Booking write probes create real bookings. They must never run against
+  // production, otherwise a smoke check could accidentally book a property.
+  if (config.environment === 'production') {
+    structuredLog({
+      level: 'warn',
+      message: 'Booking write probe skipped in production environment',
+      timestamp: new Date().toISOString(),
+      suite: suite.name,
+      location: config.location,
+      deploymentVersion: config.deploymentVersion,
+    });
+    return results;
+  }
+
   const authOk = await authenticateTestAccount(suite, config, context);
   if (!authOk) {
     structuredLog({
@@ -240,7 +286,7 @@ async function recordProbeResults(
   results: ProbeResult[],
   config: ProbeConfig,
 ): Promise<void> {
-  const overallSuccess = results.every((r) => r.success);
+  const overallSuccess = results.length > 0 && results.every((r) => r.success);
   const failedTargets = results.filter((r) => !r.success).map((r) => r.target.name);
 
   try {
@@ -248,6 +294,8 @@ async function recordProbeResults(
       suite_name: suiteName,
       location: config.location,
       deployment_version: config.deploymentVersion,
+      environment: config.environment,
+      migration_state: config.migrationState ?? null,
       overall_success: overallSuccess,
       failed_targets: failedTargets,
       results_json: results.map((r) => ({
@@ -321,6 +369,75 @@ async function checkAlertThreshold(suite: ProbeSuite, config: ProbeConfig): Prom
       error: String(err),
     });
   }
+}
+
+/**
+ * Run the deployment health gate suites and return a report that the release
+ * pipeline can use to block traffic promotion. Any failed required suite
+ * results in `passed: false`.
+ */
+export async function runDeploymentGate(
+  config: ProbeConfig = getProbeConfig(),
+): Promise<DeploymentGateReport> {
+  const outcomes: DeploymentGateOutcome[] = [];
+  const failedSuites: string[] = [];
+
+  const gateSuites = config.suites.filter((suite) =>
+    (DEPLOYMENT_GATE_SUITES as readonly string[]).includes(suite.name),
+  );
+
+  for (const suite of gateSuites) {
+    let results: ProbeResult[] = [];
+    try {
+      results = await runProbeSuite(suite, config);
+    } catch (err) {
+      structuredLog({
+        level: 'error',
+        message: 'Deployment gate suite crashed',
+        timestamp: new Date().toISOString(),
+        suite: suite.name,
+        deploymentVersion: config.deploymentVersion,
+        error: String(err),
+      });
+    }
+
+    await recordProbeResults(suite.name, results, config);
+
+    const success = results.length > 0 && results.every((r) => r.success);
+    const failedTargets = results.filter((r) => !r.success).map((r) => r.target.name);
+
+    outcomes.push({ suite: suite.name, success, failedTargets, results });
+    if (!success) {
+      failedSuites.push(suite.name);
+      structuredLog({
+        level: 'error',
+        message: 'Deployment gate suite failed',
+        timestamp: new Date().toISOString(),
+        suite: suite.name,
+        failedTargets,
+        deploymentVersion: config.deploymentVersion,
+        location: config.location,
+        migrationState: config.migrationState,
+        gate: 'deployment_health',
+      });
+    }
+  }
+
+  const report: DeploymentGateReport = {
+    deploymentVersion: config.deploymentVersion,
+    location: config.location,
+    passed: failedSuites.length === 0 && gateSuites.length > 0,
+    outcomes,
+    failedSuites,
+    completedAt: new Date().toISOString(),
+  };
+
+  incCounter(probeRunsTotal, {
+    suite: 'deployment_gate',
+    outcome: report.passed ? 'success' : 'failure',
+  });
+
+  return report;
 }
 
 export async function runAllProbes(config: ProbeConfig = getProbeConfig()): Promise<void> {

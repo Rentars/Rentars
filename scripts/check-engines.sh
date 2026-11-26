@@ -78,10 +78,34 @@ else
   echo "  Rust not found — skipping (only required for contracts workspace)"
 fi
 
+# ── Workspace command availability ──────────────────────────────────────────
+# Verify that the supported package manager can resolve each workspace from a
+# clean checkout.  Web uses Yarn, backend uses Bun.
+if command -v yarn &>/dev/null; then
+  if yarn --cwd apps/web --version &>/dev/null; then
+    pass "Yarn can resolve web workspace (apps/web)"
+  else
+    fail "Yarn cannot resolve web workspace — run 'yarn install' at the repo root"
+  fi
+else
+  fail "Yarn not found — cannot resolve web workspace (apps/web)"
+fi
+
+if command -v bun &>/dev/null; then
+  if bun --cwd apps/backend --version &>/dev/null; then
+    pass "Bun can resolve backend workspace (apps/backend)"
+  else
+    fail "Bun cannot resolve backend workspace — run 'bun install' in apps/backend"
+  fi
+else
+  echo "  Bun not found — skipping backend workspace check (only required for backend workspace)"
+fi
+
 if [[ $ERRORS -gt 0 ]]; then
   echo ""
-  echo -e "${RED}Engine check failed: $ERRORS unsupported runtime(s).${NC}" >&2
+  echo -e "${RED}Engine check failed: $ERRORS unsupported runtime(s) or unavailable workspace command(s).${NC}" >&2
   echo "Update your runtime(s) or use a version manager (.tool-versions / .nvmrc)." >&2
+  echo "Install workspace dependencies with the supported package manager (see CONTRIBUTING.md)." >&2
   exit 1
 fi
 

@@ -13,6 +13,7 @@
  */
 
 import { redisClient } from '@/config/redis.js';
+import { redisKeys } from '@/config/redisKeys.js';
 
 export interface RejectionRecord {
   route: string;
@@ -20,6 +21,10 @@ export interface RejectionRecord {
   scope: string;
   hashedIdentity: string;
   timestamp: number; // Unix ms
+  /** Resolved identity class (e.g. 'user', 'anon', 'ip'). */
+  identityClass?: string;
+  /** Endpoint class / budget name (e.g. 'login', 'search', 'upload'). */
+  endpointClass?: string;
 }
 
 export interface RouteStats {
@@ -36,7 +41,6 @@ export interface SummaryWindow {
   total: number;
 }
 
-const REDIS_KEY_PREFIX = 'rl_reject';
 /** Maximum age of records kept in Redis sorted sets (7 days in seconds). */
 const MAX_AGE_SECONDS = 60 * 60 * 24 * 7;
 
@@ -98,9 +102,8 @@ class RateLimitStoreService {
   // ── Redis implementation ────────────────────────────────────────────────────
 
   private redisKey(scope: string, route: string, method: string): string {
-    // Sanitize route for use in a Redis key (replace slashes and special chars)
-    const safeRoute = route.replace(/[^a-zA-Z0-9_-]/g, '_');
-    return `${REDIS_KEY_PREFIX}:${scope}:${method}:${safeRoute}`;
+    // Delegate to the shared key namespace so every instance agrees on key names.
+    return redisKeys.rateLimitReject(scope, method, route);
   }
 
   private async recordRedis(entry: RejectionRecord): Promise<void> {
@@ -110,21 +113,49 @@ class RateLimitStoreService {
     const member = JSON.stringify({
       id: entry.hashedIdentity,
       ts: entry.timestamp,
+      ic: entry.identityClass,
+      ec: entry.endpointClass,
     });
 
-    await redisClient.zAdd(key, { score, value: member });
-
-    // Trim entries older than MAX_AGE_SECONDS to bound storage
+    // Use a MULTI transaction so the add + trim + TTL are applied atomically
+    // and consistently across all backend instances sharing this Redis.
     const cutoff = Date.now() - MAX_AGE_SECONDS * 1000;
-    await redisClient.zRemRangeByScore(key, 0, cutoff);
+    await redisClient
+      .multi()
+      .zAdd(key, { score, value: member })
+      .zRemRangeByScore(key, 0, cutoff)
+      .expire(key, MAX_AGE_SECONDS)
+      .exec();
+  }
 
-    // Set key TTL so Redis cleans up idle keys automatically
-    await redisClient.expire(key, MAX_AGE_SECONDS);
+  /**
+   * Record a rejection using the resolved identity class and endpoint class.
+   * Convenience wrapper around record() for callers that have already resolved
+   * the identity (authenticated user vs anonymous) and the endpoint budget.
+   */
+  async recordRejection(params: {
+    route: string;
+    method: string;
+    scope: string;
+    hashedIdentity: string;
+    identityClass?: string;
+    endpointClass?: string;
+    timestamp?: number;
+  }): Promise<void> {
+    await this.record({
+      route: params.route,
+      method: params.method,
+      scope: params.scope,
+      hashedIdentity: params.hashedIdentity,
+      identityClass: params.identityClass,
+      endpointClass: params.endpointClass,
+      timestamp: params.timestamp ?? Date.now(),
+    });
   }
 
   private async getSummaryRedis(windowSeconds: number): Promise<SummaryWindow> {
     const since = Date.now() - windowSeconds * 1000;
-    const pattern = `${REDIS_KEY_PREFIX}:*`;
+    const pattern = redisKeys.rateLimitRejectPattern();
 
     const keys: string[] = [];
     let cursor = 0;
@@ -141,10 +172,10 @@ class RateLimitStoreService {
       const count = await redisClient.zCount(key, since, '+inf');
       if (count === 0) continue;
 
-      // Parse scope, method, route from key: rl_reject:<scope>:<method>:<route>
-      const parts = key.slice(REDIS_KEY_PREFIX.length + 1).split(':');
-      const [scope, method, ...routeParts] = parts;
-      const route = routeParts.join(':').replace(/_/g, '/');
+      // Parse scope, method, route from the shared key namespace.
+      const parsed = redisKeys.parseRateLimitRejectKey(key);
+      if (!parsed) continue;
+      const { scope, method, route } = parsed;
 
       byRoute.push({ route, method, scope, count });
       total += count;
@@ -208,6 +239,11 @@ class RateLimitStoreService {
   /** Exposed for testing — clears the in-memory store. */
   _clearMemoryStore(): void {
     inMemoryStore.clear();
+  }
+
+  /** Exposed for testing — returns the shared Redis key for a rejection bucket. */
+  _redisKey(scope: string, route: string, method: string): string {
+    return this.redisKey(scope, route, method);
   }
 }
 

@@ -9,15 +9,15 @@
  */
 
 import { redisClient } from '@/config/redis.js';
-import { createHash } from 'node:crypto';
+import { redisKeys } from '@/config/redisKeys.js';
 
-const METRICS_PREFIX = 'ratelimit:metrics:';
 const METRICS_TTL = 60 * 60 * 24; // 24 hours
 
 export interface RateLimitMetric {
   route: string;
   method: string;
   scope: string;
+  identityClass: string;
   hashedIdentity: string;
   consecutiveFailures: number;
   firstFailureTime: number;
@@ -33,8 +33,9 @@ class RateLimitMetricsService {
     method: string,
     scope: string,
     hashedIdentity: string,
+    identityClass: string = 'anonymous',
   ): Promise<void> {
-    const metricKey = `${METRICS_PREFIX}${scope}:${hashedIdentity}`;
+    const metricKey = redisKeys.rateLimitMetric(scope, identityClass, hashedIdentity);
 
     const existing = await redisClient.get(metricKey);
     const now = Date.now();
@@ -46,11 +47,16 @@ class RateLimitMetricsService {
         metric = JSON.parse(existing) as RateLimitMetric;
         metric.consecutiveFailures += 1;
         metric.lastFailureTime = now;
+        // Keep the most recent route/method/identity class observed.
+        metric.route = route;
+        metric.method = method;
+        metric.identityClass = identityClass;
       } catch {
         metric = {
           route,
           method,
           scope,
+          identityClass,
           hashedIdentity,
           consecutiveFailures: 1,
           firstFailureTime: now,
@@ -62,6 +68,7 @@ class RateLimitMetricsService {
         route,
         method,
         scope,
+        identityClass,
         hashedIdentity,
         consecutiveFailures: 1,
         firstFailureTime: now,
@@ -82,8 +89,9 @@ class RateLimitMetricsService {
   async resetFailures(
     scope: string,
     hashedIdentity: string,
+    identityClass: string = 'anonymous',
   ): Promise<void> {
-    const metricKey = `${METRICS_PREFIX}${scope}:${hashedIdentity}`;
+    const metricKey = redisKeys.rateLimitMetric(scope, identityClass, hashedIdentity);
     await redisClient.del(metricKey);
   }
 
@@ -93,8 +101,9 @@ class RateLimitMetricsService {
   async getMetric(
     scope: string,
     hashedIdentity: string,
+    identityClass: string = 'anonymous',
   ): Promise<RateLimitMetric | null> {
-    const metricKey = `${METRICS_PREFIX}${scope}:${hashedIdentity}`;
+    const metricKey = redisKeys.rateLimitMetric(scope, identityClass, hashedIdentity);
     const stored = await redisClient.get(metricKey);
 
     if (!stored) return null;
@@ -115,9 +124,12 @@ class RateLimitMetricsService {
     options?: {
       minConsecutiveFailures?: number;
       since?: number;
+      identityClass?: string;
     },
   ): Promise<RateLimitMetric[]> {
-    const pattern = `${METRICS_PREFIX}${scope}:*`;
+    const pattern = options?.identityClass
+      ? redisKeys.rateLimitMetricPattern(scope, options.identityClass)
+      : redisKeys.rateLimitMetricPattern(scope);
     const metrics: RateLimitMetric[] = [];
 
     for await (const key of redisClient.scanIterator({ MATCH: pattern, COUNT: 100 })) {
@@ -136,6 +148,10 @@ class RateLimitMetricsService {
           continue;
         }
 
+        if (options?.identityClass && metric.identityClass !== options.identityClass) {
+          continue;
+        }
+
         metrics.push(metric);
       } catch {
         // Skip malformed entries
@@ -151,8 +167,9 @@ class RateLimitMetricsService {
   async getHighRiskIdentities(
     scope: string,
     minConsecutiveFailures: number = 20,
+    identityClass?: string,
   ): Promise<RateLimitMetric[]> {
-    return this.queryMetrics(scope, { minConsecutiveFailures });
+    return this.queryMetrics(scope, { minConsecutiveFailures, identityClass });
   }
 }
 

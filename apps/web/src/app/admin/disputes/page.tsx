@@ -6,6 +6,14 @@ import { Button } from '@/components/ui/button';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
 
+type SettlementState = 'none' | 'pending' | 'completed' | 'failed';
+
+interface DisputeTimelineEvent {
+  type: string;
+  occurred_at: string;
+  settlement_state?: SettlementState | null;
+}
+
 interface Dispute {
   id: string;
   property_id: string;
@@ -15,10 +23,51 @@ interface Dispute {
   check_out: string;
   total_price: number;
   created_at: string;
+  decision_recorded?: boolean;
+  decision_recorded_at?: string | null;
+  settlement_state?: SettlementState;
+  settlement_completed_at?: string | null;
+  settlement_failed_reason?: string | null;
+  timeline?: DisputeTimelineEvent[];
 }
 
 interface ResolveModal {
   disputeId: string;
+}
+
+const SETTLEMENT_LABELS: Record<SettlementState, string> = {
+  none: 'No financial action',
+  pending: 'Settlement pending',
+  completed: 'Settlement completed',
+  failed: 'Settlement failed',
+};
+
+function settlementVariant(state: SettlementState): 'default' | 'secondary' | 'destructive' | 'outline' {
+  switch (state) {
+    case 'completed':
+      return 'default';
+    case 'pending':
+      return 'secondary';
+    case 'failed':
+      return 'destructive';
+    default:
+      return 'outline';
+  }
+}
+
+function decisionState(d: Dispute): { recorded: boolean; label: string } {
+  const recorded = d.decision_recorded ?? d.status === 'resolved';
+  return {
+    recorded,
+    label: recorded ? 'Decision recorded' : 'No decision yet',
+  };
+}
+
+function settlementState(d: Dispute): SettlementState {
+  if (d.settlement_state) return d.settlement_state;
+  // Fall back conservatively: a resolved dispute without verified settlement
+  // data must not be presented as fully settled.
+  return d.status === 'resolved' ? 'pending' : 'none';
 }
 
 export default function AdminDisputesPage() {
@@ -84,6 +133,8 @@ export default function AdminDisputesPage() {
             <tr>
               <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Booking</th>
               <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
+              <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Decision</th>
+              <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Settlement</th>
               <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Check-in</th>
               <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Total</th>
               <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Actions</th>
@@ -91,30 +142,69 @@ export default function AdminDisputesPage() {
           </thead>
           <tbody className="divide-y divide-gray-100">
             {disputes.length === 0 && (
-              <tr><td colSpan={5} className="px-4 py-6 text-center text-gray-400">No open disputes</td></tr>
+              <tr><td colSpan={7} className="px-4 py-6 text-center text-gray-400">No open disputes</td></tr>
             )}
-            {disputes.map((d) => (
-              <tr key={d.id} className="hover:bg-gray-50">
-                <td className="px-4 py-3 font-mono text-xs text-gray-600">{d.id.slice(0, 8)}…</td>
-                <td className="px-4 py-3">
-                  <Badge variant="destructive">{d.status}</Badge>
-                </td>
-                <td className="px-4 py-3 text-gray-600">{new Date(d.check_in).toLocaleDateString()}</td>
-                <td className="px-4 py-3 text-gray-900 font-medium">${Number(d.total_price).toFixed(2)}</td>
-                <td className="px-4 py-3">
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => setResolveModal({ disputeId: d.id })}
-                  >
-                    Resolve
-                  </Button>
-                </td>
-              </tr>
-            ))}
+            {disputes.map((d) => {
+              const decision = decisionState(d);
+              const settlement = settlementState(d);
+              return (
+                <tr key={d.id} className="hover:bg-gray-50">
+                  <td className="px-4 py-3 font-mono text-xs text-gray-600">{d.id.slice(0, 8)}…</td>
+                  <td className="px-4 py-3">
+                    <Badge variant="destructive">{d.status}</Badge>
+                  </td>
+                  <td className="px-4 py-3">
+                    <Badge variant={decision.recorded ? 'default' : 'outline'}>
+                      {decision.label}
+                    </Badge>
+                    {decision.recorded && d.decision_recorded_at && (
+                      <p className="mt-1 text-xs text-gray-500">
+                        {new Date(d.decision_recorded_at).toLocaleString()}
+                      </p>
+                    )}
+                  </td>
+                  <td className="px-4 py-3">
+                    <Badge variant={settlementVariant(settlement)}>
+                      {SETTLEMENT_LABELS[settlement]}
+                    </Badge>
+                    {settlement === 'completed' && d.settlement_completed_at && (
+                      <p className="mt-1 text-xs text-gray-500">
+                        {new Date(d.settlement_completed_at).toLocaleString()}
+                      </p>
+                    )}
+                    {settlement === 'failed' && d.settlement_failed_reason && (
+                      <p className="mt-1 text-xs text-red-600">{d.settlement_failed_reason}</p>
+                    )}
+                    {decision.recorded && settlement !== 'completed' && (
+                      <p className="mt-1 text-xs text-amber-600">
+                        Decision recorded — settlement not yet verified
+                      </p>
+                    )}
+                  </td>
+                  <td className="px-4 py-3 text-gray-600">{new Date(d.check_in).toLocaleDateString()}</td>
+                  <td className="px-4 py-3 text-gray-900 font-medium">${Number(d.total_price).toFixed(2)}</td>
+                  <td className="px-4 py-3">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => setResolveModal({ disputeId: d.id })}
+                    >
+                      Resolve
+                    </Button>
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>
+
+      {disputes.some((d) => decisionState(d).recorded && settlementState(d) !== 'completed') && (
+        <p className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-4 py-3">
+          Some disputes have a recorded decision whose financial settlement is still pending or failed.
+          These are not fully resolved until the refund or release is verified.
+        </p>
+      )}
 
       {resolveModal && (
         <div

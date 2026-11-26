@@ -101,6 +101,300 @@ export interface PeriodFilter {
   currency?: LedgerCurrency;
 }
 
+// ─── Payment timeline ─────────────────────────────────────────────────────────
+
+/**
+ * Canonical payment timeline stages, ordered from earliest to latest.
+ *
+ * `provider_processing` reflects a provider-side acknowledgement and is NOT a
+ * final success — only `confirmed` (ledger confirmation) and `settled` are
+ * terminal success states. `refunded` and `failed` are terminal as well.
+ */
+export type PaymentTimelineStage =
+  | 'quote'
+  | 'submitted'
+  | 'provider_processing'
+  | 'confirmed'
+  | 'settled'
+  | 'refunded'
+  | 'failed';
+
+/** Role of the participant requesting the timeline. */
+export type PaymentTimelineRole = 'tenant' | 'host';
+
+export interface PaymentTimelineEvent {
+  stage: PaymentTimelineStage;
+  /** Human-readable, consistent label for the stage. */
+  label: string;
+  /** ISO timestamp of when the stage was reached. */
+  timestamp: string;
+  /** True when this event represents a final state (no further updates). */
+  terminal: boolean;
+  /** True when this event is a success state (confirmed/settled). */
+  success: boolean;
+  /**
+   * Amount in integer minor units (stroops for USDC, 7 decimals).
+   * Only present when the requesting role may see amounts.
+   */
+  amount_minor?: number;
+  /** Currency token, present alongside amount_minor. */
+  currency?: LedgerCurrency;
+  /**
+   * Provider-side reference (e.g. tx hash). Visible to both parties but never
+   * contains internal ledger identifiers.
+   */
+  provider_ref?: string | null;
+  /** Safe, role-appropriate next-step hint for pending/failed states. */
+  next_step?: string | null;
+}
+
+export interface PaymentTimeline {
+  booking_id: string;
+  role: PaymentTimelineRole;
+  /** Ordered events, earliest first. */
+  events: PaymentTimelineEvent[];
+  /** Current (latest) stage. */
+  current_stage: PaymentTimelineStage;
+  /** True when the timeline has reached a terminal state — clients stop polling. */
+  terminal: boolean;
+  /** True only when the ledger has confirmed final settlement. */
+  settled: boolean;
+  /** True when the payment failed or was refunded. */
+  failed: boolean;
+  /** ISO timestamp of the last update, for polling clients. */
+  updated_at: string;
+}
+
+const STAGE_LABELS: Record<PaymentTimelineStage, string> = {
+  quote:               'Quote',
+  submitted:           'Submitted',
+  provider_processing: 'Processing with provider',
+  confirmed:           'Confirmed',
+  settled:             'Settled',
+  refunded:            'Refunded',
+  failed:              'Failed',
+};
+
+const TERMINAL_STAGES: ReadonlySet<PaymentTimelineStage> = new Set<PaymentTimelineStage>([
+  'settled',
+  'refunded',
+  'failed',
+]);
+
+const SUCCESS_STAGES: ReadonlySet<PaymentTimelineStage> = new Set<PaymentTimelineStage>([
+  'confirmed',
+  'settled',
+]);
+
+const STAGE_ORDER: Record<PaymentTimelineStage, number> = {
+  quote:               0,
+  submitted:           1,
+  provider_processing: 2,
+  confirmed:           3,
+  settled:             4,
+  refunded:            5,
+  failed:              6,
+};
+
+/** Convert a decimal currency amount to integer minor units (stroops). */
+function toMinorUnits(amount: number): number {
+  return Math.round(Number(amount) * 10_000_000);
+}
+
+function nextStepFor(stage: PaymentTimelineStage, role: PaymentTimelineRole): string | null {
+  switch (stage) {
+    case 'quote':
+      return role === 'tenant' ? 'Review and submit payment to continue.' : 'Awaiting tenant payment.';
+    case 'submitted':
+      return 'Payment submitted — awaiting provider acknowledgement.';
+    case 'provider_processing':
+      return 'Provider is processing the payment. This is not yet a final confirmation.';
+    case 'confirmed':
+      return 'Payment confirmed on the ledger. Final settlement is pending.';
+    case 'failed':
+      return role === 'tenant'
+        ? 'Payment failed. Retry or contact support.'
+        : 'Payment failed. No funds were credited.';
+    case 'refunded':
+      return role === 'tenant'
+        ? 'Refund issued to your account.'
+        : 'Refund issued to the tenant; balance adjusted.';
+    default:
+      return null;
+  }
+}
+
+/**
+ * Build a privacy-safe payment timeline for a booking from the canonical
+ * payment ledger.
+ *
+ * Visibility rules:
+ *  - Both roles see stage, label, timestamp, terminal/success flags and the
+ *    provider reference.
+ *  - Amounts (minor units) and currency are visible to both parties for their
+ *    own booking, but internal ledger identifiers and admin notes are never
+ *    exposed.
+ *  - `next_step` hints are role-appropriate.
+ *
+ * Amounts are returned in integer minor units. Terminal states are flagged so
+ * clients can stop polling.
+ */
+export async function getPaymentTimeline(
+  bookingId: string,
+  role: PaymentTimelineRole,
+): Promise<ServiceResponse<PaymentTimeline>> {
+  if (!bookingId) return { success: false, error: 'bookingId is required' };
+  if (role !== 'tenant' && role !== 'host') {
+    return { success: false, error: 'role must be tenant or host' };
+  }
+
+  // Load the booking to derive quote/submitted timestamps and the host owner.
+  const { data: bookingRow, error: bookingError } = await supabase
+    .from('bookings')
+    .select('id, total_price, currency, status, created_at, updated_at, properties!inner(owner_id)')
+    .eq('id', bookingId)
+    .maybeSingle();
+
+  if (bookingError) return { success: false, error: bookingError.message };
+  if (!bookingRow) return { success: false, error: 'Booking not found' };
+
+  const booking = bookingRow as unknown as {
+    id: string;
+    total_price: number | string | null;
+    currency: LedgerCurrency | null;
+    status: string | null;
+    created_at: string;
+    updated_at: string;
+    properties: { owner_id: string } | { owner_id: string }[];
+  };
+
+  const ownerId = Array.isArray(booking.properties)
+    ? booking.properties[0]?.owner_id
+    : booking.properties?.owner_id;
+
+  const currency: LedgerCurrency = booking.currency ?? 'USDC';
+  const grossAmount = Number(booking.total_price ?? 0);
+
+  // Load canonical ledger entries for this booking (host-scoped).
+  const { data: ledgerRows, error: ledgerError } = await supabase
+    .from('earnings_ledger_entries')
+    .select('entry_type, direction, amount, currency, source_ref, created_at')
+    .eq('booking_id', bookingId)
+    .order('created_at', { ascending: true });
+
+  if (ledgerError) return { success: false, error: ledgerError.message };
+
+  const entries = (ledgerRows ?? []) as Array<{
+    entry_type: LedgerEntryType;
+    direction: LedgerDirection;
+    amount: number;
+    currency: LedgerCurrency;
+    source_ref: string;
+    created_at: string;
+  }>;
+
+  // Load provider-side payment status (never exposes internal ledger ids).
+  const { data: paymentRow, error: paymentError } = await supabase
+    .from('payments')
+    .select('status, tx_hash, updated_at')
+    .eq('booking_id', bookingId)
+    .maybeSingle();
+
+  if (paymentError) return { success: false, error: paymentError.message };
+
+  const payment = paymentRow as
+    | { status: string | null; tx_hash: string | null; updated_at: string | null }
+    | null;
+
+  const events: PaymentTimelineEvent[] = [];
+
+  const pushEvent = (
+    stage: PaymentTimelineStage,
+    timestamp: string,
+    extra: Partial<PaymentTimelineEvent> = {},
+  ) => {
+    events.push({
+      stage,
+      label: STAGE_LABELS[stage],
+      timestamp,
+      terminal: TERMINAL_STAGES.has(stage),
+      success: SUCCESS_STAGES.has(stage),
+      amount_minor: toMinorUnits(grossAmount),
+      currency,
+      provider_ref: payment?.tx_hash ?? null,
+      next_step: nextStepFor(stage, role),
+      ...extra,
+    });
+  };
+
+  // 1. Quote — booking created.
+  pushEvent('quote', booking.created_at);
+
+  // 2. Submitted — payment row exists (provider received the request).
+  const paymentStatus = (payment?.status ?? '').toLowerCase();
+  const hasPayment = Boolean(payment);
+  if (hasPayment) {
+    pushEvent('submitted', payment?.updated_at ?? booking.updated_at);
+  }
+
+  // 3. Provider processing — provider acknowledged but not final.
+  if (paymentStatus === 'processing' || paymentStatus === 'pending' || paymentStatus === 'submitted') {
+    pushEvent('provider_processing', payment?.updated_at ?? booking.updated_at);
+  }
+
+  // 4. Confirmed — ledger booking_payment credit exists (ledger confirmation).
+  const bookingPaymentEntry = entries.find((e) => e.entry_type === 'booking_payment');
+  if (bookingPaymentEntry) {
+    pushEvent('confirmed', bookingPaymentEntry.created_at);
+  }
+
+  // 5. Settled — escrow release recorded (final ledger confirmation).
+  const escrowEntry = entries.find((e) => e.entry_type === 'escrow_release');
+  if (escrowEntry) {
+    pushEvent('settled', escrowEntry.created_at);
+  }
+
+  // 6. Refunded — refund debit recorded.
+  const refundEntry = entries.find((e) => e.entry_type === 'refund_debit');
+  if (refundEntry) {
+    pushEvent('refunded', refundEntry.created_at, {
+      amount_minor: toMinorUnits(Number(refundEntry.amount)),
+    });
+  }
+
+  // 7. Failed — provider reported failure and no ledger confirmation exists.
+  if (paymentStatus === 'failed' && !bookingPaymentEntry) {
+    pushEvent('failed', payment?.updated_at ?? booking.updated_at);
+  }
+
+  // Order deterministically by stage order, then timestamp.
+  events.sort((a, b) => {
+    const byStage = STAGE_ORDER[a.stage] - STAGE_ORDER[b.stage];
+    if (byStage !== 0) return byStage;
+    return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime();
+  });
+
+  const currentStage = events.length > 0 ? events[events.length - 1].stage : 'quote';
+  const terminal = TERMINAL_STAGES.has(currentStage);
+  const settled = currentStage === 'settled';
+  const failed = currentStage === 'failed' || currentStage === 'refunded';
+  const updatedAt = events.length > 0 ? events[events.length - 1].timestamp : booking.updated_at;
+
+  return {
+    success: true,
+    data: {
+      booking_id: bookingId,
+      role,
+      events,
+      current_stage: currentStage,
+      terminal,
+      settled,
+      failed,
+      updated_at: updatedAt,
+    },
+  };
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function validateDateRange(from: string, to: string): string | null {
@@ -343,6 +637,126 @@ export async function getHostLedgerBalance(
       net:           round2(totalCredits - totalDebits),
       currency,
       entry_count:   rows.length,
+    },
+  };
+}
+
+// ─── Per-entry-type balance breakdown (#770 / Feature 4) ──────────────────────
+
+export interface LedgerBalanceBreakdown {
+  /** Gross settled booking revenue (Σ booking_payment credits). */
+  gross: number;
+  /** Platform fees withheld (Σ platform_fee debits). */
+  platform_fees: number;
+  /** Refunds returned to tenants (Σ refund_debit debits). */
+  refunds: number;
+  /** Net manual adjustments (Σ adjustment credits − Σ adjustment debits). */
+  adjustments_net: number;
+  /** Funds released to the host wallet / paid out (Σ escrow_release credits). */
+  escrow_released: number;
+  /** Total credits across all entry types (for transparency). */
+  total_credits: number;
+  /** Total debits across all entry types (for transparency). */
+  total_debits: number;
+  /**
+   * Settled net earnings derived from the ledger:
+   *   gross − platform_fees − refunds + adjustments_net
+   * Refunds are subtracted exactly once (as refund_debit debits), so a refund
+   * can never be double-counted against the same booking's gross credit.
+   */
+  net: number;
+  /** Funds already paid out to the host wallet (= escrow_released). */
+  paid_out: number;
+  entry_count: number;
+  currency: LedgerCurrency;
+}
+
+/**
+ * Compute a per-entry-type balance breakdown for a host.
+ *
+ * Unlike {@link getHostLedgerBalance} (which sums all credits/debits and so
+ * conflates fees, refunds, and adjustments into one "debits" figure), this
+ * breaks the balance down by entry type so callers can present gross, fees,
+ * refunds, adjustments, and paid-out amounts separately — and derive an
+ * "available" (withdrawable) balance that excludes reserved/disputed funds.
+ *
+ * @param hostId  - Host user ID.
+ * @param filter  - Optional period + currency. When `from`/`to` are omitted the
+ *                  breakdown is computed all-time (used by the dashboard).
+ */
+export async function getHostLedgerBalanceBreakdown(
+  hostId: string,
+  filter?: PeriodFilter,
+): Promise<ServiceResponse<LedgerBalanceBreakdown>> {
+  if (!hostId) return { success: false, error: 'hostId is required' };
+
+  const currency = filter?.currency ?? 'USDC';
+
+  let query = supabase
+    .from('earnings_ledger_entries')
+    .select('entry_type, direction, amount, currency')
+    .eq('host_id', hostId)
+    .eq('currency', currency);
+
+  if (filter?.from) {
+    const dateError = validateDateRange(filter.from, filter.to ?? filter.from);
+    if (dateError) return { success: false, error: dateError };
+    query = query.gte('created_at', filter.from).lte('created_at', filter.to ?? filter.from);
+  }
+
+  const { data, error } = await query;
+  if (error) return { success: false, error: error.message };
+
+  const rows = (data ?? []) as Array<{
+    entry_type: LedgerEntryType;
+    direction: LedgerDirection;
+    amount: number | string;
+  }>;
+
+  const creditByType: Record<LedgerEntryType, number> = {
+    booking_payment: 0, escrow_release: 0, refund_debit: 0, platform_fee: 0, adjustment: 0,
+  };
+  const debitByType: Record<LedgerEntryType, number> = {
+    booking_payment: 0, escrow_release: 0, refund_debit: 0, platform_fee: 0, adjustment: 0,
+  };
+
+  let totalCredits = 0;
+  let totalDebits = 0;
+
+  for (const row of rows) {
+    const amt = Number(row.amount) || 0;
+    if (row.direction === 'credit') {
+      creditByType[row.entry_type] += amt;
+      totalCredits += amt;
+    } else {
+      debitByType[row.entry_type] += amt;
+      totalDebits += amt;
+    }
+  }
+
+  const round2 = (n: number) => Math.round(n * 100) / 100;
+
+  const gross = creditByType.booking_payment;
+  const platformFees = debitByType.platform_fee;
+  const refunds = debitByType.refund_debit;
+  const adjustmentsNet = creditByType.adjustment - debitByType.adjustment;
+  const escrowReleased = creditByType.escrow_release;
+  const net = gross - platformFees - refunds + adjustmentsNet;
+
+  return {
+    success: true,
+    data: {
+      gross: round2(gross),
+      platform_fees: round2(platformFees),
+      refunds: round2(refunds),
+      adjustments_net: round2(adjustmentsNet),
+      escrow_released: round2(escrowReleased),
+      total_credits: round2(totalCredits),
+      total_debits: round2(totalDebits),
+      net: round2(net),
+      paid_out: round2(escrowReleased),
+      entry_count: rows.length,
+      currency,
     },
   };
 }

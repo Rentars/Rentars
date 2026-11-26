@@ -20,5 +20,14 @@ const fileFilter = (_req: any, file: Express.Multer.File, cb: multer.FileFilterC
 export const upload = multer({
   storage,
   fileFilter,
-  limits: { fileSize: env.MAX_IMAGE_SIZE_BYTES, files: 1, fields: 10 },
+  // Bound the whole multipart request, not just the file: a client can
+  // otherwise stream huge field values or thousands of parts into memory.
+  limits: {
+    fileSize: env.MAX_IMAGE_SIZE_BYTES,
+    files: 1,
+    fields: 10,
+    parts: 12,
+    fieldSize: 16 * 1024,
+    fieldNameSize: 128,
+  },
 });

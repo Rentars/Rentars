@@ -6,6 +6,7 @@ import type { IcsEventInput } from '@/utils/ics.js';
 import { supabase } from '@/config/supabase.js';
 import type { AuthRequest } from '@/middleware/auth.middleware.js';
 import type { BookingModification } from '@/services/booking.service.js';
+import { BookingErrorCode } from '@/services/booking.service.js';
 import type { BookingActor } from '@/services/bookingAuthorization.service.js';
 import { lookup, store, lockKey, completeKey, releaseKey, hashRequestBody } from '@/services/idempotency.service.js';
 import { fetchReceiptData, generateReceiptPdf } from '@/services/receipt.service.js';
@@ -26,6 +27,47 @@ function bookingActor(req: Request): BookingActor | undefined {
 }
 
 const bookingService = new BookingService();
+
+/**
+ * Stable, non-disclosing message returned whenever a booking request loses the
+ * race for an overlapping date range. It intentionally reveals nothing about
+ * the competing reservation (no tenant, booking id, or exact dates).
+ */
+export const BOOKING_CONFLICT_MESSAGE =
+  'The selected dates are no longer available. Please choose different dates.';
+
+/**
+ * Maps a failed booking-service result onto an HTTP status code.
+ *
+ * A `BOOKING_CONFLICT` error code (or the legacy `conflict` flag) always maps
+ * to 409 so that concurrent overlapping requests receive a consistent,
+ * non-disclosing conflict response.
+ */
+function bookingErrorStatus(
+  result: { error?: string; code?: string; conflict?: boolean; statusCode?: number },
+  fallback = 400,
+): number {
+  if (result.code === BookingErrorCode.BOOKING_CONFLICT || result.conflict) {
+    return 409;
+  }
+  return result.statusCode ?? fallback;
+}
+
+/**
+ * Builds the JSON body for a failed booking-service result. Conflict responses
+ * use the stable message so no competing-tenant information leaks.
+ */
+function bookingErrorBody(result: {
+  error?: string;
+  code?: string;
+  conflict?: boolean;
+  details?: unknown;
+}): Record<string, unknown> {
+  if (result.code === BookingErrorCode.BOOKING_CONFLICT || result.conflict) {
+    return { error: BOOKING_CONFLICT_MESSAGE, code: BookingErrorCode.BOOKING_CONFLICT };
+  }
+  return { error: result.error, code: result.code, details: result.details };
+}
 
 export async function listUserBookings(req: AuthRequest, res: Response): Promise<void> {
   const userId = req.userId;
@@ -89,9 +131,8 @@ export async function requestModification(req: Request, res: Response): Promise<
     const statusCode =
       result.error?.startsWith('Forbidden') ? 403
       : result.error === 'Booking not found'  ? 404
-      : result.conflict ? 409
-      : 400;
-    res.status(statusCode).json({ error: result.error });
+      : bookingErrorStatus(result);
+    res.status(statusCode).json(bookingErrorBody(result));
     return;
   }
 
@@ -117,9 +158,8 @@ export async function acceptModification(req: Request, res: Response): Promise<v
     const statusCode =
       result.error?.startsWith('Forbidden') ? 403
       : result.error === 'Booking not found' || result.error === 'Modification request not found' ? 404
-      : result.conflict ? 409
-      : 400;
-    res.status(statusCode).json({ error: result.error });
+      : bookingErrorStatus(result);
+    res.status(statusCode).json(bookingErrorBody(result));
     return;
   }
 
@@ -222,8 +262,13 @@ export async function createBooking(req: Request, res: Response): Promise<void> 
     const lockResult = await lockKey(userId, trimmedKey, requestHash);
 
     if (!lockResult.success) {
-      // DB error during lock — fail safe rather than blocking all bookings.
+      // Financial operations must fail closed: without a durable claim we cannot
+      // guarantee that a retry will not create a second pending booking.
       console.error('[idempotency] lock error:', lockResult.error);
+      res.status(503).json({
+        error: 'Booking could not be safely started. Please retry with the same Idempotency-Key.',
+      });
+      return;
     } else if (lockResult.data) {
       const lockData = lockResult.data;
 
@@ -261,13 +306,14 @@ export async function createBooking(req: Request, res: Response): Promise<void> 
       // We claimed the key — proceed and complete or release on failure.
       const claimedId = (lockData as { claimed: true; id: string }).id;
 
-      const result = await bookingService.createBooking(req.body);
+      const bookingInput = { ...req.body, tenant_id: req.body.tenant_id ?? userId };
+      const result = await bookingService.createBooking(bookingInput);
 
       if (!result.success) {
         // Release the processing lock so the caller can retry.
         await releaseKey(claimedId);
-        const status = result.statusCode ?? (result.conflict ? 409 : 400);
-        res.status(status).json({ error: result.error, code: result.code, details: result.details });
+        const status = bookingErrorStatus(result);
+        res.status(status).json(bookingErrorBody(result));
         return;
       }
 
@@ -285,11 +331,12 @@ export async function createBooking(req: Request, res: Response): Promise<void> 
   }
 
   // ── Fallback: no idempotency key provided ───────────────────────────────────
-  const result = await bookingService.createBooking(req.body);
+  const bookingInput = { ...req.body, tenant_id: req.body.tenant_id ?? userId };
+  const result = await bookingService.createBooking(bookingInput);
 
   if (!result.success) {
-    const status = result.statusCode ?? (result.conflict ? 409 : 400);
-    res.status(status).json({ error: result.error, code: result.code, details: result.details });
+    const status = bookingErrorStatus(result);
+    res.status(status).json(bookingErrorBody(result));
     return;
   }
 
@@ -323,9 +370,9 @@ export async function cancelBooking(req: Request, res: Response): Promise<void> 
               result.error === 'Cannot cancel a completed booking' ||
               result.error === 'Cannot cancel a disputed booking. Resolve the dispute first.'
             ? 409
-            : 400);
+            : bookingErrorStatus(result));
 
-    res.status(statusCode).json({ error: result.error });
+    res.status(statusCode).json(bookingErrorBody(result));
     return;
   }
 
@@ -345,8 +392,8 @@ export async function confirmBooking(req: Request, res: Response): Promise<void>
   const result = await bookingService.confirmBooking(req.params.id, authUser.id, authUser.role);
 
   if (!result.success) {
-    const statusCode = result.statusCode ?? (result.error?.startsWith('Forbidden') ? 403 : 400);
-    res.status(statusCode).json({ error: result.error });
+    const statusCode = result.statusCode ?? (result.error?.startsWith('Forbidden') ? 403 : bookingErrorStatus(result));
+    res.status(statusCode).json(bookingErrorBody(result));
     return;
   }
 
@@ -424,7 +471,7 @@ export async function updateBooking(req: Request, res: Response): Promise<void> 
   const result = await bookingService.updateBooking(req.params.id, req.body, actor);
 
   if (!result.success) {
-    res.status(result.statusCode ?? 400).json({ error: result.error });
+    res.status(bookingErrorStatus(result)).json(bookingErrorBody(result));
     return;
   }
 
@@ -826,6 +873,32 @@ export async function resolveDispute(req: Request, res: Response): Promise<void>
   if (!result.success) {
     const statusCode = result.statusCode ?? (result.error?.startsWith('Forbidden') ? 403 : 400);
     res.status(statusCode).json({ error: result.error });
+    return;
+  }
+
+  res.json(result.data);
+}
+
+/**
+ * GET /api/v1/bookings/:id/dispute/timeline
+ *
+ * Participant-safe dispute timeline. Distinguishes the recorded decision from
+ * the (possibly still pending or failed) financial settlement action, without
+ * exposing internal evidence or reviewer notes. (#943)
+ *
+ * Access: the booking tenant, the property host, or an admin/moderator.
+ */
+export async function getDisputeTimeline(req: Request, res: Response): Promise<void> {
+  const actor = bookingActor(req);
+  if (!actor) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const result = await bookingService.getDisputeTimelineForActor(req.params.id, actor);
+
+  if (!result.success) {
+    res.status(result.statusCode ?? 404).json({ error: result.error });
     return;
   }
 

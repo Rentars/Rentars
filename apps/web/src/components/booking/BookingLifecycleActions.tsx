@@ -1,10 +1,14 @@
 'use client';
 
-import { useState } from 'react';
-import { AlertCircle, CheckCircle2, XCircle, Loader2 } from 'lucide-react';
-import { normaliseStatus, TENANT_TRANSITIONS } from '@/types/booking';
+import { useEffect, useState } from 'react';
+import { AlertCircle, CheckCircle2, XCircle, Loader2, Info } from 'lucide-react';
 import type { Booking } from '@/types/booking';
 import { useBookingActions } from '@/hooks/useBookingActions';
+import {
+  getBookingActions,
+  getUnavailableActions,
+  type BookingActionId,
+} from '@/lib/bookingActionMatrix';
 import DisputeButton from './DisputeButton';
 import DisputeModal from './DisputeModal';
 
@@ -41,8 +45,11 @@ export default function BookingLifecycleActions({ booking, onBookingUpdated }: P
   const [refundPreviewLoading, setRefundPreviewLoading] = useState(false);
   const [refundPreviewError, setRefundPreviewError] = useState<string | null>(null);
 
-  const status      = normaliseStatus(booking.status);
-  const transitions = TENANT_TRANSITIONS[status] ?? [];
+  // Presentation policy derived from server-loaded booking state. Backend
+  // services remain authoritative for authorization (#947).
+  const actionPolicy = getBookingActions(booking, 'tenant');
+  const unavailableActions = getUnavailableActions(booking, 'tenant');
+  const can = (action: BookingActionId) => actionPolicy.allowed.includes(action);
 
   const { pendingAction, actionError, confirm, complete, cancel, dispute, clearError } =
     useBookingActions(booking.id, (updated) => {
@@ -87,12 +94,8 @@ export default function BookingLifecycleActions({ booking, onBookingUpdated }: P
     return () => { cancelled = true; };
   }, [showCancelConfirm, booking.id]);
 
-  if (transitions.length === 0) return null;
+  if (actionPolicy.allowed.length === 0 && unavailableActions.length === 0) return null;
 
-  const handleDispute = async () => {
-    if (!disputeReason.trim()) return;
-    await dispute(disputeReason.trim());
-  };
 
   return (
     <div className="space-y-4">
@@ -118,7 +121,7 @@ export default function BookingLifecycleActions({ booking, onBookingUpdated }: P
       {/* Action buttons */}
       <div className="flex flex-wrap gap-3">
         {/* Confirm */}
-        {transitions.includes('confirm') && (
+        {can('confirm') && (
           <button
             type="button"
             disabled={isLoading}
@@ -137,7 +140,7 @@ export default function BookingLifecycleActions({ booking, onBookingUpdated }: P
         )}
 
         {/* Complete */}
-        {transitions.includes('complete') && (
+        {can('complete') && (
           <button
             type="button"
             disabled={isLoading}
@@ -156,18 +159,20 @@ export default function BookingLifecycleActions({ booking, onBookingUpdated }: P
         )}
 
         {/* Dispute */}
-        <DisputeButton
-          booking={booking}
-          disabled={isLoading}
-          onClick={() => {
-            setIsDisputeModalOpen(true);
-            setShowCancelConfirm(false);
-            clearError();
-          }}
-        />
+        {can('dispute') && (
+          <DisputeButton
+            booking={booking}
+            disabled={isLoading}
+            onClick={() => {
+              setIsDisputeModalOpen(true);
+              setShowCancelConfirm(false);
+              clearError();
+            }}
+          />
+        )}
 
         {/* Cancel */}
-        {transitions.includes('cancel') && !showCancelConfirm && (
+        {can('cancel') && !showCancelConfirm && (
           <button
             type="button"
             disabled={isLoading}
@@ -182,6 +187,21 @@ export default function BookingLifecycleActions({ booking, onBookingUpdated }: P
           </button>
         )}
       </div>
+
+      {/* Explanatory unavailable states — actions the API would reject */}
+      {unavailableActions.length > 0 && (
+        <ul className="space-y-1.5" aria-label="Unavailable actions">
+          {unavailableActions.map(({ action, reason }) => (
+            <li
+              key={action}
+              className="flex items-start gap-2 text-xs text-gray-500 dark:text-gray-400"
+            >
+              <Info size={13} className="flex-shrink-0 mt-0.5" aria-hidden="true" />
+              <span>{reason}</span>
+            </li>
+          ))}
+        </ul>
+      )}
 
       {/* Cancel confirmation inline */}
       {showCancelConfirm && (

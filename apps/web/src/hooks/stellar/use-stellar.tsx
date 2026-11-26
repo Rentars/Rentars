@@ -1,13 +1,30 @@
 'use client';
 
 import { createContext, useContext, useState, useCallback, ReactNode } from 'react';
-import * as StellarSdk from '@stellar/stellar-sdk';
 import { deriveKeyFromPasskey } from '@/lib/passkey/stellar';
 import { deployStellarSmartWallet } from '@/lib/passkey/deploy';
 import { PASSKEY_WALLET_SUPPORTED, PasskeyUnsupportedError } from '@/lib/passkey/status';
 
+// Type-only import so type-checking has Keypair without bundling the SDK.
+import type * as StellarSdkTypes from '@stellar/stellar-sdk';
+
+// ── Lazy Stellar SDK ────────────────────────────────────────────────────────
+// The Stellar SDK (~200KB) is only needed when the wallet/booking flow runs.
+// Import it on demand so the initial page bundle stays small.
+
+let _stellarSdk: typeof import('@stellar/stellar-sdk') | null = null;
+
+async function stellarSdk(): Promise<typeof import('@stellar/stellar-sdk')> {
+  if (!_stellarSdk) {
+    _stellarSdk = await import('@stellar/stellar-sdk');
+  }
+  return _stellarSdk;
+}
+
+// ─── Context ───────────────────────────────────────────────────────────────
+
 interface StellarContextType {
-  keypair: StellarSdk.Keypair | null;
+  keypair: StellarSdkTypes.Keypair | null;
   publicKey: string | null;
   network: 'testnet' | 'mainnet';
   onRegister: (registrationResponse: any) => Promise<void>;
@@ -30,7 +47,7 @@ export function StellarProvider({
   children: ReactNode;
   network?: 'testnet' | 'mainnet';
 }) {
-  const [keypair, setKeypair] = useState<StellarSdk.Keypair | null>(null);
+  const [keypair, setKeypair] = useState<StellarSdkTypes.Keypair | null>(null);
   const [deployee, setDeployee] = useState<string | null>(null);
   const [loadingDeployee, setLoadingDeployee] = useState(false);
   const [loadingRegister, setLoadingRegister] = useState(false);
@@ -104,3 +121,5 @@ export function useStellar() {
   }
   return context;
 }
+
+export { stellarSdk };

@@ -10,6 +10,9 @@ router.get('/:propertyId/check', calendarController.checkAvailability);
 router.get('/:propertyId/price', calendarController.getRangePrice);
 router.get('/:propertyId/availability', calendarController.getAvailability);
 
+// Host-only typed unavailability intervals (Feature 3) — authenticated + ownership-checked.
+router.get('/:propertyId/intervals', authenticate, calendarController.getCalendarIntervals);
+
 // Host-only endpoints
 router.get('/:propertyId/seasons', calendarController.getSeasonalRates);
 router.post('/:propertyId/seasons', authenticate, calendarController.createSeasonalRate);

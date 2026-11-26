@@ -3,6 +3,11 @@ import { syncAllBookings, syncAllProperties, reconcileAllPendingEscrows } from '
 import { purgeExpired as purgeExpiredIdempotencyKeys } from './idempotency.service.js';
 import { BookingService } from './booking.service.js';
 import { processDueAccountDeletions } from './privacy.service.js';
+import {
+  runRetentionJobs,
+  type RetentionOptions,
+  type RetentionRunSummary,
+} from './retention.service.js';
 import { env } from '@/config/env.js';
 import { structuredLog } from '@/middleware/logging.middleware.js';
 
@@ -32,14 +37,15 @@ function schedLog(
 
 const bookingService = new BookingService();
 
-// ── Intervals ─────────────────────────────────────────────────────────────────
-
-const SYNC_INTERVAL_MS                  = 60 * 60 * 1000;   // 1 hour
-const RECONCILIATION_INTERVAL_MS        = 5  * 60 * 1000;   // 5 minutes
-const NOTIFICATION_OUTBOX_INTERVAL_MS   = 60 * 1000;        // 1 minute
-const IDEMPOTENCY_CLEANUP_INTERVAL_MS   = 60 * 60 * 1000;   // 1 hour
-const BOOKING_EXPIRY_INTERVAL_MS        = 10 * 60 * 1000;   // 10 minutes
-const ACCOUNT_DELETION_INTERVAL_MS      = 60 * 60 * 1000;   // 1 hour
+const SYNC_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+const RECONCILIATION_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const IDEMPOTENCY_CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+const BOOKING_EXPIRY_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+const ACCOUNT_DELETION_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+const NOTIFICATION_OUTBOX_INTERVAL_MS = 60 * 1000; // 1 minute
+const MAX_CONCURRENT_RECONCILIATIONS = 5;
+const INITIAL_BACKOFF_MS = 1000; // 1 second
+const MAX_BACKOFF_MS = 30000; // 30 seconds
 
 const RETENTION_INTERVAL_MS =
   (env.RETENTION_INTERVAL_HOURS ?? 24) * 60 * 60 * 1000;
@@ -162,9 +168,84 @@ async function runEscrowReconciliation(): Promise<void> {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Notification outbox
-// ─────────────────────────────────────────────────────────────────────────────
+export function startSyncScheduler(): void {
+  if (process.env.NODE_ENV === 'test') return;
+  // Blockchain sync
+  setInterval(() => {
+    runSync().catch((err) => console.error('[sync] Scheduler error:', err));
+  }, SYNC_INTERVAL_MS);
+
+  setInterval(() => {
+    runEscrowReconciliation().catch((err) => console.error('[reconcile] Scheduler error:', err));
+  }, RECONCILIATION_INTERVAL_MS);
+
+  setInterval(() => {
+    runNotificationOutbox().catch((err) => console.error('[notification-outbox] Scheduler error:', err));
+  }, NOTIFICATION_OUTBOX_INTERVAL_MS);
+
+  // Idempotency-key cleanup — runs once per hour, purges records older than 24 h
+  setInterval(() => {
+    runIdempotencyCleanup().catch((err) => console.error('[idempotency] Cleanup error:', err));
+  }, IDEMPOTENCY_CLEANUP_INTERVAL_MS);
+
+  // Booking expiry cleanup — runs every 10 minutes, expires stale Pending bookings.
+  setInterval(() => {
+    runBookingExpiryCleanup().catch((err) => console.error('[expiry] Scheduler error:', err));
+  }, BOOKING_EXPIRY_INTERVAL_MS);
+
+  // Account deletion — executes requests whose 7-day cancellation window has closed.
+  setInterval(() => {
+    processDueAccountDeletions().catch((err) => console.error('[privacy] Deletion worker error:', err));
+  }, ACCOUNT_DELETION_INTERVAL_MS);
+
+  // Run an initial cleanup shortly after startup so stale keys don't linger
+  // across a server restart that happens to be more than 24 h after creation.
+  setTimeout(() => {
+    runIdempotencyCleanup().catch((err) =>
+      console.error('[idempotency] Initial cleanup error:', err),
+    );
+    runBookingExpiryCleanup().catch((err) =>
+      console.error('[expiry] Initial cleanup error:', err),
+    );
+  }, 30_000); // 30 seconds after startup
+
+  // ── Data-retention cleanup ────────────────────────────────────────────────
+  //
+  // Scheduled sweep runs every RETENTION_INTERVAL_HOURS (default 24 h).
+  // At startup a dry-run preview fires after a short delay so operators can
+  // verify what the next scheduled run will touch before it mutates anything.
+  //
+  // To trigger an immediate live run without restarting the server, set
+  // RETENTION_RUN_ON_STARTUP=true — useful for one-off cleanups after a
+  // retention-policy change is deployed.
+
+  setInterval(() => {
+    runDataRetention().catch((err) => console.error('[retention] Scheduler error:', err));
+  }, RETENTION_INTERVAL_MS);
+
+  // Startup preview: dry-run only, no deletions.
+  setTimeout(() => {
+    runDataRetention({ dryRun: true, label: 'startup-preview' }).catch((err) =>
+      console.error('[retention] Startup preview error:', err),
+    );
+  }, RETENTION_STARTUP_PREVIEW_DELAY_MS);
+
+  // Optional immediate live run (e.g. after a retention-policy change).
+  if (env.RETENTION_RUN_ON_STARTUP) {
+    setTimeout(() => {
+      runDataRetention({ dryRun: false, label: 'startup-live' }).catch((err) =>
+        console.error('[retention] Startup live-run error:', err),
+      );
+    }, 60_000); // 60 s after startup — after the dry-run preview
+  }
+
+  console.log(
+    `[sync] Scheduler started — sync interval: ${SYNC_INTERVAL_MS / 1000}s, ` +
+    `reconciliation interval: ${RECONCILIATION_INTERVAL_MS / 1000}s, ` +
+    `idempotency cleanup interval: ${IDEMPOTENCY_CLEANUP_INTERVAL_MS / 1000}s, ` +
+    `booking expiry interval: ${BOOKING_EXPIRY_INTERVAL_MS / 1000}s`,
+  );
+}
 
 async function runNotificationOutbox(): Promise<void> {
   if (notificationOutboxRunning) return;
@@ -312,63 +393,59 @@ async function runBookingExpiryCleanup(): Promise<void> {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Data retention
-// ─────────────────────────────────────────────────────────────────────────────
-
-interface RetentionOptions {
-  dryRun?: boolean;
-  batchSize?: number;
-}
-
+/**
+ * Run one full data-retention sweep, guarding against overlapping runs so two
+ * scheduled invocations can never mutate the same tables concurrently.
+ *
+ * This wrapper deliberately delegates all eligibility, protection (active
+ * bookings, legal holds, audit/payment obligations) and batching decisions to
+ * `runRetentionJobs` in retention.service.ts — the scheduler never bypasses or
+ * re-implements that protection logic. It only adds overlap guarding and
+ * observable logging.
+ *
+ * Returns the per-class summary, or null when a run was already in progress.
+ */
 async function runDataRetention(
   options: RetentionOptions & { label?: string } = {},
-): Promise<void> {
+): Promise<RetentionRunSummary | null> {
+  const label = options.label ?? 'scheduled';
   if (retentionRunning) {
-    const correlationId = randomUUID();
-    schedLog('info', `retention run skipped — previous sweep still running`, correlationId, {
-      job: 'data-retention',
-      outcome: 'skipped',
-      label: options.label ?? 'scheduled',
-    });
-    return;
+    console.log(`[retention] Skipping ${label} — previous sweep still in progress`);
+    return null;
   }
 
   retentionRunning = true;
-  const correlationId = randomUUID();
-  const start = Date.now();
-
-  schedLog('info', `data retention sweep started`, correlationId, {
-    job: 'data-retention',
-    label: options.label ?? 'scheduled',
-    dryRun: options.dryRun ?? false,
-  });
-
+  const startedAt = Date.now();
   try {
     const summary = await runRetentionJobs({
       dryRun: options.dryRun,
       batchSize: options.batchSize,
     });
-
-    schedLog('info', `data retention sweep complete`, correlationId, {
-      job: 'data-retention',
-      label: options.label ?? 'scheduled',
-      outcome: 'success',
-      dryRun: summary.dry_run,
-      totalDeleted: summary.total_deleted,
-      totalEligible: summary.total_eligible,
-      totalHeldSkipped: summary.total_held_skipped,
-      failedClasses: summary.failed_classes,
-      durationMs: Date.now() - start,
-    });
+    const mode = summary.dry_run ? 'Dry-run' : 'Cleanup';
+    console.log(
+      `[retention] ${mode} (${label}) — ` +
+      `${summary.total_deleted} deleted, ${summary.total_eligible} eligible, ` +
+      `${summary.total_held_skipped} held, ${summary.elapsed_ms}ms` +
+      (summary.failed_classes.length ? `, failures: ${summary.failed_classes.join(',')}` : ''),
+    );
+    // Per-class breakdown for observability / metrics scraping.
+    for (const cls of summary.classes) {
+      console.log(
+        `[retention] ${mode} (${label}) class=${cls.class} ` +
+        `deleted=${cls.deleted} retained=${cls.retained} ` +
+        `held_skipped=${cls.held_skipped} failed=${cls.failed}` +
+        (cls.error ? ` error=${cls.error}` : ''),
+      );
+    }
+    return summary;
   } catch (err) {
-    schedLog('error', `data retention sweep threw unexpectedly`, correlationId, {
-      job: 'data-retention',
-      label: options.label ?? 'scheduled',
-      outcome: 'failure',
-      error: err instanceof Error ? err.message : String(err),
-      durationMs: Date.now() - start,
-    });
+    // Never let a retention failure crash the scheduler; log with context so
+    // operators can alert on it.
+    console.error(
+      `[retention] ${label} failed after ${Date.now() - startedAt}ms:`,
+      err,
+    );
+    return null;
   } finally {
     retentionRunning = false;
   }

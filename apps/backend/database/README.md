@@ -55,6 +55,7 @@ erDiagram
     date check_in NOT NULL
     date check_out NOT NULL
     decimal total_price NOT NULL
+    varchar display_currency
     varchar status
     varchar escrow_id
     varchar blockchain_booking_id
@@ -107,6 +108,7 @@ Indexes:
 | check_in | DATE | NOT NULL | Check-in date |
 | check_out | DATE | NOT NULL, CHECK > check_in | Check-out date |
 | total_price | DECIMAL(10,2) | NOT NULL, CHECK > 0 | Total booking price |
+| display_currency | VARCHAR(3) | NOT NULL, DEFAULT 'USD' | Display currency for the booking total (added by `00029_add_display_currency_to_bookings.sql`) |
 | status | VARCHAR(50) | DEFAULT 'pending' | Booking status |
 | escrow_id | VARCHAR(255) | Nullable | Escrow contract identifier |
 | blockchain_booking_id | VARCHAR(255) | Nullable | On-chain booking identifier |
@@ -244,21 +246,40 @@ All triggers execute `update_updated_at_column()` `BEFORE UPDATE` for each row.
 
 ### Authoritative migration command
 
-`setup.sql` is the single authoritative source of truth for the database schema.
-It applies all migrations in the correct order (see `MIGRATIONS_NAMING.md` for the
-canonical ordering of files with shared prefixes).
+The unified migration runner is the single authoritative way to apply migrations:
 
 ```bash
-# Apply the full schema from scratch — aborts immediately on any SQL error
+# Apply pending migrations
+cd apps/backend
+bun run db:migrate
+
+# Preview pending migrations without applying
+bun run db:migrate --dry-run
+```
+
+This runner:
+- Applies migrations in canonical order (see `MIGRATIONS_NAMING.md`)
+- Tracks applied migrations in `schema_migrations` table
+- Validates checksums to detect drift
+- Prevents duplicate or out-of-order migrations
+- Is idempotent: safe to run multiple times
+
+See `MIGRATION_RUNNER.md` for complete documentation.
+
+### Legacy setup.sql (CI only)
+
+`setup.sql` remains for CI compatibility and applies the same migrations via psql includes.
+For local development and deployment, use `bun run db:migrate`.
+
+```bash
+# CI command (do not use locally):
 cd apps/backend/database
 PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1 -f setup.sql
 ```
 
-This is the **same command CI uses**. Running it locally reproduces the exact CI schema.
-
 > **Do not** apply migrations piecemeal by hand unless you are adding a single new
-> file. Always use `setup.sql` for a fresh database. See `MIGRATIONS_NAMING.md` for
-> the naming convention and how to add new migrations.
+> file. Always use `bun run db:migrate` for local development.
+> See `MIGRATIONS_NAMING.md` for the naming convention and how to add new migrations.
 
 ### Validate migration filenames
 
@@ -271,6 +292,9 @@ bun run validate:migrations
 bun run validate:migrations --dry-run
 ```
 
+Both scripts are defined in `apps/backend/package.json`; run them from
+`apps/backend` (or via `bun run --cwd apps/backend <script>` from the repo root).
+
 ### Seed local data
 
 ```bash
@@ -278,7 +302,21 @@ cd apps/backend && bun run db:seed
 ```
 
 Populates a realistic local dataset (users, properties, availability, bookings, reviews, wishlists,
-notifications) using stable UUIDs — idempotent and safe to re-run.
+notifications) using stable UUIDs — idempotent and safe to re-run. The `db:seed`
+script is also defined in `apps/backend/package.json`.
+
+### Schema changes in this repository
+
+The schema is the cumulative result of the numbered files in
+`apps/backend/database/migrations/`. Notable recent additions:
+
+- `00029_add_display_currency_to_bookings.sql` — adds `bookings.display_currency`
+  (`VARCHAR(3)`, `NOT NULL`, default `'USD'`), used to render booking totals in the
+  user's chosen display currency.
+
+When adding a migration, follow `MIGRATIONS_NAMING.md`, append the file to
+`setup.sql` in order, and re-run the authoritative command above to verify a fresh
+database still builds cleanly.
 
 ### Rollback strategy
 
