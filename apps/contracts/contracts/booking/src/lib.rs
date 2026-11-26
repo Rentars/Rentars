@@ -5,15 +5,22 @@
 //!
 //! ## Cross-Contract Integration
 //!
-//! `create_booking` performs two cross-contract calls against the
+//! `create_booking` performs a cross-contract call against the
 //! `property-listing` contract (whose address is stored at initialization):
 //!
 //! 1. **Verify availability** — calls `get_listing(property_id)` and asserts
 //!    the returned status is `ListingStatus::Active`. Bookings on inactive or
-//!    already-rented properties are rejected.
-//! 2. **Mark as rented** — after persisting the booking, calls `set_rented(id)`
-//!    on the property-listing contract to atomically flip the property status to
-//!    `Rented`, preventing double-bookings across contract boundaries.
+//!    removed properties are rejected.
+//!
+//! Properties are NOT permanently marked as `Rented` after a single booking.
+//! Instead, the contract tracks all bookings per-property by date range and
+//! rejects any new booking whose `[check_in, check_out)` interval overlaps an
+//! existing, non-cancelled booking. This allows owners to accept sequential
+//! or non-overlapping future reservations without having to manually re-activate
+//! the listing after each stay.
+//!
+//! Owner-initiated pauses (`ListingStatus::Inactive`) and administrative
+//! removals remain fully enforceable — only `Active` listings accept bookings.
 //!
 //! ## Escrow Flow
 //!
@@ -32,10 +39,41 @@
 //! ## Storage TTL Strategy
 //!
 //! All persistent storage entries use TTL (time-to-live) extensions to prevent
-//! ledger entry expiry on Stellar's state-expiration model:
+//! ledger entry expiry on Stellar's state-expiration model.
 //!
-//! - **TTL_MIN** (100 ledgers): Minimum remaining TTL before an extension fires.
-//! - **TTL_EXTEND_TO** (100 ledgers): Target TTL applied on every write.
+//! ### Constants
+//!
+//! | Constant           | Ledgers    | Real-world duration          |
+//! |--------------------|-----------|------------------------------|
+//! | `LEDGER_THRESHOLD` |  120,960  | ~7 days  (at 5 s/ledger)    |
+//! | `LEDGER_TARGET`    | 6,307,200 | ~1 year  (at 5 s/ledger)    |
+//!
+//! Rationale:
+//! - **LEDGER_THRESHOLD**: If a persistent entry has fewer than ~7 days of TTL
+//!   remaining, it is extended on the next read or write. This provides a
+//!   comfortable buffer before automatic archival and avoids spurious
+//!   re-extension costs during active usage.
+//! - **LEDGER_TARGET**: Each extension resets the TTL to ~1 year. Booking
+//!   records, property booking indexes, the global counter, and admin config
+//!   all require long-lived persistence — a 1-year window matches expected
+//!   platform activity and far exceeds any single rental period.
+//!
+//! ### Which keys are extended
+//!
+//! - `Booking(id)` — extended on every read and write.
+//! - `BookingCount` — extended on every write.
+//! - `PropertyBookings(property_id)` — extended on every read and write.
+//! - `Initialized`, `Admin`, `PropertyListingContractId`, `TokenAddress` —
+//!   stored in **instance** storage, which is extended automatically with the
+//!   contract instance; no manual TTL calls are required for these keys.
+//!
+//! ### Archival note
+//!
+//! Entries that have not been touched within the TTL window become archived on
+//! Stellar. Archived entries can be restored via a Stellar restore transaction,
+//! but this requires the restorer to supply the archived entry proof. For
+//! production deployments, a background job should monitor TTL and extend
+//! entries proactively to avoid archival entirely.
 
 #![no_std]
 
@@ -44,9 +82,20 @@ use soroban_sdk::{contract, contractimpl, contracttype, token, vec, Address, Env
 use property_listing::{ListingStatus, PropertyListingContractClient};
 
 // ─── TTL Constants ────────────────────────────────────────────────────────────
+//
+// 1 ledger ≈ 5 seconds on Stellar mainnet.
+//   1 day  ≈  17,280 ledgers
+//   7 days ≈ 120,960 ledgers
+//   1 year ≈ 6,307,200 ledgers
 
-const TTL_MIN: u32 = 100;
-const TTL_EXTEND_TO: u32 = 100;
+/// Minimum remaining TTL (in ledgers) before an extension is triggered.
+/// Approximately 7 days — provides a comfortable buffer before archival.
+const LEDGER_THRESHOLD: u32 = 120_960;
+
+/// Target TTL (in ledgers) applied on every read/write extension.
+/// Approximately 1 year — matches expected platform activity and exceeds
+/// any realistic single rental period.
+const LEDGER_TARGET: u32 = 6_307_200;
 
 // ─── Data Types ──────────────────────────────────────────────────────────────
 
@@ -148,7 +197,18 @@ impl BookingContract {
 
     // ── Bookings ─────────────────────────────────────────────────────────────
 
-    /// Create a new booking. Verifies property availability cross-contract.
+    /// Create a new booking. Verifies property availability via cross-contract
+    /// read and rejects overlapping date ranges atomically.
+    ///
+    /// Unlike the previous design, the property's status is NOT changed to
+    /// `Rented` after a successful booking. This allows non-overlapping future
+    /// bookings to be accepted. The listing must be `Active`; `Inactive` or
+    /// `Removed` listings are rejected (see Issue 112).
+    ///
+    /// Overlap detection: for each existing, non-cancelled booking on the same
+    /// property, the contract checks whether `[check_in, check_out)` intersects
+    /// the existing `[existing.check_in, existing.check_out)` interval. The
+    /// check is `!(check_out <= existing.check_in || check_in >= existing.check_out)`.
     pub fn create_booking(
         env: Env,
         tenant: Address,
@@ -171,6 +231,8 @@ impl BookingContract {
         let listing_client = PropertyListingContractClient::new(&env, &listing_contract_id);
         let listing = listing_client.get_listing(&property_id);
 
+        // Only Active listings accept new bookings. Paused (Inactive) or
+        // removed listings are explicitly blocked here (Issue 114 alignment).
         assert!(
             listing.status == ListingStatus::Active,
             "Property is not available for booking"
@@ -178,19 +240,38 @@ impl BookingContract {
 
         let property_owner = listing.owner.clone();
 
+        // Load the per-property booking index; default to empty on first use.
+        let property_bookings_key = DataKey::PropertyBookings(property_id);
         let property_bookings: Vec<u64> = env
             .storage()
             .persistent()
-            .get(&DataKey::PropertyBookings(property_id))
+            .get(&property_bookings_key)
             .unwrap_or(vec![&env]);
 
+        // Extend TTL on the index after reading.
+        if env.storage().persistent().has(&property_bookings_key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&property_bookings_key, LEDGER_THRESHOLD, LEDGER_TARGET);
+        }
+
+        // Reject if any non-cancelled booking overlaps the requested dates.
+        // This is the core of Issue 112: date-range occupancy replaces the
+        // single-flag Rented status so multiple non-overlapping future
+        // reservations are permitted on the same listing.
         for i in 0..property_bookings.len() {
             let bid = property_bookings.get(i).unwrap();
+            let existing_key = DataKey::Booking(bid);
             let existing: Booking = env
                 .storage()
                 .persistent()
-                .get(&DataKey::Booking(bid))
+                .get(&existing_key)
                 .unwrap();
+
+            // Extend TTL on each booking record accessed during the scan.
+            env.storage()
+                .persistent()
+                .extend_ttl(&existing_key, LEDGER_THRESHOLD, LEDGER_TARGET);
 
             if existing.status == BookingStatus::Cancelled {
                 continue;
@@ -200,10 +281,12 @@ impl BookingContract {
             assert!(!overlaps, "Booking dates overlap with an existing booking");
         }
 
+        // Assign the next booking ID.
+        let count_key = DataKey::BookingCount;
         let count: u64 = env
             .storage()
             .persistent()
-            .get(&DataKey::BookingCount)
+            .get(&count_key)
             .unwrap_or(0);
         let id = count + 1;
 
@@ -220,26 +303,35 @@ impl BookingContract {
             escrow_status: EscrowStatus::NotFunded,
         };
 
-        env.storage().persistent().set(&DataKey::Booking(id), &booking);
+        // Persist booking and extend TTL immediately.
+        let booking_key = DataKey::Booking(id);
+        env.storage().persistent().set(&booking_key, &booking);
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::Booking(id), TTL_MIN, TTL_EXTEND_TO);
+            .extend_ttl(&booking_key, LEDGER_THRESHOLD, LEDGER_TARGET);
 
-        env.storage().persistent().set(&DataKey::BookingCount, &id);
+        // Update global counter and extend its TTL.
+        env.storage().persistent().set(&count_key, &id);
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::BookingCount, TTL_MIN, TTL_EXTEND_TO);
+            .extend_ttl(&count_key, LEDGER_THRESHOLD, LEDGER_TARGET);
 
+        // Append to the per-property booking index and extend its TTL.
         let mut bookings = property_bookings;
         bookings.push_back(id);
         env.storage()
             .persistent()
-            .set(&DataKey::PropertyBookings(property_id), &bookings);
+            .set(&property_bookings_key, &bookings);
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::PropertyBookings(property_id), TTL_MIN, TTL_EXTEND_TO);
+            .extend_ttl(&property_bookings_key, LEDGER_THRESHOLD, LEDGER_TARGET);
 
-        listing_client.set_rented(&property_id);
+        // NOTE (Issue 112): We intentionally do NOT call listing_client.set_rented()
+        // here. Marking the property as Rented after the first booking would block
+        // all subsequent non-overlapping future reservations. Availability is now
+        // enforced purely by date-range overlap detection above. The listing owner
+        // retains control via update_status (Active ↔ Inactive) in the
+        // property-listing contract.
 
         id
     }
@@ -248,11 +340,17 @@ impl BookingContract {
     pub fn fund_escrow(env: Env, caller: Address, booking_id: u64) {
         caller.require_auth();
 
+        let booking_key = DataKey::Booking(booking_id);
         let mut booking: Booking = env
             .storage()
             .persistent()
-            .get(&DataKey::Booking(booking_id))
+            .get(&booking_key)
             .expect("Booking not found");
+
+        // Extend TTL on read.
+        env.storage()
+            .persistent()
+            .extend_ttl(&booking_key, LEDGER_THRESHOLD, LEDGER_TARGET);
 
         assert!(
             booking.tenant == caller,
@@ -277,10 +375,10 @@ impl BookingContract {
         token.transfer(&caller, &env.current_contract_address(), &booking.total_price);
 
         booking.escrow_status = EscrowStatus::Funded;
-        env.storage().persistent().set(&DataKey::Booking(booking_id), &booking);
+        env.storage().persistent().set(&booking_key, &booking);
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::Booking(booking_id), TTL_MIN, TTL_EXTEND_TO);
+            .extend_ttl(&booking_key, LEDGER_THRESHOLD, LEDGER_TARGET);
     }
 
     /// Cancel a booking. Allowed by the tenant or the contract admin.
@@ -289,11 +387,17 @@ impl BookingContract {
     pub fn cancel_booking(env: Env, caller: Address, booking_id: u64) {
         caller.require_auth();
 
+        let booking_key = DataKey::Booking(booking_id);
         let mut booking: Booking = env
             .storage()
             .persistent()
-            .get(&DataKey::Booking(booking_id))
+            .get(&booking_key)
             .expect("Booking not found");
+
+        // Extend TTL on read.
+        env.storage()
+            .persistent()
+            .extend_ttl(&booking_key, LEDGER_THRESHOLD, LEDGER_TARGET);
 
         let admin: Address = env
             .storage()
@@ -334,10 +438,10 @@ impl BookingContract {
         }
 
         booking.status = BookingStatus::Cancelled;
-        env.storage().persistent().set(&DataKey::Booking(booking_id), &booking);
+        env.storage().persistent().set(&booking_key, &booking);
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::Booking(booking_id), TTL_MIN, TTL_EXTEND_TO);
+            .extend_ttl(&booking_key, LEDGER_THRESHOLD, LEDGER_TARGET);
     }
 
     /// Advance a booking through the defined state machine (admin only).
@@ -366,11 +470,17 @@ impl BookingContract {
             .expect("Contract not initialized");
         assert!(caller == admin, "Unauthorized");
 
+        let booking_key = DataKey::Booking(booking_id);
         let mut booking: Booking = env
             .storage()
             .persistent()
-            .get(&DataKey::Booking(booking_id))
+            .get(&booking_key)
             .expect("Booking not found");
+
+        // Extend TTL on read.
+        env.storage()
+            .persistent()
+            .extend_ttl(&booking_key, LEDGER_THRESHOLD, LEDGER_TARGET);
 
         let valid = match (&booking.status, &new_status) {
             (BookingStatus::Pending, BookingStatus::Confirmed) => true,
@@ -416,10 +526,10 @@ impl BookingContract {
         }
 
         booking.status = new_status;
-        env.storage().persistent().set(&DataKey::Booking(booking_id), &booking);
+        env.storage().persistent().set(&booking_key, &booking);
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::Booking(booking_id), TTL_MIN, TTL_EXTEND_TO);
+            .extend_ttl(&booking_key, LEDGER_THRESHOLD, LEDGER_TARGET);
     }
 
     /// Open a dispute on a funded booking (tenant only).
@@ -428,11 +538,17 @@ impl BookingContract {
     pub fn dispute_booking(env: Env, caller: Address, booking_id: u64) {
         caller.require_auth();
 
+        let booking_key = DataKey::Booking(booking_id);
         let mut booking: Booking = env
             .storage()
             .persistent()
-            .get(&DataKey::Booking(booking_id))
+            .get(&booking_key)
             .expect("Booking not found");
+
+        // Extend TTL on read.
+        env.storage()
+            .persistent()
+            .extend_ttl(&booking_key, LEDGER_THRESHOLD, LEDGER_TARGET);
 
         assert!(
             booking.tenant == caller,
@@ -449,10 +565,10 @@ impl BookingContract {
         );
 
         booking.status = BookingStatus::Disputed;
-        env.storage().persistent().set(&DataKey::Booking(booking_id), &booking);
+        env.storage().persistent().set(&booking_key, &booking);
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::Booking(booking_id), TTL_MIN, TTL_EXTEND_TO);
+            .extend_ttl(&booking_key, LEDGER_THRESHOLD, LEDGER_TARGET);
     }
 
     /// Resolve a disputed booking (admin only).
@@ -474,11 +590,17 @@ impl BookingContract {
             .expect("Contract not initialized");
         assert!(caller == admin, "Unauthorized");
 
+        let booking_key = DataKey::Booking(booking_id);
         let mut booking: Booking = env
             .storage()
             .persistent()
-            .get(&DataKey::Booking(booking_id))
+            .get(&booking_key)
             .expect("Booking not found");
+
+        // Extend TTL on read.
+        env.storage()
+            .persistent()
+            .extend_ttl(&booking_key, LEDGER_THRESHOLD, LEDGER_TARGET);
 
         assert!(
             booking.status == BookingStatus::Disputed,
@@ -510,10 +632,10 @@ impl BookingContract {
             booking.escrow_status = EscrowStatus::Refunded;
         }
 
-        env.storage().persistent().set(&DataKey::Booking(booking_id), &booking);
+        env.storage().persistent().set(&booking_key, &booking);
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::Booking(booking_id), TTL_MIN, TTL_EXTEND_TO);
+            .extend_ttl(&booking_key, LEDGER_THRESHOLD, LEDGER_TARGET);
     }
 
     /// Attach an off-chain escrow reference to a booking (admin only).
@@ -527,35 +649,61 @@ impl BookingContract {
             .expect("Contract not initialized");
         assert!(caller == admin, "Unauthorized");
 
+        let booking_key = DataKey::Booking(booking_id);
         let mut booking: Booking = env
             .storage()
             .persistent()
-            .get(&DataKey::Booking(booking_id))
+            .get(&booking_key)
             .expect("Booking not found");
 
-        booking.escrow_id = escrow_id;
-        env.storage().persistent().set(&DataKey::Booking(booking_id), &booking);
+        // Extend TTL on read.
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::Booking(booking_id), TTL_MIN, TTL_EXTEND_TO);
+            .extend_ttl(&booking_key, LEDGER_THRESHOLD, LEDGER_TARGET);
+
+        booking.escrow_id = escrow_id;
+        env.storage().persistent().set(&booking_key, &booking);
+        env.storage()
+            .persistent()
+            .extend_ttl(&booking_key, LEDGER_THRESHOLD, LEDGER_TARGET);
     }
 
     // ── Queries ───────────────────────────────────────────────────────────────
 
     /// Retrieve a booking by its on-chain ID.
     pub fn get_booking(env: Env, id: u64) -> Booking {
+        let booking_key = DataKey::Booking(id);
+        let booking: Booking = env
+            .storage()
+            .persistent()
+            .get(&booking_key)
+            .expect("Booking not found");
+
+        // Extend TTL on read to keep active records alive.
         env.storage()
             .persistent()
-            .get(&DataKey::Booking(id))
-            .expect("Booking not found")
+            .extend_ttl(&booking_key, LEDGER_THRESHOLD, LEDGER_TARGET);
+
+        booking
     }
 
     /// Return all booking IDs for a given property.
     pub fn get_property_bookings(env: Env, property_id: u64) -> Vec<u64> {
-        env.storage()
+        let key = DataKey::PropertyBookings(property_id);
+        let bookings: Vec<u64> = env
+            .storage()
             .persistent()
-            .get(&DataKey::PropertyBookings(property_id))
-            .unwrap_or(vec![&env])
+            .get(&key)
+            .unwrap_or(vec![&env]);
+
+        // Extend TTL on read if the entry exists.
+        if env.storage().persistent().has(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_TARGET);
+        }
+
+        bookings
     }
 
     /// Check whether a date range is available for a property.
@@ -565,19 +713,33 @@ impl BookingContract {
         check_in: u64,
         check_out: u64,
     ) -> bool {
+        let key = DataKey::PropertyBookings(property_id);
         let property_bookings: Vec<u64> = env
             .storage()
             .persistent()
-            .get(&DataKey::PropertyBookings(property_id))
+            .get(&key)
             .unwrap_or(vec![&env]);
+
+        // Extend TTL on read if the entry exists.
+        if env.storage().persistent().has(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_TARGET);
+        }
 
         for i in 0..property_bookings.len() {
             let bid = property_bookings.get(i).unwrap();
+            let booking_key = DataKey::Booking(bid);
             let existing: Booking = env
                 .storage()
                 .persistent()
-                .get(&DataKey::Booking(bid))
+                .get(&booking_key)
                 .unwrap();
+
+            // Extend TTL on each booking accessed during the scan.
+            env.storage()
+                .persistent()
+                .extend_ttl(&booking_key, LEDGER_THRESHOLD, LEDGER_TARGET);
 
             if existing.status == BookingStatus::Cancelled {
                 continue;
@@ -593,10 +755,21 @@ impl BookingContract {
 
     /// Return the total number of bookings ever created.
     pub fn booking_count(env: Env) -> u64 {
-        env.storage()
+        let key = DataKey::BookingCount;
+        let count: u64 = env
+            .storage()
             .persistent()
-            .get(&DataKey::BookingCount)
-            .unwrap_or(0)
+            .get(&key)
+            .unwrap_or(0);
+
+        // Extend TTL on read if the counter entry exists.
+        if env.storage().persistent().has(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_TARGET);
+        }
+
+        count
     }
 }
 

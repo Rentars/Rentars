@@ -177,7 +177,8 @@ mod tests {
 
         assert_eq!(
             listing_client.get_listing(&property_id).status,
-            ListingStatus::Rented,
+            // Issue 112: property stays Active after a booking (no longer flipped to Rented).
+            ListingStatus::Active,
         );
     }
 
@@ -203,9 +204,10 @@ mod tests {
         );
     }
 
+    /// Issue 112: a second booking with NON-OVERLAPPING dates on the same
+    /// property must now succeed. The property stays Active after the first booking.
     #[test]
-    #[should_panic(expected = "Property is not available for booking")]
-    fn test_cross_contract_booking_already_rented() {
+    fn test_cross_contract_booking_non_overlapping_allowed() {
         let (env, booking_cid, listing_cid, _admin) = make_env_with_listing();
         let booking_client = BookingContractClient::new(&env, &booking_cid);
 
@@ -215,6 +217,43 @@ mod tests {
 
         let property_id = create_property(&env, &listing_cid, &owner);
 
+        // First booking: days 1000-1007.
+        let id1 = booking_client.create_booking(
+            &tenant_a,
+            &property_id,
+            &1_000_u64,
+            &1_007_u64,
+            &700_0000000_i128,
+        );
+
+        // Second booking: days 2000-2007 -- non-overlapping, must succeed.
+        let id2 = booking_client.create_booking(
+            &tenant_b,
+            &property_id,
+            &2_000_u64,
+            &2_007_u64,
+            &700_0000000_i128,
+        );
+
+        assert_ne!(id1, id2);
+        assert_eq!(booking_client.get_booking(&id1).status, BookingStatus::Pending);
+        assert_eq!(booking_client.get_booking(&id2).status, BookingStatus::Pending);
+    }
+
+    /// Issue 112: overlapping bookings must still be rejected atomically.
+    #[test]
+    #[should_panic(expected = "Booking dates overlap with an existing booking")]
+    fn test_cross_contract_booking_overlapping_rejected() {
+        let (env, booking_cid, listing_cid, _admin) = make_env_with_listing();
+        let booking_client = BookingContractClient::new(&env, &booking_cid);
+
+        let owner = Address::generate(&env);
+        let tenant_a = Address::generate(&env);
+        let tenant_b = Address::generate(&env);
+
+        let property_id = create_property(&env, &listing_cid, &owner);
+
+        // First booking: days 1000-1007.
         booking_client.create_booking(
             &tenant_a,
             &property_id,
@@ -223,11 +262,12 @@ mod tests {
             &700_0000000_i128,
         );
 
+        // Second booking: days 1003-1010 -- overlaps, must be rejected.
         booking_client.create_booking(
             &tenant_b,
             &property_id,
-            &2_000_u64,
-            &2_007_u64,
+            &1_003_u64,
+            &1_010_u64,
             &700_0000000_i128,
         );
     }
@@ -1505,8 +1545,10 @@ mod tests {
 
     // ─── Security Tests ───────────────────────────────────────────────────────
 
+    /// Issue 112: re-booking with OVERLAPPING dates on the same property is
+    /// atomically rejected. This guards against double-booking attacks.
     #[test]
-    #[should_panic(expected = "Property is not available for booking")]
+    #[should_panic(expected = "Booking dates overlap with an existing booking")]
     fn test_reentrancy_attack_prevention() {
         let (env, booking_cid, listing_cid, _admin) = make_env_with_listing();
         let client = BookingContractClient::new(&env, &booking_cid);
@@ -1514,8 +1556,10 @@ mod tests {
         let attacker = Address::generate(&env);
         let property_id = create_property(&env, &listing_cid, &owner);
 
+        // First booking: days 5000-5010.
         client.create_booking(&attacker, &property_id, &5_000_u64, &5_010_u64, &100_i128);
-        client.create_booking(&attacker, &property_id, &6_000_u64, &6_010_u64, &100_i128);
+        // Overlapping booking (5005-5015) must be rejected atomically.
+        client.create_booking(&attacker, &property_id, &5_005_u64, &5_015_u64, &100_i128);
     }
 
     #[test]
@@ -1805,9 +1849,9 @@ mod tests {
         let client = BookingContractClient::new(&env, &cid);
         let tenant = Address::generate(&env);
 
-        // We use a unique property per test because properties become Rented
-        // after one booking, so overlapping on the same property is not possible
-        // via create_booking. We test overlap logic via check_availability instead.
+        // Issue 112: properties stay Active after a booking, so overlap detection
+        // is enforced by date-range checks rather than a Rented flag. We verify
+        // check_availability for a property with no bookings returns true.
         assert!(client.check_availability(&999_u64, &1_000_u64, &2_000_u64));
     }
 
@@ -1824,8 +1868,8 @@ mod tests {
         // Overlapping range must return false
         assert!(!client.check_availability(&pid, &1_500_u64, &2_500_u64));
 
-        // Non-overlapping range returns true (but property is Rented, so
-        // create_booking would still fail — this is a design limitation)
+        // Non-overlapping range returns true; and since the property stays Active
+        // (Issue 112), create_booking with these dates would also succeed.
         assert!(client.check_availability(&pid, &2_000_u64, &3_000_u64));
     }
 
